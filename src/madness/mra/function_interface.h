@@ -280,9 +280,11 @@ MADNESS_PRAGMA_GCC(diagnostic pop)
 
 		ElementaryInterface(T (*f)(const coordT&)) : f(f) {}
 
-		T operator()(const coordT& x) const {return f(x);}
+		using FunctionFunctorInterface<T,NDIM>::operator();
 
-		coeffT values(const Key<NDIM>& key, const Tensor<double>& quad_x) const {
+		virtual T operator()(const coordT& x) const override {return f(x);}
+
+		coeffT values(const Key<NDIM>& key, const Tensor<double>& quad_x) const override {
 	        typedef Tensor<T> tensorT;
             tensorT fval=madness::fcube(key,f,quad_x);
             return coeffT(fval,FunctionDefaults<NDIM>::get_thresh(),TT_FULL);

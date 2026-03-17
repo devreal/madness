@@ -375,8 +375,8 @@ public:
 	Nemo(World& world, const CalculationParameters& param, const NemoCalculationParameters& nemo_param,
 		const Molecule& molecule);
 
-    std::string name() const {return "nemo";}
-    bool selftest() {return false;}
+    std::string name() const override {return "nemo";}
+    bool selftest() override {return false;}
 
     static void help() {
         print_header2("help page for NEMO");
@@ -409,7 +409,7 @@ public:
 
 	virtual double value() {return value(calc->molecule.get_all_coords());}
 
-	virtual double value(const Tensor<double>& x);
+	virtual double value(const Tensor<double>& x) override;
 
 	void load_mos(World& w) {
 		calc->load_mos(w);
@@ -419,15 +419,15 @@ public:
 	virtual nlohmann::json analyze() const;
 
 	/// compute the nuclear gradients
-	Tensor<double> gradient(const Tensor<double>& x);
+	Tensor<double> gradient(const Tensor<double>& x) override;
 
-	bool provides_gradient() const {return true;}
+	bool provides_gradient() const override {return true;}
 
 	/// returns the molecular hessian matrix at structure x
 	Tensor<double> hessian(const Tensor<double>& x);
 
 	/// construct the fock operator based on the calculation parameters (K or XC?)
-	virtual std::shared_ptr<Fock<double,3>> make_fock_operator() const;
+	virtual std::shared_ptr<Fock<double,3>> make_fock_operator() const override;
 
 	/// purify and symmetrize the hessian
 
@@ -509,7 +509,7 @@ public:
 	tensorT compute_fock_matrix(const vecfuncT& nemo, const tensorT& occ) const;
 
 	/// return a reference to the molecule
-	Molecule& molecule() {return calc->molecule;}
+	Molecule& molecule() override {return calc->molecule;}
 
     /// return a reference to the molecule
     Molecule& molecule() const {
