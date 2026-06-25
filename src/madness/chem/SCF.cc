@@ -42,6 +42,12 @@
 #include <madness/chem/SCF.h>
 #include <madchem.h>
 
+#ifdef HAVE_MRA_TTG
+#include <mra/mra.h>
+#include <mra/vmra/vmra.h>
+#include <ttg.h>
+#endif // HAVE_MRA_TTG
+
 #if defined(__has_include)
 #  if __has_include(<filesystem>)
 #    define MADCHEM_HAS_STD_FILESYSTEM
@@ -1541,6 +1547,19 @@ void SCF::vector_stats(const std::vector<double>& v, double& rms,
     rms = sqrt(rms / v.size());
 }
 
+#ifdef HAVE_MRA_TTG
+static void execute_mra_ttg(auto&& start) {
+    auto connected = make_graph_executable(start.get());
+    assert(connected);
+    if (ttg::default_execution_context().rank() == 0) {
+      // This kicks off the entire computation
+      start->invoke();
+    }
+    ttg::execute();
+    ttg::fence();
+}
+#endif // HAVE_MRA_TTG
+
 vecfuncT SCF::compute_residual(World& world, tensorT& occ, tensorT& fock,
                                const vecfuncT& psi, vecfuncT& Vpsi, double& err) {
 
@@ -1644,14 +1663,58 @@ vecfuncT SCF::compute_residual(World& world, tensorT& occ, tensorT& fock,
         std::vector<poperatorT> ops = make_bsh_operators(world, eps, param);
         set_thresh(world, Vpsi, FunctionDefaults<3>::get_thresh());
 
+#ifdef HAVE_MRA_TTG
+
+        // define N Gaussians, don't instantiate
+        // TODO: use the Vpsi process map
+        using T = double;
+        constexpr mra::Dimension NDIM = 3;
+        const mra::size_type N = Vpsi.size();
+        const mra::size_type K = FunctionDefaults<3>::get_k();
+        const T precision = FunctionDefaults<3>::get_thresh();
+        mra::FunctionData<T, NDIM> functiondata(K);
+        mra::GaussianConvolutionOperator<T, NDIM> op(ops);
+        auto pmap = mra::make_procmap<NDIM>(N, 1 /* batch */);
+        auto dmap = mra::make_devicemap<NDIM>(pmap);
+        auto gaussians = mra::make_functionset<mra::Gaussian<T, NDIM>>(pmap.batch_manager());
+
+        /* create the result function vector; share impl for process-map ownership */
+        vecfuncT madconv_mra(N);
+        for (mra::size_type i = 0; i < N; ++i) {
+            madconv_mra[i].set_impl(Vpsi[i], false);
+        }
+        /* ensure Vpsi is in reconstructed form before loading into MRA-TTG */
+        reconstruct(world, Vpsi);
+
+        /**
+         * TODO: have the make* functions return their output edge so we don't have to define it up front.
+         */
+        ttg::Edge<mra::Key<NDIM>, mra::FunctionsReconstructedNode<T, NDIM>> reconstruct_conv_result;
+        ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>> compress_result,
+                                                                        convolution_result;
+        ttg::Edge<mra::Key<NDIM>, void> load_control;
+        ttg::Edge<mra::Key<NDIM>, mra::FunctionsReconstructedNode<T, NDIM>> load_vmra;
+        auto start            = mra::make_start(gaussians, load_control);
+        auto load_tt          = mra::vmra::make_vmra_load(Vpsi, load_control, load_vmra, "load_vmra");
+        auto compress         = mra::make_compress(gaussians, K, true, functiondata, load_vmra, compress_result, "compress");
+        auto convolve         = mra::make_convolution(gaussians, K, compress_result, convolution_result, op, precision, "convolution");
+        auto reconstruct_conv = mra::make_reconstruct(gaussians, K, true, functiondata, convolution_result, reconstruct_conv_result, "reconstruct_convolution");
+        auto store_tt         = mra::vmra::make_vmra_store(madconv_mra, reconstruct_conv_result, "store_vmra");
+
+        execute_mra_ttg(start);
+
+        new_psi = std::move(madconv_mra);
+
+#else  // HAVE_MRA_TTG
         new_psi = apply(world, ops, Vpsi);
-        
+#endif // HAVE_MRA_TTG
+
         ops.clear();
         Vpsi.clear();
         world.gop.fence();
 
         END_TIMER(world, "Apply BSH");
-        
+
         START_TIMER(world);
         truncate(world, new_psi);
         END_TIMER(world, "Truncate new psi");

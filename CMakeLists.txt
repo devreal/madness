@@ -139,6 +139,14 @@ set(MADNESS_TASK_VALID_BACKENDS Pthreads TBB PaRSEC)
 set(MADNESS_TASK_BACKEND Pthreads CACHE STRING "The backend to use for dispatching tasks")
 set_property(CACHE MADNESS_TASK_BACKEND PROPERTY STRINGS ${MADNESS_TASK_VALID_BACKENDS})
 
+option(ENABLE_MRA_TTG "Enable MRA-TTG task-graph MRA implementation" ON)
+
+if (ENABLE_MRA_TTG)
+  # The MRA-TTG implementation uses PaRSEC so we're better off forcing it for MADNESS too
+  message(STATUS "MRA-TTG enabled, setting MADNESS_TASK_BACKEND=PaRSEC")
+  set(MADNESS_TASK_BACKEND PaRSEC)
+endif (ENABLE_MRA_TTG)
+
 if (DEFINED MADNESS_TASK_BACKEND)
   if(NOT MADNESS_TASK_BACKEND IN_LIST MADNESS_TASK_VALID_BACKENDS)
     message(FATAL_ERROR "MADNESS_TASK_BACKEND must be one of ${MADNESS_TASK_VALID_BACKENDS}")

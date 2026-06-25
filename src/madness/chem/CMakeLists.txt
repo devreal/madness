@@ -1,5 +1,18 @@
 # src/apps/chem
 
+# MRA-TTG: activate here so that MADworld/MADtensor/MADmra are already defined
+# and MRA-TTG's FindOrFetchMADNESS guard fires correctly (does not re-fetch MADNESS).
+if (ENABLE_MRA_TTG)
+  if (NOT TARGET mra::base)
+    FetchContent_MakeAvailable(MRATTG)
+  endif()
+  if (TARGET mra::base)
+    set(HAVE_MRA_TTG TRUE)
+  else()
+    message(WARNING "ENABLE_MRA_TTG=ON but mra::base target unavailable after fetch")
+  endif()
+endif()
+
 add_definitions(-DMRA_CHEMDATA_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}\")
 
 # Set the CHEM sources and header files
@@ -147,6 +160,11 @@ add_mad_library(chem MADCHEM_SOURCES MADCHEM_HEADERS "mra" "madness/chem/")
   if (BOOST_FOUND)
     target_link_libraries(${targetname} PUBLIC Boost::headers)
   endif ()
+
+  if (HAVE_MRA_TTG)
+    target_link_libraries(${targetname} PUBLIC mra::base mra::host)
+    target_compile_definitions(${targetname} PUBLIC -DHAVE_MRA_TTG=1)
+  endif()
 
 # Add executables
 if (NOT MADNESS_BUILD_LIBRARIES_ONLY)
