@@ -42,6 +42,8 @@
 #include <madness/world/worldmem.h>
 #include <madness/misc/info.h>
 
+#include <mra/mra.h>
+
 
 #if defined(HAVE_SYS_TYPES_H) && defined(HAVE_SYS_STAT_H) && defined(HAVE_UNISTD_H)
 
@@ -76,7 +78,12 @@ static void END_TIMER(World &world, const char *msg) {
 
 int main(int argc, char **argv) {
 
-    World &world = initialize(argc, argv);
+#ifdef HAVE_MRA_TTG
+    // MRA initializes TTG and MADNESS, must be first
+    mra::initialize(argc, argv, -1);
+#endif
+    //World &world = initialize(argc, argv);
+    World& world = madness::World::get_default();
     if (world.rank() == 0) {
         print_header1("MOLDFT -- molecular DFT and Hartree-Fock code");
     }
@@ -227,6 +234,10 @@ int main(int argc, char **argv) {
         print_stats(world);
     } // world is dead -- ready to finalize
     finalize();
+
+#ifdef HAVE_MRA_TTG
+    mra::finalize();
+#endif // HAVE_MRA_TTG
 
     return 0;
 }
