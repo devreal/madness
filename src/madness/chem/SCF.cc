@@ -1620,7 +1620,7 @@ vecfuncT SCF::compute_residual(World& world, tensorT& occ, tensorT& fock,
     scale(world, Vpsi, fac);
     END_TIMER(world, "Compute residual stuff");
 
-    const bool tile_applyBSH = true;
+    const bool tile_applyBSH = false;
     vecfuncT new_psi;
 
     if (tile_applyBSH) {
@@ -1689,15 +1689,28 @@ vecfuncT SCF::compute_residual(World& world, tensorT& occ, tensorT& fock,
         /**
          * TODO: have the make* functions return their output edge so we don't have to define it up front.
          */
-        ttg::Edge<mra::Key<NDIM>, mra::FunctionsReconstructedNode<T, NDIM>> reconstruct_conv_result;
-        ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>> compress_result,
+        ttg::Edge<mra::Key<NDIM>, mra::FunctionsReconstructedNode<T, NDIM>> reconstruct_conv_result, compress_input;
+        ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>> conv_input, compress_conv_result,
                                                                         convolution_result;
         ttg::Edge<mra::Key<NDIM>, void> load_control;
-        ttg::Edge<mra::Key<NDIM>, mra::FunctionsReconstructedNode<T, NDIM>> load_vmra;
+        std::vector<std::unique_ptr<ttg::TTBase>> tts; // crutch because we need to keep TTs alive
         auto start            = mra::make_start(gaussians, load_control);
-        auto load_tt          = mra::vmra::make_vmra_load(Vpsi, load_control, load_vmra, "load_vmra");
-        auto compress         = mra::make_compress(gaussians, K, true, functiondata, load_vmra, compress_result, "compress");
-        auto convolve         = mra::make_convolution(gaussians, K, compress_result, convolution_result, op, precision, "convolution");
+        if (Vpsi.front().get_impl()->get_tree_state() == madness::TreeState::reconstructed) {
+            // Reconstructed nodes: load and compress into nonstandard form
+            auto load = mra::vmra::make_vmra_load(Vpsi, load_control, compress_input, "load_vmra");
+            tts.push_back(std::move(load));
+        } else if (Vpsi.front().get_impl()->get_tree_state() == madness::TreeState::compressed) {
+            // Compressed nodes: load, reconstruct, and compress into nonstandard form
+            ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>> load_vmra;
+            auto load = mra::vmra::make_vmra_load(Vpsi, load_control, load_vmra, "load_vmra");
+            auto reconstruct = mra::make_reconstruct(gaussians, K, false, functiondata, load_vmra, compress_input, "reconstruct");
+            tts.push_back(std::move(load));
+            tts.push_back(std::move(reconstruct));
+        } else {
+            throw std::runtime_error("Vpsi must be in reconstructed or compressed form");
+        }
+        auto compress         = mra::make_compress(gaussians, K, true, functiondata, compress_input, conv_input, "compress");
+        auto convolve         = mra::make_convolution(gaussians, K, conv_input, convolution_result, op, precision, "convolution");
         auto reconstruct_conv = mra::make_reconstruct(gaussians, K, true, functiondata, convolution_result, reconstruct_conv_result, "reconstruct_convolution");
         auto store_tt         = mra::vmra::make_vmra_store(madconv_mra, reconstruct_conv_result, "store_vmra");
 
