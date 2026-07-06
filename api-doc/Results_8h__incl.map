@@ -1,0 +1,9 @@
+<map id="Results.h" name="Results.h">
+<area shape="rect" id="Node000001" title=" " alt="" coords="220,5,303,31"/>
+<area shape="rect" id="Node000002" title=" " alt="" coords="5,86,152,111"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="236,33,119,83,117,78,234,28"/>
+<area shape="rect" id="Node000003" title=" " alt="" coords="176,79,347,119"/>
+<area shape="poly" id="edge2_Node000001_Node000003" title=" " alt="" coords="264,31,264,65,259,65,259,31"/>
+<area shape="rect" id="Node000004" title=" " alt="" coords="371,86,429,111"/>
+<area shape="poly" id="edge3_Node000001_Node000004" title=" " alt="" coords="283,29,369,77,366,82,280,33"/>
+</map>
