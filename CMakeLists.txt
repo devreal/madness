@@ -692,6 +692,10 @@ if (DEFINED ELEMENTAL_TAG)
   include(external/elemental.cmake)
 endif (DEFINED ELEMENTAL_TAG)
 
+if (ENABLE_MRA_TTG)
+  include(external/mra-ttg.cmake)
+endif (ENABLE_MRA_TTG)
+
 # Add project subdirectories ===================================================
 
 # predefine targets
