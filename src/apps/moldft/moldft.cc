@@ -233,10 +233,12 @@ int main(int argc, char **argv) {
         world.gop.fence();
         print_stats(world);
     } // world is dead -- ready to finalize
-    finalize();
 
 #ifdef HAVE_MRA_TTG
+    // MRA finalizes TTG and MADNESS, must be last
     mra::finalize();
+#else
+    finalize();
 #endif // HAVE_MRA_TTG
 
     return 0;
