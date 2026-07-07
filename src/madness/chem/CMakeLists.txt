@@ -15,6 +15,22 @@ endif()
 
 add_definitions(-DMRA_CHEMDATA_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}\")
 
+set(MADCHEM_SCF_SOURCES SCF.cc)
+
+if (TARGET mra::cuda OR TARGET mra::hip)
+  mra_generate_gpu_wrappers(
+      SOURCES mad_vmra_test.cc
+      CUDA_OUTPUT_VAR _scf_cu
+      HIP_OUTPUT_VAR  _scf_hip
+    )
+  if (TARGET mra::cuda)
+    set(MADCHEM_SCF_SOURCES ${_scf_cu})
+  endif()
+  if (TARGET mra::hip)
+    set(MADCHEM_SCF_SOURCES ${_scf_hip})
+  endif()
+endif()
+
 # Set the CHEM sources and header files
 set(MADCHEM_HEADERS
     AC.h
@@ -118,7 +134,7 @@ set(MADCHEM_SOURCES
     potentialmanager.cc
     polynomial.cc
     SAP.cc
-    SCF.cc
+    ${MADCHEM_SCF_SOURCES}
     SCFOperators.cc
     TDHF.cc
     vibanal.cc

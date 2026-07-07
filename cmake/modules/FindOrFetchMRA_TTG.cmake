@@ -20,6 +20,13 @@ if (NOT TARGET mra::base)
 endif()
 
 if (NOT TARGET mra::base)
+  # When consumed as a subproject, prevent MRA-TTG's own tests, examples, and
+  # benchmarks from entering the MADNESS build.  Using CACHE FORCE overrides any
+  # stale ON value left by a previous standalone MRA-TTG configure run.
+  set(MRA_BUILD_TESTS      OFF CACHE BOOL "Build MRA tests"      FORCE)
+  set(MRA_BUILD_EXAMPLES   OFF CACHE BOOL "Build MRA examples"   FORCE)
+  set(MRA_BUILD_BENCHMARKS OFF CACHE BOOL "Build MRA benchmarks" FORCE)
+
   include(FetchContent)
   FetchContent_Declare(
     MRATTG
