@@ -651,5 +651,17 @@ namespace madness {
 
 }
 
+
+namespace std {
+
+    // Needed to use madness::Key<NDIM> as a key in std::unordered_map
+    template <std::size_t NDIM>
+    struct hash<madness::Key<NDIM>> {
+        std::size_t operator()(const madness::Key<NDIM>& k) const {
+            return k.hash();
+        }
+    };
+} // namespace std
+
 #endif // MADNESS_MRA_KEY_H__INCLUDED
 
