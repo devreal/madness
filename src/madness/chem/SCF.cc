@@ -1651,6 +1651,7 @@ void SCF::vector_stats(const std::vector<double>& v, double& rms,
 static void execute_mra_ttg(auto&& start) {
     auto connected = make_graph_executable(start.get());
     assert(connected);
+    //ttg::trace_on();
     if (ttg::default_execution_context().rank() == 0) {
       // This kicks off the entire computation
       start->invoke();

@@ -11,7 +11,7 @@ if (ENABLE_MRA_TTG)
     check_language(HIP)
     if(CMAKE_HIP_COMPILER)
       enable_language(HIP)
-    else()
+    endif()
   endif()
 
   if (CMAKE_CXX_STANDARD LESS 20)
