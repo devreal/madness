@@ -476,6 +476,7 @@ namespace madness {
                 else break_even=long(0.7*twok);
                 bool rank_is_zero = false;
                 for (std::size_t d=0; d<NDIM; ++d) {
+#ifdef APPLY_USE_LOW_RANK
                     long r;
                     for (r=0; r<twok; ++r) {
                         if (ops_1d[d]->Rs[r] < tol_Rs) break;
@@ -499,10 +500,17 @@ namespace madness {
                         trans[d].VT = ops_1d[d]->RVT.ptr();
                     }
                     trans2[d]=ops_1d[d]->R;
+#else  // APPLY_USE_LOW_RANK
+                    trans[d].r = twok;
+                    trans[d].U = ops_1d[d]->R.ptr();
+                    trans[d].VT = 0;
+#endif // APPLY_USE_LOW_RANK
+                    //std::cout << "MAD muopxv_fast " << d << " R " << ops_1d[d]->R.normf() << std::endl;
                 }
 
-                if (!rank_is_zero)
+                if (!rank_is_zero) {
                     apply_transformation(twok, trans, f, work1, work2, mufac, result);
+                }
 
                 //            apply_transformation2(n, twok, tol, trans2, f, work1, work2, mufac, result);
 //                apply_transformation3(trans2, f, mufac, result);
@@ -521,6 +529,7 @@ namespace madness {
                 else break_even=long(0.7*k);
                 bool rank_is_zero = false;
                 for (std::size_t d=0; d<NDIM; ++d) {
+#ifdef APPLY_USE_LOW_RANK
                     long r;
                     for (r=0; r<k; ++r) {
                         if (ops_1d[d]->Ts[r] < tol_Ts) break;
@@ -544,6 +553,12 @@ namespace madness {
                         trans[d].VT = ops_1d[d]->TVT.ptr();
                     }
                     trans2[d]=ops_1d[d]->T;
+#else  // APPLY_USE_LOW_RANK
+                    trans[d].r = k;
+                    trans[d].U = ops_1d[d]->T.ptr();
+                    trans[d].VT = 0;
+                    //std::cout << "MAD muopxv_fast " << d << " S " << ops_1d[d]->T.normf() << std::endl;
+#endif // APPLY_USE_LOW_RANK
                 }
                 if (!rank_is_zero)
                     apply_transformation(k, trans, f0, work1, work2, -mufac, result0);
