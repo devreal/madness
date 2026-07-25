@@ -1764,7 +1764,7 @@ vecfuncT SCF::compute_residual(World& world, tensorT& occ, tensorT& fock,
         std::vector<poperatorT> ops = make_bsh_operators(world, eps, param);
         set_thresh(world, Vpsi, FunctionDefaults<3>::get_thresh());
 
-//#ifdef HAVE_MRA_TTG
+#ifdef HAVE_MRA_TTG
 
         // define N Gaussians, don't instantiate
         // TODO: use the Vpsi process map
@@ -1784,8 +1784,6 @@ vecfuncT SCF::compute_residual(World& world, tensorT& occ, tensorT& fock,
         for (mra::size_type i = 0; i < N; ++i) {
             madconv_mra[i].set_impl(Vpsi[i], false);
         }
-        /* ensure Vpsi is in reconstructed form before loading into MRA-TTG */
-        reconstruct(world, Vpsi);
 
         /**
          * Quick check: do all functions have the same truncate mode?
@@ -1831,16 +1829,15 @@ vecfuncT SCF::compute_residual(World& world, tensorT& occ, tensorT& fock,
 
         new_psi = std::move(madconv_mra);
 
-//#else  // HAVE_MRA_TTG
-        //verbose_apply = true;
-        auto mad_new_psi = apply(world, ops, Vpsi);
-        //verbose_apply = false;
-//#endif // HAVE_MRA_TTG
+        if (validate_mra_ttg) {
+            auto mad_new_psi = apply(world, ops, Vpsi);
+            compare_mra_madness(mad_new_psi, new_psi, "BSH-conv-result", 1e-8);
+        }
 
-        make_nonstandard(world, Vpsi);
-        compare_mra_madness(mad_new_psi, new_psi, "BSH-conv-result", 1e-8);
-
+#else  // HAVE_MRA_TTG
+        new_psi = apply(world, ops, Vpsi);
         world.gop.fence();
+#endif // HAVE_MRA_TTG
 
         ops.clear();
         Vpsi.clear();

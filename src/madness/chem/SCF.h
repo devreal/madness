@@ -197,6 +197,7 @@ public:
     PCM pcm;
     AtomicBasisSet aobasis;
     functionT mask;
+    bool validate_mra_ttg = false;
 
     scf_data e_data;
 
@@ -227,7 +228,11 @@ public:
 
     /// forwarding constructor
     SCF(World& world, const commandlineparser& parser)
-        : SCF(world, CalculationParameters(world, parser), Molecule(world, parser)) {}
+        : SCF(world, CalculationParameters(world, parser), Molecule(world, parser)) {
+        if (parser.key_exists("validate-mra-ttg")) {
+            validate_mra_ttg = true;
+        }
+    }
 
     /// collective constructor for SCF uses contents of file \c filename and broadcasts to all nodes
     SCF(World& world, const CalculationParameters& param, const Molecule& molecule);
