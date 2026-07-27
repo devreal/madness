@@ -19,7 +19,7 @@ set(MADCHEM_SCF_SOURCES SCF.cc)
 
 if (TARGET mra::cuda OR TARGET mra::hip)
   mra_generate_gpu_wrappers(
-      SOURCES mad_vmra_test.cc
+      SOURCES SCF.cc
       CUDA_OUTPUT_VAR _scf_cu
       HIP_OUTPUT_VAR  _scf_hip
     )
