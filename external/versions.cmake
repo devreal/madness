@@ -1,2 +1,2 @@
 set(MADNESS_TRACKED_PARSEC_TAG parsec-for-ttg)
-set(MADNESS_TRACKED_MRA_TTG_TAG tensorview_concepts_sparsity)
+set(MADNESS_TRACKED_MRA_TTG_TAG batched_convolution)

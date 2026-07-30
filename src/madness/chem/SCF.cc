@@ -1785,7 +1785,7 @@ vecfuncT SCF::compute_residual(World& world, tensorT& occ, tensorT& fock,
             madconv_mra[i].set_impl(Vpsi[i], false);
         }
         /* ensure Vpsi is in reconstructed form before loading into MRA-TTG */
-        reconstruct(world, Vpsi);
+        //reconstruct(world, Vpsi);
 
         /**
          * Quick check: do all functions have the same truncate mode?

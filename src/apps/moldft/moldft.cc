@@ -97,6 +97,15 @@ int main(int argc, char **argv) {
 
             commandlineparser parser(argc, argv);
 
+#ifdef HAVE_MRA_TTG
+            if (parser.key_exists("trace")) {
+                ttg::trace_on();
+            }
+            if (parser.key_exists("batch-size")) {
+                mra::set_batch_size(std::stoi(parser.value("batch-size")));
+            }
+#endif // HAVE_MRA_TTG
+
             if (parser.key_exists("help")) {
                 SCF::help();
 
