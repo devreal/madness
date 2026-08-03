@@ -1715,10 +1715,10 @@ vecfuncT SCF::compute_residual(World& world, tensorT& occ, tensorT& fock,
         fock(i, i) += eps(i);
     }
 
-    gaxpy(world, 1.0, Vpsi, -1.0, fpsi);
+    gaxpy(world, -2.0, Vpsi, 2.0, fpsi);
     fpsi.clear();
-    std::vector<double> fac(nmo, -2.0);
-    scale(world, Vpsi, fac);
+    //std::vector<double> fac(nmo, -2.0);
+    //scale(world, Vpsi, fac);
     END_TIMER(world, "Compute residual stuff");
 
     const bool tile_applyBSH = false;
