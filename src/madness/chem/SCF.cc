@@ -79,6 +79,36 @@ namespace madness {
     }
   } // namespace detail
 
+
+    template<typename T, std::size_t NDIM>
+    bool validate_vmra(const std::vector<madness::Function<T, NDIM>>& vmra,
+        std::string name = "validate_vmra", bool fail_on_error = true) {
+        bool valid = true;
+        for (int i = 0; i < vmra.size(); ++i) {
+            const auto& fn = vmra[i];
+            auto impl = fn.get_impl();
+            for (auto& node : impl->get_coeffs()) {
+                if (impl->get_tree_state() == madness::TreeState::reconstructed) {
+                    if (node.second.has_children() && node.second.coeff().size() != 0 && node.second.coeff().normf() > 0) {
+                        std::cerr << name << ": reconstructed function " << i
+                                  << " has non-empty inner node (" << node.second.coeff().normf() << ") "
+                                  << node.first << " with children" << std::endl;
+                        valid = false;
+                    }
+                } else if (impl->get_tree_state() == madness::TreeState::compressed) {
+                    if (!node.second.has_children() && node.second.coeff().size() > 0 && node.second.coeff().normf() > 0) {
+                        std::cerr << name << ": compressed function " << i
+                                  << " has leaf node " << node.first
+                                  << " with non-zero coefficients (norm " << node.second.coeff().normf() << ")" << std::endl;
+                        valid = false;
+                    }
+                }
+            }
+        }
+        if (!valid && fail_on_error) throw std::runtime_error("validate_vmra: invalid node");
+        return valid;
+    }
+
   template<typename T, std::size_t NDIM>
   inline void compare_mra_madness(const std::vector<madness::Function<T, NDIM>>& madfunc1,
                                   const std::vector<madness::Function<T, NDIM>>& madfunc2,
@@ -1765,6 +1795,8 @@ vecfuncT SCF::compute_residual(World& world, tensorT& occ, tensorT& fock,
         set_thresh(world, Vpsi, FunctionDefaults<3>::get_thresh());
 
 #ifdef HAVE_MRA_TTG
+
+        validate_vmra(Vpsi, "SCF: Vpsi", true);
 
         // define N Gaussians, don't instantiate
         // TODO: use the Vpsi process map
