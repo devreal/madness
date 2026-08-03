@@ -1694,6 +1694,7 @@ static void execute_mra_ttg(auto&& start) {
 vecfuncT SCF::compute_residual(World& world, tensorT& occ, tensorT& fock,
                                const vecfuncT& psi, vecfuncT& Vpsi, double& err) {
 
+    validate_vmra(psi, "SCF: psi", true);
 
     // apply the BSH operator in a Macrotask to reduce communication and possible hangs
     class ApplyTask : public MacroTaskOperationBase {
@@ -1740,6 +1741,7 @@ vecfuncT SCF::compute_residual(World& world, tensorT& occ, tensorT& fock,
         fock(i, i) -= eps(i);
     }
     vecfuncT fpsi = transform(world, psi, fock, trantol, true);
+    validate_vmra(psi, "SCF: fpsi", true);
 
     for (int i = 0; i < nmo; ++i) { // Undo the damage
         fock(i, i) += eps(i);
