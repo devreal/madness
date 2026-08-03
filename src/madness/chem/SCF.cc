@@ -1741,7 +1741,7 @@ vecfuncT SCF::compute_residual(World& world, tensorT& occ, tensorT& fock,
         fock(i, i) -= eps(i);
     }
     vecfuncT fpsi = transform(world, psi, fock, trantol, true);
-    validate_vmra(psi, "SCF: fpsi", true);
+    validate_vmra(fpsi, "SCF: fpsi", true);
 
     for (int i = 0; i < nmo; ++i) { // Undo the damage
         fock(i, i) += eps(i);
