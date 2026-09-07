@@ -83,6 +83,7 @@ namespace madness {
   inline void compare_mra_madness(const std::vector<madness::Function<T, NDIM>>& madfunc1,
                                   const std::vector<madness::Function<T, NDIM>>& madfunc2,
                                   const std::string name, T precision = 1e-15,
+                                  bool ignore_zero = true,
                                   bool fail_on_mismatch = false)
   {
     if (madfunc1.size() != madfunc2.size()) {
@@ -122,21 +123,18 @@ namespace madness {
       }
       for (auto& node1 : impl1->get_coeffs()) {
         auto node2 = impl2->get_coeffs().find(node1.first);
+        auto node1_norm = node1.second.coeff().normf();
         if (node2.get() == impl2->get_coeffs().end()) {
-          std::cout << name << ": node " << node1.first << " in MADNESS vector 1 function " << i << " (norm " << node1.second.coeff().normf() << ") not found in MADNESS vector 2" << std::endl;
-          check = false;
+          if ((node1_norm > precision || !ignore_zero)) {
+            std::cout << name << ": node " << node1.first << " in MADNESS vector 1 function "
+                        << i << " (norm " << node1_norm
+                        << ") not found in MADNESS vector 2" << std::endl;
+            check = false;
+          }
           continue;
         }
 
         node_seen_map[node1.first] = true;
-
-        if (node2.get()->second.has_children() != node1.second.has_children()) {
-          std::cout << name << ": node " << node1.first << " in MADNESS vector 1 function " << i
-                    << " has children " << node1.second.has_children() << " but in vector 2 has children "
-                    << node2.get()->second.has_children() << std::endl;
-          check = false;
-          /* non-fatal error */
-        }
 
         auto norm1 = node1.second.coeff().normf();
         auto norm2 = node2.get()->second.coeff().normf();
@@ -147,14 +145,27 @@ namespace madness {
           check = false;
           continue;
         }
+
+        if (!ignore_zero && node2.get()->second.has_children() != node1.second.has_children()) {
+          std::cout << name << ": node " << node1.first << " in MADNESS vector 1 function " << i
+                    << " has children " << node1.second.has_children() << " but in vector 2 has children "
+                    << node2.get()->second.has_children() << std::endl;
+          check = false;
+          /* non-fatal error */
+        }
       }
 
       // check if all nodes in vector 2 are in vector 1
       for (auto& node2 : impl2->get_coeffs()) {
         if (node_seen_map.find(node2.first) == node_seen_map.end()) {
-          std::cout << name << ": node " << node2.first << " in MADNESS vector 2 function " << i << " (norm " << node2.second.coeff().normf() << ") not found in MADNESS vector 1" << std::endl;
-          check = false;
-          continue;
+            if (node2.second.has_coeff() &&
+                (node2.second.coeff().normf() > precision || !ignore_zero) ) {
+                std::cout << name << ": node " << node2.first << " in MADNESS vector 2 function "
+                          << i << " (norm " << node2.second.coeff().normf()
+                          << ") not found in MADNESS vector 1" << std::endl;
+                check = false;
+                continue;
+            }
         }
       }
     }
@@ -1802,7 +1813,7 @@ vecfuncT SCF::compute_residual(World& world, tensorT& occ, tensorT& fock,
          */
         ttg::Edge<mra::Key<NDIM>, mra::FunctionsReconstructedNode<T, NDIM>> reconstruct_conv_result, compress_input;
         ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>> conv_input, compress_conv_result,
-                                                                        convolution_result;
+                                                                        convolution_result, recompress_result, truncate_result;
         ttg::Edge<mra::Key<NDIM>, void> load_control;
         std::vector<std::unique_ptr<ttg::TTBase>> tts; // crutch because we need to keep TTs alive
         auto start            = mra::make_start(gaussians, load_control);
@@ -1824,31 +1835,48 @@ vecfuncT SCF::compute_residual(World& world, tensorT& occ, tensorT& fock,
         auto convolve         = mra::make_convolution(gaussians, K, conv_input, convolution_result, op, precision, truncate_mode,
                                                       FunctionDefaults<NDIM>::get_cell_min_width(), "convolution");
         auto reconstruct_conv = mra::make_reconstruct(gaussians, K, true, functiondata, convolution_result, reconstruct_conv_result, "reconstruct_convolution");
-        auto store_tt         = mra::vmra::make_vmra_store(madconv_mra, reconstruct_conv_result, madness::TreeState::reconstructed, "store_vmra");
+        auto recompress_conv  = mra::make_compress(gaussians, K, false, functiondata, reconstruct_conv_result, recompress_result, "recompress_convolution");
+
+        auto truncate_conv    = make_truncate(gaussians, K, precision,
+                                              madness::FunctionDefaults<NDIM>::get_truncate_mode(),
+                                              madness::FunctionDefaults<NDIM>::get_cell_min_width(),
+                                              recompress_result, truncate_result, "truncate");
+        auto store_tt         = mra::vmra::make_vmra_store(madconv_mra, truncate_result);
 
         execute_mra_ttg(start);
+
+        END_TIMER(world, "Apply BSH & truncate");
 
 
         new_psi = std::move(madconv_mra);
 
         if (validate_mra_ttg) {
             auto mad_new_psi = apply(world, ops, Vpsi);
+            madness::compress(world, mad_new_psi);
+            truncate(world, mad_new_psi);
             compare_mra_madness(mad_new_psi, new_psi, "BSH-conv-result", 1e-8);
         }
+
+        ops.clear();
+        Vpsi.clear();
+
 
 #else  // HAVE_MRA_TTG
         new_psi = apply(world, ops, Vpsi);
         world.gop.fence();
+        END_TIMER(world, "Apply BSH");
+
+        ops.clear();
+        Vpsi.clear();
+
+        START_TIMER(world);
+        truncate(world, new_psi);
+        END_TIMER(world, "Truncate new psi");
 #endif // HAVE_MRA_TTG
 
         ops.clear();
         Vpsi.clear();
 
-        END_TIMER(world, "Apply BSH");
-
-        START_TIMER(world);
-        truncate(world, new_psi);
-        END_TIMER(world, "Truncate new psi");
     }
 
     // Thought it was a bad idea to truncate *before* computing the residual
