@@ -41,6 +41,7 @@
 #include <madness/world/worldam.h>
 #include <madness/world/world_task_queue.h>
 #include <madness/world/worldgop.h>
+#include <madness/world/thread_binding.h>
 #include <cstdlib>
 #include <sstream>
 
@@ -82,6 +83,7 @@ namespace madness {
                  bool fence)
             : obj_id(1)          ///< start from 1 so that 0 is an invalid id
             , user_state(0)
+            , alive(std::make_shared<std::atomic<bool>>(true))
             , mpi(*(new WorldMpiInterface(comm)))
             , am(* (new WorldAmInterface(*this)))
             , taskq(*(new WorldTaskQueue(*this)))
@@ -126,6 +128,9 @@ namespace madness {
         delete &am;
         delete &mpi;
         if (this->_id != 0) worlds.remove(this);
+        // last: any WorldObject destroyed above must still see this world as alive,
+        // just like it must still be findable via world_from_id
+        alive->store(false, std::memory_order_relaxed);
     }
 
     void World::initialize_world_id_range(int global_rank) {
@@ -207,6 +212,12 @@ namespace madness {
         start_cpu_time = cpu_time();
         start_wall_time = wall_time();
         ThreadPool::begin(nthread);        // Must have thread pool before any AM arrives
+
+        // Throw now if the launcher pinned this rank to fewer hardware threads
+        // than it is about to use -- still single-threaded and before RMI starts,
+        // so a collective on comm is safe here.
+        check_thread_binding(comm, static_cast<int>(ThreadPool::size()) + 1);
+
         if(comm.Get_size() > 1) {
             RMI::begin(comm);           // Must have RMI while still running single threaded
             // N.B. sync everyone up before messages start flying

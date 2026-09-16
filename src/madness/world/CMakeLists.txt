@@ -11,22 +11,23 @@ set(MADWORLD_HEADERS
     uniqueid.h worldprofile.h timers.h binary_fstream_archive.h mpi_archive.h 
     text_fstream_archive.h worlddc.h mem_func_wrapper.h taskfn.h group.h 
     dist_cache.h distributed_id.h type_traits.h function_traits.h stubmpi.h 
-    bgq_atomics.h binsorter.h parsec.h meta.h atomic_shared_ptr.h worldinit.h thread_info.h
-    cloud.h test_utilities.h timing_utilities.h units.h ranks_and_hosts.h)
+    bgq_atomics.h binsorter.h parsec.h meta.h atomic_shared_ptr.h worldinit.h thread_info.h thread_specific.h
+    cloud.h test_utilities.h timing_utilities.h units.h ranks_and_hosts.h
+    thread_binding.h)
 set(MADWORLD_SOURCES
     madness_exception.cc world.cc timers.cc future.cc redirectio.cc
     archive_type_names.cc debug.cc print.cc worldmem.cc worldrmi.cc
     safempi.cc worldpapi.cc worldref.cc worldam.cc worldprofile.cc thread.cc 
     world_task_queue.cc worldgop.cc deferred_cleanup.cc worldmutex.cc
     binary_fstream_archive.cc text_fstream_archive.cc lookup3.c worldmpi.cc 
-    group.cc parsec.cc archive.cc units.cc ranks_and_hosts.cpp)
+    group.cc parsec.cc archive.cc units.cc ranks_and_hosts.cpp thread_binding.cc)
 
 if(MADNESS_ENABLE_CEREAL)
     set(MADWORLD_HEADERS ${MADWORLD_HEADERS} "cereal_archive.h")
 endif()
 
 # Create the MADworld-obj and MADworld library targets
-add_mad_library(world MADWORLD_SOURCES MADWORLD_HEADERS "common;${ELEMENTAL_PACKAGE_NAME}" "madness/world")
+add_mad_library(world MADWORLD_SOURCES MADWORLD_HEADERS "misc;common;${ELEMENTAL_PACKAGE_NAME}" "madness/world")
 
 # DISABLEPIE flag can break linking of dependent libraries (e.g. on Linux using gcc6)
 # instead for each dependent executable target T do:
@@ -44,6 +45,11 @@ if(MADNESS_ENABLE_CEREAL)
   target_link_libraries(${targetname} PUBLIC cereal)
   target_compile_definitions(${targetname} PUBLIC MADNESS_HAS_CEREAL)
 endif()
+
+# nlohmann_json is used starting at MADworld (cloud.h); linking it PUBLIC here
+# carries the usage requirement to every downstream component and to installed
+# consumers of MADNESS. N.B. if fetched it is part of its own export set.
+target_link_libraries(${targetname} PUBLIC nlohmann_json::nlohmann_json)
 
 # Set the dependencies for the MADworld library
 target_include_directories(${targetname} PUBLIC
@@ -94,6 +100,7 @@ if(BUILD_TESTING)
       test_dc.cc test_hashthreaded.cc test_queue.cc test_world.cc 
       test_worldprofile.cc test_binsorter.cc test_vector.cc test_worldptr.cc 
       test_worldref.cc test_stack.cc test_googletest.cc test_tree.cc
+      test_thread_specific.cc
           )
 
   add_unittests(world "${WORLD_TEST_SOURCES}" ";MADworld;MADgtest" "unittests;short")

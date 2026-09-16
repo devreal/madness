@@ -134,6 +134,11 @@ namespace madness {
     /// \ingroup mra
     /// \addtogroup function
 
+    /// Header magic for Function::store/load; bump whenever FunctionNode::serialize changes.
+    ///   7776769  original (Mellow Mushroom Pizza tel.# in Knoxville, +1 for cell in header)
+    ///   7776770  FunctionNode gained _dnorm_tree
+    static constexpr long FUNCTION_ARCHIVE_MAGIC = 7776770;
+
     /// A multiresolution adaptive numerical function
     template <typename T, std::size_t NDIM>
     class Function : public archive::ParallelSerializableObject {
@@ -266,6 +271,61 @@ namespace madness {
                 }
             }
             return impl->eval_local_only(xsim,maxlevel);
+        }
+
+        /// Batched eval_local_only writing into a caller-provided buffer.
+
+        /// Resizes results to xuser.size() (reusing its capacity) and stores one
+        /// (local?,value) pair per input point, in input order: (true,value) if
+        /// the point is owned locally, otherwise (false,0.0).
+        /// Consecutive points that fall in the same leaf box share that box's
+        /// descent and coefficient fetch (last-box memoization), so spatially
+        /// coherent point streams (quadrature grids) amortise the per-point
+        /// tree descent.  Results are bit-for-bit identical to calling the
+        /// single-point eval_local_only on each point.  No communications, and
+        /// no per-call heap allocation once results has capacity.
+        ///
+        /// maxlevel is the maximum depth to search down to --- the max local depth can be
+        /// computed with max_local_depth();
+        void eval_local_only(const std::vector<coordT>& xuser, Level maxlevel,
+                             std::vector<std::pair<bool,T>>& results) const {
+            const double eps=1e-15;
+            verify();
+            MADNESS_ASSERT(is_reconstructed());
+            thread_local std::vector<coordT> xsim;
+            xsim.resize(xuser.size());
+            for (std::size_t ip=0; ip<xuser.size(); ++ip) {
+                coordT xs;
+                user_to_sim(xuser[ip],xs);
+                // If on the boundary, move the point just inside the volume so the
+                // evaluation logic does not fail (matches the single-point path).
+                for (std::size_t d=0; d<NDIM; ++d) {
+                    if (xs[d] < -eps) {
+                        MADNESS_EXCEPTION("eval: coordinate lower-bound error in dimension", d);
+                    }
+                    else if (xs[d] < eps) {
+                        xs[d] = eps;
+                    }
+
+                    if (xs[d] > 1.0+eps) {
+                        MADNESS_EXCEPTION("eval: coordinate upper-bound error in dimension", d);
+                    }
+                    else if (xs[d] > 1.0-eps) {
+                        xs[d] = 1.0-eps;
+                    }
+                }
+                xsim[ip] = xs;
+            }
+            results.resize(xuser.size());
+            impl->eval_local_only(xsim.data(), xsim.size(), maxlevel, results.data());
+        }
+
+        /// Batched eval_local_only returning a fresh vector (see the
+        /// output-parameter overload above for semantics).
+        std::vector<std::pair<bool,T>> eval_local_only(const std::vector<coordT>& xuser, Level maxlevel) const {
+            std::vector<std::pair<bool,T>> results;
+            eval_local_only(xuser, maxlevel, results);
+            return results;
         }
 
         /// Only the invoking process will receive the result via the future
@@ -552,6 +612,11 @@ namespace madness {
 
 
         /// Returns the maximum local depth of the function tree ... no communications
+
+        /// This is the value to pass as \c maxlevel to eval_local_only: it bounds the
+        /// descent to the deepest leaf actually held on this rank.  Passing a larger
+        /// bound (e.g. Level::max()) only makes a missing/remote point descend through
+        /// empty levels doing owner() checks that never match -- pure overhead.
         std::size_t max_local_depth() const {
             PROFILE_MEMBER_FUNC(Function);
             if (!impl) return 0;
@@ -744,23 +809,45 @@ namespace madness {
 
         /// Returns the square of the norm of the local function ... no communication
 
-        /// Works in either basis
+        /// Works in any state that holds its coefficients once, cf.
+        /// FunctionImpl::has_summable_coefficients()
         double norm2sq_local() const {
             PROFILE_MEMBER_FUNC(Function);
             verify();
-            MADNESS_CHECK_THROW(is_compressed() or is_reconstructed(),
-                "function must be compressed or reconstructed for norm2sq_local");
+            MADNESS_CHECK_THROW(impl->has_summable_coefficients(),
+                "norm2sq_local needs a tree that holds its coefficients once");
             return impl->norm2sq_local();
         }
 
 
         /// Returns the 2-norm of the function ... global sum ... works in either basis
 
-        /// See comments for err() w.r.t. applying to many functions.
+        /// Works in any state whose coefficients norm2sq_local() can sum, which
+        /// includes the redundant and nonstandard-with-leaves trees left behind
+        /// by mul_sparse() and friends; the remaining states are reconstructed
+        /// first.  See comments for err() w.r.t. applying to many functions.
+        ///
+        /// Throws if the function is on-demand: it carries no coefficients, so
+        /// its norm is not defined until it is materialized.
+        ///
+        /// N.B. that reconstruction is a mutation -- it discards the interior
+        /// coefficients -- so this (logically const) method fences before it
+        /// changes state: any task still reading those coefficients, e.g. a
+        /// mul_sparse() invoked with fence=false, must be done with them before
+        /// they are removed.
+        ///
+        /// The branch is taken on the tree state, which is replicated, so all
+        /// ranks take the same branch and the global ops stay collective.
         double norm2() const {
             PROFILE_MEMBER_FUNC(Function);
             verify();
             if (VERIFY_TREE) verify_tree();
+            if (!impl->has_summable_coefficients()) {
+                MADNESS_CHECK_THROW(not is_on_demand(),
+                    "norm2 is not defined for an on-demand function; materialize it first");
+                impl->world.gop.fence();
+                reconstruct();
+            }
             double local = impl->norm2sq_local();
 
             impl->world.gop.sum(local);
@@ -828,8 +915,12 @@ namespace madness {
         /// world.gop.fence() to assure global completion before using the function
         /// for other purposes.
         ///
-        /// Must be already compressed.
-        void make_redundant(bool fence = true) {
+        /// Since the transformation does not discard information we define this
+        /// as const ... "logical constness" not "bitwise constness".
+        ///
+        /// Note redundant form stores sum coefficients at every level, so it is larger than
+        /// reconstructed form; a caller that keeps the function alive may want to convert back.
+        void make_redundant(bool fence = true) const {
             change_tree_state(redundant, fence);
         }
 
@@ -905,6 +996,10 @@ namespace madness {
         }
 
         /// Inplace broadens support in scaling function basis
+
+        /// N.B. with fence=false the per-node norm reset is skipped: norm_tree
+        /// keeps the -1.0 broadened marker and dnorm_tree its previous value,
+        /// so broadening cannot be repeated until the norms are recomputed.
         void broaden(const BoundaryConditions<NDIM>& bc=FunctionDefaults<NDIM>::get_bc(),
                      bool fence = true) const {
             verify();
@@ -1175,15 +1270,33 @@ namespace madness {
         T trace_local() const {
             PROFILE_MEMBER_FUNC(Function);
             if (!impl) return 0.0;
+            MADNESS_CHECK_THROW(impl->has_summable_coefficients(),
+                "trace_local needs a tree that holds its coefficients once");
             if (VERIFY_TREE) verify_tree();
             return impl->trace_local();
         }
 
 
         /// Returns global value of \c int(f(x),x) ... global comm required
+
+        /// Works in any state whose coefficients trace_local() can sum; the
+        /// remaining states are reconstructed first.  For efficient use
+        /// especially with many functions, reconstruct them all first and use
+        /// trace_local instead, so you can perform a global sum on all at the
+        /// same time.
+        ///
+        /// Throws if the function is on-demand, and fences before reconstructing;
+        /// see norm2() for both, including why the branch stays collective.
         T trace() const {
             PROFILE_MEMBER_FUNC(Function);
             if (!impl) return 0.0;
+            if (!impl->has_summable_coefficients()) {
+                MADNESS_CHECK_THROW(not is_on_demand(),
+                    "trace is not defined for an on-demand function; materialize it first");
+                impl->world.gop.fence();
+                reconstruct();
+            }
+            if (VERIFY_TREE) verify_tree();
             T sum = impl->trace_local();
             impl->world.gop.sum(sum);
             impl->world.gop.fence();
@@ -1355,9 +1468,7 @@ namespace madness {
             // if this and g are the same, use norm2()
             if constexpr (std::is_same_v<T,R>) {
               if (this->get_impl() == g.get_impl()) {
-                TreeState state = this->get_impl()->get_tree_state();
-                if (not(state == reconstructed or state == compressed))
-                  change_tree_state(reconstructed);
+                // let norm2() handle tree state
                 double norm = this->norm2();
                 return norm * norm;
               }
@@ -1536,9 +1647,11 @@ namespace madness {
             long magic = 0l, id = 0l, ndim = 0l, k = 0l;
             Tensor<double> cell;
             ar & magic & id & ndim & k & cell;
-            MADNESS_ASSERT(magic == 7776769); // Mellow Mushroom Pizza tel.# in Knoxville (+1 for cell in header)
-            MADNESS_ASSERT(id == TensorTypeData<T>::id);
-            MADNESS_ASSERT(ndim == NDIM);
+            // CHECK not ASSERT: ASSERT is compiled out when ASSERTION_TYPE=disable
+            MADNESS_CHECK_THROW(magic == FUNCTION_ARCHIVE_MAGIC,
+                "Function archive was written by an incompatible MADNESS version; regenerate it.");
+            MADNESS_CHECK(id == TensorTypeData<T>::id);
+            MADNESS_CHECK(ndim == NDIM);
 
             // if simulation cell is set it must match the cell from function on file.
             // if simulation cell is not set set it to the one found on file
@@ -1570,7 +1683,7 @@ namespace madness {
             PROFILE_MEMBER_FUNC(Function);
             verify();
             // For type checking, etc.
-            ar & long(7776769) & long(TensorTypeData<T>::id) & long(NDIM) & long(k()) & impl->get_cell();
+            ar & long(FUNCTION_ARCHIVE_MAGIC) & long(TensorTypeData<T>::id) & long(NDIM) & long(k()) & impl->get_cell();
 
             impl->store(ar);
         }
@@ -1659,6 +1772,9 @@ namespace madness {
             std::vector<const FunctionImpl<R,NDIM>*> vright(right.size());
             for (unsigned int i=0; i<right.size(); ++i) {
                 result[i].set_impl(left,false);
+                // set_impl copies left's state, which is redundant here, but the kernel builds
+                // a reconstructed tree (interior nodes carry no coefficients)
+                result[i].get_impl()->set_tree_state(reconstructed);
                 vresult[i] = result[i].impl.get();
                 vright[i] = right[i].get_impl().get();
             }
@@ -1845,28 +1961,28 @@ namespace madness {
         return mul(alpha, f, true);
     }
 
-    /// Sparse multiplication --- left and right must be reconstructed and if tol!=0 have tree of norms already created
+    /// Sparse multiplication; the scalar interface redirects to the vector one in vmra.h
+
+    /// @param[in] tol  target absolute accuracy of the product; see the vector mul_sparse in
+    ///                 vmra.h for the semantics, including the internal safety margin and tol=0
+    /// @param[in] do_make_redundant  if false, both inputs must already be redundant
     template <typename L, typename R,std::size_t NDIM>
     Function<TENSOR_RESULT_TYPE(L,R),NDIM>
-    mul_sparse(const Function<L,NDIM>& left, const Function<R,NDIM>& right, double tol, bool fence=true) {
+    mul_sparse(const Function<L,NDIM>& left, const Function<R,NDIM>& right, double tol,
+               bool fence=true, bool do_make_redundant=true) {
         PROFILE_FUNC;
         left.verify();
         right.verify();
-        MADNESS_ASSERT(left.is_reconstructed() and right.is_reconstructed());
-        if (VERIFY_TREE) left.verify_tree();
-        if (VERIFY_TREE) right.verify_tree();
-
-        Function<TENSOR_RESULT_TYPE(L,R),NDIM> result;
-        result.set_impl(left, false);
-        result.get_impl()->mulXX(left.get_impl().get(), right.get_impl().get(), tol, fence);
-        return result;
+        std::vector< Function<R,NDIM> > vright(1,right);
+        return mul_sparse(left.get_impl()->world, left, vright, tol, fence, do_make_redundant)[0];
     }
 
-    /// Same as \c operator* but with optional fence and no automatic reconstruction
+    /// Same as \c operator* but with optional fence; see mul_sparse to screen
     template <typename L, typename R,std::size_t NDIM>
     Function<TENSOR_RESULT_TYPE(L,R),NDIM>
-    mul(const Function<L,NDIM>& left, const Function<R,NDIM>& right, bool fence=true) {
-        return mul_sparse(left,right,0.0,fence);
+    mul(const Function<L,NDIM>& left, const Function<R,NDIM>& right, bool fence=true,
+        bool do_make_redundant=true) {
+        return mul_sparse(left,right,/*tol=*/0.0,fence,do_make_redundant);
     }
 
     /// Generate new function = op(left,right) where op acts on the function values
@@ -1909,8 +2025,7 @@ namespace madness {
 
     /// This so that we don't have to have friend functions in a different header.
     ///
-    /// If using sparsity (tol != 0) you must have created the tree of norms
-    /// already for both left and right.
+    /// left and right must be in redundant state, with tree norms available.
     template <typename L, typename R, std::size_t D>
     std::vector< Function<TENSOR_RESULT_TYPE(L,R),D> >
     vmulXX(const Function<L,D>& left, const std::vector< Function<R,D> >& vright, double tol, bool fence=true) {
@@ -2062,8 +2177,9 @@ namespace madness {
         if (VERIFY_TREE) left.verify_tree();
         if (VERIFY_TREE) right.verify_tree();
 
+        TreeState operating_state=left.get_impl()->get_tensor_type()==TT_FULL ? compressed : reconstructed;
         // no compression for high-dimensional functions
-        if (NDIM==6) {
+        if (operating_state==reconstructed) {
             left.reconstruct();
             right.reconstruct();
             return gaxpy_oop_reconstructed(1.0,left,1.0,right,true);
@@ -2508,7 +2624,10 @@ namespace madness {
 //        Function<T,LDIM>& gg = const_cast< Function<T,LDIM>& >(g);
 
         f.change_tree_state(redundant,false);
-        g.change_tree_state(redundant);
+        g.change_tree_state(redundant,false);
+        // neither call is fenced, and either may be a no-op if the function already is
+        // redundant -- fence explicitly before the trees are traversed
+        result.world().gop.fence();
 		FunctionImpl<T,NDIM>* fimpl=f.get_impl().get();
 		FunctionImpl<T,LDIM>* gimpl=g.get_impl().get();
 

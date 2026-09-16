@@ -40,6 +40,8 @@
 #include <memory>
 #include <math.h>
 #include <cmath>
+#include <iomanip>
+#include <sstream>
 #include <madness/world/world_object.h>
 #include <madness/world/worlddc.h>
 #include <madness/world/worldhashmap.h>
@@ -282,6 +284,16 @@ namespace madness {
     template <typename T, std::size_t NDIM>
     bool FunctionImpl<T,NDIM>::is_on_demand() const {
     	return tree_state==on_demand;
+    }
+
+    template <typename T, std::size_t NDIM>
+    bool FunctionImpl<T,NDIM>::has_coefficients_on_leaves_only() const {
+        return (tree_state==redundant) or (tree_state==nonstandard_with_leaves);
+    }
+
+    template <typename T, std::size_t NDIM>
+    bool FunctionImpl<T,NDIM>::has_summable_coefficients() const {
+        return is_reconstructed() or is_compressed() or has_coefficients_on_leaves_only();
     }
 
     template <typename T, std::size_t NDIM>
@@ -911,8 +923,17 @@ namespace madness {
     }
 
     /// After 1d push operator must sum coeffs down the tree to restore correct scaling function coefficients
+
+    /// @warning NUMERICALLY UNSTABLE for tensor types other than TT_FULL: sum_down propagates
+    /// coefficients from the root to the leaves, and at each level the low-rank (SVD) tensor
+    /// operations (v2k construction at target thresh, unfilter, per-node add_SVD) re-truncate
+    /// the rank. These truncation errors compound multiplicatively down the tree, so a deeply
+    /// refined (e.g. cuspy) function loses ~1-2 digits relative to the TT_FULL result. Prefer a
+    /// path that avoids sum_down for TT_2D/TT_SVD where threshold-level accuracy is required.
     template <typename T, std::size_t NDIM>
     void FunctionImpl<T,NDIM>::sum_down(bool fence) {
+        if (get_tensor_type()!=TT_FULL && world.rank()==0)
+            print("WARNING: sum_down is numerically unstable for tensor type",get_tensor_type());
         tree_state=reconstructed;
         if (world.rank() == coeffs.owner(cdata.key0)) sum_down_spawn(cdata.key0, coeffT());
         if (fence) world.gop.fence();
@@ -945,6 +966,11 @@ namespace madness {
     template <typename T, std::size_t NDIM>
     void FunctionImpl<T,NDIM>::diff(const DerivativeBase<T,NDIM>* D, const implT* f, bool fence) {
         typedef std::pair<keyT,coeffT> argT;
+        if (D->parallel_submit_) {
+            D->submit_diff_tasks(f, this);   // same tasks, spawned from the pool instead of here
+            if (fence) world.gop.fence();
+            return;
+        }
         for (const auto& [key, node]: f->coeffs) {
             if (node.has_coeff()) {
                 Future<argT> left  = D->find_neighbor(f, key,-1);
@@ -1287,12 +1313,14 @@ namespace madness {
         }
     }
 
-    // For each local node sets value of norm tree, snorm and dnorm to 0.0
+    // For each local node sets norm_tree, snorm and dnorm to 0.0, and marks
+    // dnorm_tree as uncomputed.
     template <typename T, std::size_t NDIM>
     void FunctionImpl<T,NDIM>::zero_norm_tree() {
         typename dcT::iterator end = coeffs.end();
         for (typename dcT::iterator it=coeffs.begin(); it!=end; ++it) {
             it->second.set_norm_tree(0.0);
+            it->second.set_dnorm_tree(NORM_TREE_UNCOMPUTED);
             it->second.set_snorm(0.0);
             it->second.set_dnorm(0.0);
         }
@@ -1455,9 +1483,16 @@ namespace madness {
         if (finalstate==get_tree_state()) return;
 
 
-        // go through reconstructed state -- requires fence!
+        // go through reconstructed state -- requires fence! The uncovered transitions need the
+        // reconstructed coefficients before the second pass, so the fence is unavoidable; report a
+        // broken no-fence promise once, from one rank, rather than per rank per call.
+        if (not fence and FunctionDefaults<NDIM>::get_debug() and world.rank() == 0) {
+            static std::atomic<bool> reported(false);
+            if (not reported.exchange(true))
+                print("change_tree_state:", current_state, "->", finalstate,
+                      "must reconstruct first and therefore fences, despite fence=false");
+        }
         change_tree_state(reconstructed,true);
-        print("could not respect  no-fence  parameter in change_tree_state");
         change_tree_state(finalstate,fence);
 
     }
@@ -1660,13 +1695,12 @@ namespace madness {
     /// calculate the wavelet coefficients using the sum coefficients of all child nodes
 
     /// @param[in] key 	this's key
-    /// @param[in] v 	sum coefficients of the child nodes
+    /// @param[in] v 	sum coefficients and propagated norms of the child nodes
     /// @param[in] nonstandard  keep the sum coefficients with the wavelet coefficients
-    /// @param[in] redundant    keep only the sum coefficients, discard the wavelet coefficients
-    /// @return 		the sum coefficients
+    /// @return 		the sum coefficients and propagated norms
     template <typename T, std::size_t NDIM>
-    std::pair<typename FunctionImpl<T,NDIM>::coeffT,double> FunctionImpl<T,NDIM>::compress_op(const keyT& key,
-    		const std::vector< Future<std::pair<coeffT,double> > >& v, bool nonstandard1) {
+    typename FunctionImpl<T,NDIM>::compressT FunctionImpl<T,NDIM>::compress_op(const keyT& key,
+    		const std::vector< Future<compressT> >& v, bool nonstandard1) {
         //PROFILE_MEMBER_FUNC(FunctionImpl);
 
         double cpu0=cpu_time();
@@ -1674,11 +1708,12 @@ namespace madness {
         tensorT d(cdata.v2k);
         //            coeffT d(cdata.v2k,targs);
         int i=0;
-        double norm_tree2=0.0;
+        double norm_tree2=0.0, dnorm_tree2=0.0;
         for (KeyChildIterator<NDIM> kit(key); kit; ++kit,++i) {
             //                d(child_patch(kit.key())) += v[i].get();
             d(child_patch(kit.key())) += v[i].get().first.full_tensor();
-            norm_tree2+=v[i].get().second*v[i].get().second;
+            norm_tree2+=v[i].get().second.first*v[i].get().second.first;
+            dnorm_tree2+=v[i].get().second.second*v[i].get().second.second;
         }
 
         d = filter(d);
@@ -1695,44 +1730,56 @@ namespace madness {
         TensorArgs targs2=targs;
         targs2.thresh*=0.1;
 
-        // need the deep copy for contiguity
-        coeffT ss=coeffT(copy(d(cdata.s0)));
-        double snorm=ss.normf();
+        // need the deep copy for contiguity; ss shares it rather than taking a
+        // second one, so this k^NDIM block is the only temporary on the path
+        const tensorT s0block = copy(d(cdata.s0));
+        coeffT ss = coeffT(s0block);
+        double snorm = ss.normf();
 
-        if (key.level()> 0 && !nonstandard1) d(cdata.s0) = 0.0;
+        // dnorm must mean ||d|| in every tree state. The stored tensor keeps its
+        // s0 block at the root and everywhere in nonstandard form, so zero s0
+        // unconditionally to measure and put it back when the stored tensor is
+        // one that keeps it.
+        const bool stored_tensor_keeps_s0 = (key.level() == 0) or nonstandard1;
+        d(cdata.s0) = 0.0;
+        const double dnorm = d.normf();
+        if (stored_tensor_keeps_s0) d(cdata.s0) = s0block;
 
         coeffT dd=coeffT(d,targs2);
-        double dnorm=dd.normf();
         double norm_tree=sqrt(norm_tree2);
+        // dnorm_tree accumulates this node's d coefficients and all those below it
+        double dnorm_tree=sqrt(dnorm_tree2+dnorm*dnorm);
 
         acc->second.set_snorm(snorm);
         acc->second.set_dnorm(dnorm);
         acc->second.set_norm_tree(norm_tree);
+        acc->second.set_dnorm_tree(dnorm_tree);
 
         acc->second.set_coeff(dd);
         cpu1=cpu_time();
         timer_compress_svd.accumulate(cpu1-cpu0);
 
-        // return sum coefficients
-        return std::make_pair(ss,snorm);
+        // return sum coefficients and propagated norms
+        return std::make_pair(ss,std::make_pair(norm_tree,dnorm_tree));
     }
 
     /// similar to compress_op, but insert only the sum coefficients in the tree
 
-    /// also sets snorm, dnorm and norm_tree for all nodes
+    /// also sets snorm, dnorm, norm_tree and dnorm_tree for all nodes
     /// @param[in] key  this's key
-    /// @param[in] v    sum coefficients of the child nodes
-    /// @return         the sum coefficients
+    /// @param[in] v    sum coefficients and propagated norms of the child nodes
+    /// @return         the sum coefficients and propagated norms
     template <typename T, std::size_t NDIM>
-    std::pair<typename FunctionImpl<T,NDIM>::coeffT,double>
-            FunctionImpl<T,NDIM>::make_redundant_op(const keyT& key, const std::vector< Future<std::pair<coeffT,double> > >& v) {
+    typename FunctionImpl<T,NDIM>::compressT
+            FunctionImpl<T,NDIM>::make_redundant_op(const keyT& key, const std::vector< Future<compressT> >& v) {
 
         tensorT d(cdata.v2k);
         int i=0;
-        double norm_tree2=0.0;
+        double norm_tree2=0.0, dnorm_tree2=0.0;
         for (KeyChildIterator<NDIM> kit(key); kit; ++kit,++i) {
             d(child_patch(kit.key())) += v[i].get().first.full_tensor();
-            norm_tree2+=v[i].get().second*v[i].get().second;
+            norm_tree2+=v[i].get().second.first*v[i].get().second.first;
+            dnorm_tree2+=v[i].get().second.second*v[i].get().second.second;
         }
         d = filter(d);
         double norm_tree=sqrt(norm_tree2);
@@ -1751,13 +1798,17 @@ namespace madness {
         const auto found = coeffs.find(acc, key);
         MADNESS_CHECK(found);
 
+        // dnorm_tree accumulates this node's d coefficients and all those below it
+        double dnorm_tree=sqrt(dnorm_tree2+dnorm*dnorm);
+
         acc->second.set_coeff(s);
         acc->second.set_dnorm(dnorm);
         acc->second.set_snorm(snorm);
         acc->second.set_norm_tree(norm_tree);
+        acc->second.set_dnorm_tree(dnorm_tree);
 
-        // return sum coefficients
-        return std::make_pair(s,norm_tree);
+        // return sum coefficients and propagated norms
+        return std::make_pair(s,std::make_pair(norm_tree,dnorm_tree));
     }
 
     /// Changes non-standard compressed form to standard compressed form
@@ -1829,9 +1880,11 @@ namespace madness {
     template <typename T, std::size_t NDIM>
     double FunctionImpl<T,NDIM>::norm2sq_local() const {
         PROFILE_MEMBER_FUNC(FunctionImpl);
+        MADNESS_CHECK_THROW(has_summable_coefficients(),
+            "norm2sq_local() needs a tree that holds its coefficients once");
         typedef Range<typename dcT::const_iterator> rangeT;
         return world.taskq.reduce<double,rangeT,do_norm2sq_local>(rangeT(coeffs.begin(),coeffs.end()),
-                                                                  do_norm2sq_local());
+                                                                  do_norm2sq_local(has_coefficients_on_leaves_only()));
     }
 
 
@@ -1946,8 +1999,13 @@ namespace madness {
         const double d=sizeof(T);
         const double fac=1024*1024*1024;
 
+        // This is a diagnostic and must not mutate the tree, so report the norm
+        // only in the states where norm2sq_local() is defined (cf.
+        // has_summable_coefficients()).  The tree state is replicated, so all
+        // ranks take the same branch and the global ops stay collective.
+        const bool norm_is_meaningful = has_summable_coefficients();
         double norm=0.0;
-        {
+        if (norm_is_meaningful) {
             double local = norm2sq_local();
             this->world.gop.sum(local);
             this->world.gop.fence();
@@ -1955,12 +2013,19 @@ namespace madness {
         }
 
         if (this->world.rank()==0) {
-
-            constexpr std::size_t bufsize=128;
-            char buf[bufsize];
-            snprintf(buf, bufsize, "%40s at time %.1fs: norm/tree/#coeff/size: %7.5f %zu, %6.3f m, %6.3f GByte",
-                   (name.c_str()), wall, norm, tsize,double(ncoeff)*1.e-6,double(ncoeff)/fac*d);
-            print(std::string(buf));
+            std::ostringstream oss;
+            oss << std::setw(40) << name << " at time "
+                << std::fixed << std::setprecision(1) << wall
+                << "s: norm/tree/#coeff/size: ";
+            if (norm_is_meaningful)
+                oss << std::setw(7) << std::setprecision(5) << norm;
+            else
+                oss << std::setw(7) << "n/a";
+            oss << " " << tsize
+                << ", " << std::setw(6) << std::setprecision(3) << double(ncoeff)*1.e-6
+                << " m, " << std::setw(6) << std::setprecision(3) << double(ncoeff)/fac*d
+                << " GByte";
+            print(oss.str());
         }
     }
 
@@ -2025,54 +2090,67 @@ namespace madness {
     T FunctionImpl<T,NDIM>::eval_cube(Level n, coordT& x, const tensorT& c) const {
         PROFILE_MEMBER_FUNC(FunctionImpl);
         const int k = cdata.k;
-        double px[NDIM][MAXK];
         T sum = T(0.0);
 
-        for (std::size_t i=0; i<NDIM; ++i) legendre_scaling_functions(x[i],k,px[i]);
+        // v = sum_{p,q,...} c[p,q,...] phi_p(x0) phi_q(x1) ... is a separable
+        // contraction; the fastest evaluation depends on the dimension.
+        //
+        // NDIM<=2 (deep 1-D radial trees are the hottest eval workload): a
+        // factored register-resident loop.  Partial sums stay in registers, the
+        // only memory traffic is one streaming read of c, and no per-thread
+        // scratch is needed (px is <= NDIM*MAXK*8 bytes of stack).  Routing the
+        // tiny (k x 1) contraction through general_fast_transform's dispatch
+        // and ping-pong scratch measured ~20% slower at NDIM=1.
+        //
+        // NDIM>=3: general_fast_transform's staged contraction vectorizes
+        // (the factored loop's inner reduction cannot under strict FP) and
+        // measured 4-5x faster at NDIM=6; the phi matrices and scratch are
+        // thread_local, so this path stays allocation-free after warm-up.
+        if constexpr (NDIM <= 2) {
+            MADNESS_ASSERT(k <= MAXK);
+            double px[NDIM][MAXK];
+            for (std::size_t i=0; i<NDIM; ++i) legendre_scaling_functions(x[i],k,px[i]);
 
-        if (NDIM == 1) {
-            for (int p=0; p<k; ++p)
-                sum += c(p)*px[0][p];
-        }
-        else if (NDIM == 2) {
-            for (int p=0; p<k; ++p)
-                for (int q=0; q<k; ++q)
-                    sum += c(p,q)*px[0][p]*px[1][q];
-        }
-        else if (NDIM == 3) {
-            for (int p=0; p<k; ++p)
-                for (int q=0; q<k; ++q)
-                    for (int r=0; r<k; ++r)
-                        sum += c(p,q,r)*px[0][p]*px[1][q]*px[2][r];
-        }
-        else if (NDIM == 4) {
-            for (int p=0; p<k; ++p)
-                for (int q=0; q<k; ++q)
-                    for (int r=0; r<k; ++r)
-                        for (int s=0; s<k; ++s)
-                            sum += c(p,q,r,s)*px[0][p]*px[1][q]*px[2][r]*px[3][s];
-        }
-        else if (NDIM == 5) {
-            for (int p=0; p<k; ++p)
-                for (int q=0; q<k; ++q)
-                    for (int r=0; r<k; ++r)
-                        for (int s=0; s<k; ++s)
-                            for (int t=0; t<k; ++t)
-                                sum += c(p,q,r,s,t)*px[0][p]*px[1][q]*px[2][r]*px[3][s]*px[4][t];
-        }
-        else if (NDIM == 6) {
-            for (int p=0; p<k; ++p)
-                for (int q=0; q<k; ++q)
-                    for (int r=0; r<k; ++r)
-                        for (int s=0; s<k; ++s)
-                            for (int t=0; t<k; ++t)
-                                for (int u=0; u<k; ++u)
-                                    sum += c(p,q,r,s,t,u)*px[0][p]*px[1][q]*px[2][r]*px[3][s]*px[4][t]*px[5][u];
+            if constexpr (NDIM == 1) {
+                const T* cp = c.ptr();
+                for (int p=0; p<k; ++p) sum += cp[p]*px[0][p];
+            }
+            else {
+                for (int p=0; p<k; ++p) {
+                    const double a = px[0][p];
+                    const T* cq = &c(p,0);
+                    T s2 = T(0);
+                    for (int q=0; q<k; ++q) s2 += cq[q]*px[1][q];
+                    sum += a*s2;
+                }
+            }
         }
         else {
-            MADNESS_EXCEPTION("FunctionImpl:eval_cube:NDIM?",NDIM);
+            thread_local Tensor<double> phi[NDIM];
+            thread_local int phi_k = -1;
+            if (phi_k != k) {
+                for (std::size_t i=0; i<NDIM; ++i) phi[i] = Tensor<double>(long(k), 1L);
+                phi_k = k;
+            }
+            for (std::size_t i=0; i<NDIM; ++i)
+                legendre_scaling_functions(x[i], k, phi[i].ptr());
+
+            typedef TENSOR_RESULT_TYPE(T,double) evalR;
+            // ws/res are references bound to the thread_local scratch tensors.
+            auto [ws, res] = madness::detail::eval_scratch<evalR>(c.size());
+            general_fast_transform(c, phi, res, ws);
+            sum = res.ptr()[0];
         }
-        return sum*pow(2.0,0.5*NDIM*n)/sqrt(FunctionDefaults<NDIM>::get_cell_volume());
+        // exp2 replaces pow for the level scaling; 1/sqrt(cell_volume) is cached
+        // per thread and refreshed only if the cell changes (perf-doc change #2).
+        thread_local double cached_cell_volume = -1.0;
+        thread_local double cached_inv_sqrt_cell_vol = 0.0;
+        const double cell_volume = FunctionDefaults<NDIM>::get_cell_volume();
+        if (cell_volume != cached_cell_volume) {
+            cached_cell_volume = cell_volume;
+            cached_inv_sqrt_cell_vol = 1.0/std::sqrt(cell_volume);
+        }
+        return sum * std::exp2(0.5*NDIM*n) * cached_inv_sqrt_cell_vol;
     }
 
     template <typename T, std::size_t NDIM>
@@ -2944,6 +3022,97 @@ namespace madness {
     }
 
     template <typename T, std::size_t NDIM>
+    void
+    FunctionImpl<T,NDIM>::eval_local_only(const Vector<double,NDIM>* xin,
+                                          std::size_t npt, Level maxlevel,
+                                          std::pair<bool,T>* results) {
+        const ProcessID me = world.rank();
+
+        // Memoize the most recently hit leaf (key + shallow coefficient copy).
+        // Quadrature callers stream spatially coherent points, so consecutive
+        // points usually land in the same leaf box; replaying the exact
+        // coordinate-refinement arithmetic against the cached key costs a few
+        // flops per level and skips the per-level container find()s that
+        // dominate the descent.  A miss falls through to the verbatim
+        // single-point walk below (owner()+find()+Future -- no const_accessor,
+        // which doubles NUMA descent cost).  Leaves partition the domain and
+        // interior nodes of a reconstructed function hold no coeffs, so a
+        // translation match at the cached level identifies exactly the leaf the
+        // scalar descent would have stopped at: results are bit-for-bit
+        // identical to the single-point overload.  No fence intervenes within a
+        // call, so the cached node cannot be invalidated mid-call.
+        bool have_cache = false;
+        keyT cached_key;
+        tensorT cached_c;
+
+        for (std::size_t ip=0; ip<npt; ++ip) {
+            results[ip] = std::pair<bool,T>(false, T(0));
+
+            if (have_cache) {
+                Vector<double,NDIM> x = xin[ip];
+                Vector<Translation,NDIM> l;
+                for (std::size_t i=0; i<NDIM; ++i) l[i] = 0;
+                const Level nl = cached_key.level();
+                for (Level nn=0; nn<nl; ++nn) {
+                    for (std::size_t i=0; i<NDIM; ++i) {
+                        double xi = x[i]*2.0;
+                        int li = int(xi);
+                        if (li == 2) li = 1;
+                        x[i] = xi - li;
+                        l[i] = 2*l[i] + li;
+                    }
+                }
+                bool same = true;
+                const Vector<Translation,NDIM>& lc = cached_key.translation();
+                for (std::size_t i=0; i<NDIM; ++i) same = same && (l[i] == lc[i]);
+                if (same) {
+                    results[ip] = std::pair<bool,T>(true, eval_cube(nl, x, cached_c));
+                    continue;
+                }
+            }
+
+            // Verbatim single-point descent (keep in sync with the scalar
+            // overload above).
+            Vector<double,NDIM> x = xin[ip];
+            keyT key(0);
+            Vector<Translation,NDIM> l = key.translation();
+            while (key.level() <= maxlevel) {
+                if (coeffs.owner(key) == me) {
+                    typename dcT::futureT fut = coeffs.find(key);
+                    typename dcT::iterator it = fut.get();
+                    if (it != coeffs.end()) {
+                        nodeT& node = it->second;
+                        if (node.has_coeff()) {
+                            cached_key = key;
+                            cached_c = node.coeff().full_tensor();
+                            have_cache = true;
+                            results[ip] = std::pair<bool,T>(true,
+                                eval_cube(key.level(), x, cached_c));
+                            break;
+                        }
+                    }
+                }
+                for (std::size_t i=0; i<NDIM; ++i) {
+                    double xi = x[i]*2.0;
+                    int li = int(xi);
+                    if (li == 2) li = 1;
+                    x[i] = xi - li;
+                    l[i] = 2*l[i] + li;
+                }
+                key = keyT(key.level()+1,l);
+            }
+        }
+    }
+
+    template <typename T, std::size_t NDIM>
+    std::vector<std::pair<bool,T>>
+    FunctionImpl<T,NDIM>::eval_local_only(const std::vector<Vector<double,NDIM>>& xin, Level maxlevel) {
+        std::vector<std::pair<bool,T>> results(xin.size(), std::pair<bool,T>(false,T(0)));
+        eval_local_only(xin.data(), xin.size(), maxlevel, results.data());
+        return results;
+    }
+
+    template <typename T, std::size_t NDIM>
     void FunctionImpl<T,NDIM>::evaldepthpt(const Vector<double,NDIM>& xin,
                                            const keyT& keyin,
                                            const typename Future<Level>::remote_refT& ref) {
@@ -3171,6 +3340,8 @@ template <typename T, std::size_t NDIM>
     template <typename T, std::size_t NDIM>
     T FunctionImpl<T,NDIM>::trace_local() const {
         PROFILE_MEMBER_FUNC(FunctionImpl);
+        MADNESS_CHECK_THROW(has_summable_coefficients(),
+            "trace_local() needs a tree that holds its coefficients once");
         std::vector<long> v0(NDIM,0);
         T sum = 0.0;
         if (is_compressed()) {
@@ -3183,9 +3354,13 @@ template <typename T, std::size_t NDIM>
             }
         }
         else {
+            // on a redundant or nonstandard-with-leaves tree the internal nodes
+            // repeat what the leaves already carry, cf. norm2sq_local()
+            const bool leaves_only = has_coefficients_on_leaves_only();
             for (typename dcT::const_iterator it=coeffs.begin(); it!=coeffs.end(); ++it) {
                 const keyT& key = it->first;
                 const nodeT& node = it->second;
+                if (leaves_only and node.has_children()) continue;
                 if (node.has_coeff()) sum += node.coeff().full_tensor()(v0)*pow(0.5,NDIM*key.level()*0.5);
             }
         }
@@ -3266,9 +3441,9 @@ template <typename T, std::size_t NDIM>
 
 
     /// will insert
-    /// @return s coefficient and norm_tree for key
+    /// @return s coefficient and (norm_tree, dnorm_tree) for key
     template <typename T, std::size_t NDIM>
-    Future< std::pair<GenTensor<T>,double> > FunctionImpl<T,NDIM>::compress_spawn(const Key<NDIM>& key,
+    Future< typename FunctionImpl<T,NDIM>::compressT > FunctionImpl<T,NDIM>::compress_spawn(const Key<NDIM>& key,
 				bool nonstandard1, bool keepleaves, bool redundant1) {
         if (!coeffs.probe(key)) print("missing node",key);
         MADNESS_ASSERT(coeffs.probe(key));
@@ -3278,7 +3453,7 @@ template <typename T, std::size_t NDIM>
 
         // internal node -> continue recursion
         if (node.has_children()) {
-            std::vector< Future<std::pair<coeffT,double> > > v = future_vector_factory<std::pair<coeffT,double> >(1<<NDIM);
+            std::vector< Future<compressT> > v = future_vector_factory<compressT>(1<<NDIM);
             int i=0;
             for (KeyChildIterator<NDIM> kit(key); kit; ++kit,++i) {
                 //PROFILE_BLOCK(compress_send); // Too fine grain for routine profiling
@@ -3291,7 +3466,7 @@ template <typename T, std::size_t NDIM>
         }
 
         // leaf node -> remove coefficients here and pass them back to parent for filtering
-        // insert snorm, dnorm=0.0, normtree (=snorm)
+        // insert snorm, dnorm=0.0, normtree (=snorm), dnormtree (=0.0)
         else {
             // special case: tree has only root node: keep sum coeffs and make zero diff coeffs
             if (key.level()==0) {
@@ -3302,7 +3477,8 @@ template <typename T, std::size_t NDIM>
                     node.set_dnorm(0.0);
                     node.set_snorm(snorm);
                     node.set_norm_tree(snorm);
-                    return Future< std::pair<GenTensor<T>,double> >(std::make_pair(result,snorm));
+                    node.set_dnorm_tree(0.0);
+                    return Future<compressT>(std::make_pair(result,std::make_pair(snorm,0.0)));
                 } else {
                     // compress
                     coeffT result(node.coeff());
@@ -3313,19 +3489,30 @@ template <typename T, std::size_t NDIM>
                     node.set_dnorm(0.0);
                     node.set_snorm(snorm);
                     node.set_norm_tree(snorm);
-                    return Future< std::pair<GenTensor<T>,double> >(std::make_pair(result,node.coeff().normf()));
+                    node.set_dnorm_tree(0.0);
+                    return Future<compressT>(std::make_pair(result,std::make_pair(node.coeff().normf(),0.0)));
                 }
 
             } else { // this is a leaf node
                 Future<coeffT > result(node.coeff());
+                const double snorm = node.coeff().normf();
+
                 if (not keepleaves) node.clear_coeff();
 
-                auto snorm=(keepleaves) ? node.coeff().normf() : 0.0;
+                // norm_tree is the norm of this subtree and the value the parent
+                // filters with, so it is the leaf norm either way -- reading it
+                // after clear_coeff() would propagate a zero up to the root.
                 node.set_norm_tree(snorm);
-                node.set_snorm(snorm);
+                node.set_dnorm_tree(0.0);
+                // snorm, in contrast, describes the coefficients this node still
+                // holds: zero when they were just cleared, matching
+                // FunctionNode::recompute_snorm_and_dnorm().  The invariant
+                // "snorm > 0 implies the node has coefficients" is what
+                // recur_down_for_contraction_map() screens on.
+                node.set_snorm(keepleaves ? snorm : 0.0);
                 node.set_dnorm(0.0);
 
-                return Future< std::pair<GenTensor<T>,double> >(std::make_pair(result,snorm));
+                return Future<compressT>(std::make_pair(result,std::make_pair(snorm,0.0)));
             }
         }
     }
@@ -3466,6 +3653,14 @@ template <typename T, std::size_t NDIM>
                 bool binary) {
         PROFILE_FUNC;
         MADNESS_ASSERT(NDIM<=6);
+        // The plot cell must be an (NDIM x 2) [lo,hi]-per-dimension tensor; an empty
+        // or ill-shaped cell would dereference out of bounds below (cell(d,0)/(d,1)),
+        // which previously segfaulted. Convert that into a clear error. Callers must
+        // default an unset cell to the simulation cell first (see SCF::do_plots).
+        MADNESS_CHECK_THROW(cell.ndim()==2 && cell.dim(0)>=static_cast<long>(NDIM)
+                            && cell.dim(1)>=2,
+                            "plotdx: plot cell must be an (NDIM x 2) [lo,hi] tensor "
+                            "(got an empty or ill-shaped cell)");
         const char* element[6] = {"lines","quads","cubes","cubes4D","cubes5D","cubes6D"};
 
         function.verify();

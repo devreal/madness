@@ -48,6 +48,7 @@ include(AddMADExecutable)
 include(AddUnittests)
 include(AddMPITests)
 include(AddScriptedTests)
+include(AddQCTests)
 include(CMakePackageConfigHelpers)
 include(CopyTargetProperties)
 include(FeatureSummary)
@@ -56,20 +57,12 @@ include(FetchContent)
 
 # Check compiler feature support ===============================================
 
-set(CMAKE_CXX_STANDARD 17 CACHE STRING  "C++ ISO Standard version")
-if (NOT(CMAKE_CXX_STANDARD EQUAL 17 OR CMAKE_CXX_STANDARD EQUAL 20))
-  message(FATAL_ERROR "C++ 2017 ISO Standard or higher is required to compile MADNESS")
-endif()
-# C++20 is only configurable via compile features with cmake 3.12 and older
-if (CMAKE_CXX_STANDARD EQUAL 20 AND CMAKE_VERSION VERSION_LESS 3.12.0)
-  message(FATAL_ERROR "C++ 2020 ISO Standard requires CMake version 3.12 or higher")
-endif()
+set(CMAKE_CXX_STANDARD 20 CACHE STRING  "C++ ISO Standard version")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if (CMAKE_CXX_STANDARD LESS 20)
+  message(FATAL_ERROR "MADNESS requires C++20 or later (CMAKE_CXX_STANDARD=${CMAKE_CXX_STANDARD}; pass -DCMAKE_CXX_STANDARD=20)")
+endif()
 set(CMAKE_CXX_EXTENSIONS OFF CACHE BOOL "Whether to use extensions of C++ ISO Standard version")
-
-# workaround for cmake bug: CheckCXXSourceCompiles does not respect CXX_STANDARD
-# see https://github.com/OPM/opm-common/blob/master/cmake/Modules/FindCXX11Features.cmake
-add_options(CXX ALL_BUILDS ${CMAKE_CXX${CMAKE_CXX_STANDARD}_STANDARD_COMPILE_OPTION})
 
 # Set install paths ============================================================
 include(GNUInstallDirs)
@@ -106,9 +99,12 @@ include(external/versions.cmake)
 # failure to find the library is an error. 
 
 option(ENABLE_MPI "Enable Message Passing Interface (MPI) Library" ON)
-#redefaultable_option(ENABLE_MKL "Search for Intel Math Kernel Library (MKL) for BLAS and LAPACK support" ON)
 option(ENABLE_MKL "Search for Intel Math Kernel Library (MKL) for BLAS and LAPACK support" ON)
+option(ENABLE_ARMPL "Search for Arm Performance Libraries (ARMPL) for BLAS and LAPACK support" ON)
+option(ENABLE_NVPL "Search for NVIDIA Performance Libraries (NVPL) for BLAS and LAPACK support on ARM" ON)
+option(ENABLE_BLIS "Search for BLIS (serial) for BLAS support" ON)
 option(ENABLE_ACML "Search for AMD Core Math Library (ACML) for BLAS and LAPACK support" ON)
+option(ENABLE_OPENBLAS "Allow use of OpenBLAS for BLAS/LAPACK (unsafe for multithreading on ARM)" OFF)
 option(ENABLE_TCMALLOC_MINIMAL "Enable use of tcmalloc_minimal library from Google Performance Tools (gperftools)" OFF)
 option(ENABLE_GPERFTOOLS "Enable use of full Google Performance Tools (gperftools)" OFF)
 option(ENABLE_LIBUNWIND
@@ -118,21 +114,19 @@ option(ENABLE_PAPI "Enables use of PAPI" OFF)
 option(ENABLE_LIBXC "Enables use of the libxc library of density functionals" ON)
 option(ENABLE_PCM "Enables use of the polarizable continuum model library" ON)
 option(ENABLE_INTEGRATORXX "Enables use of the IntegratorXX for building DFT quadrature grids" ON)
+option(ENABLE_DFTD3 "Enables use of simple-dftd3 for empirical dispersion corrections (DFT-D3)" ON)
 option(ENABLE_PYTHON "Enables Python bindings via pybind11" OFF)
+option(ENABLE_LIBXSMM "Enable LIBXSMM library for accelerated small matrix multiplication" ON)
+option(ENABLE_MTXMQ_PROFILE "Instrument mTxmq to record a per-shape call/FLOP profile, reported at exit" OFF)
 
-set(CMAKE_REQUIRED_LIBRARIES ${LAPACK_LIBRARIES})
-check_cxx_source_compiles(
-    "
-    namespace madness {
-      template <typename T>
-      void mTxmq(long dimi, long dimj, long dimk,
-		 T* __restrict__ c, const T* a, const T* b, long ldb=-1);
-
-      template <>
-      void mTxmq(long dimi, long dimj, long dimk, double* __restrict__ c, const  double* a, const double* b, long ldb);
-    }
-    int main() { double a[1], b[1], c[1]; madness::mTxmq(1,1,1,c,a,b,1); return 0; }
-    " HAVE_MTXMQ)
+# LIBXSMM only backs src/madness/tensor, which MADNESS_BUILD_MADWORLD_ONLY does not
+# build; fetching+building it there would cost a network clone for nothing.
+if (ENABLE_LIBXSMM AND NOT MADNESS_BUILD_MADWORLD_ONLY)
+  include(${PROJECT_SOURCE_DIR}/cmake/modules/FindOrFetchLibxsmm.cmake)
+else ()
+  set(MADNESS_HAS_LIBXSMM OFF CACHE BOOL "MADNESS has access to LIBXSMM" FORCE)
+  set(HAVE_MTXMQ OFF CACHE BOOL "MADNESS has mTxmq enabled" FORCE)
+endif ()
 
   ####### preferred task backend
 set(MADNESS_TASK_VALID_BACKENDS Pthreads TBB PaRSEC)
@@ -191,6 +185,9 @@ else (ENABLE_ELEMENTAL)
   set(MADNESS_HAS_ELEMENTAL 0)
 endif (ENABLE_ELEMENTAL)
 add_feature_info(Elemental ENABLE_ELEMENTAL "compiles parallel linear-algebra library Elemental as part of MADNESS")
+add_feature_info(LIBXSMM ENABLE_LIBXSMM "Enable LIBXSMM library for accelerated small matrix multiplication")
+add_feature_info(MTXMQ_PROFILE ENABLE_MTXMQ_PROFILE "Instrument mTxmq to record a per-shape call/FLOP profile, reported at exit")
+set(MTXMQ_PROFILE ${ENABLE_MTXMQ_PROFILE})
 
 option(ENABLE_BOOST "Enable C++ Boost Libraries" OFF)
 
@@ -409,7 +406,6 @@ check_cxx_source_compiles(
     int main() { return 0; }
     " HAVE_CRAYXT)
 if(HAVE_CRAYXE)
-  set(AMD_QUADCORE_TUNE ON CACHE BOOL "Target for tuning mtxmq kernels")
   set(USE_SPINLOCKS ON CACHE BOOL 
       "Enables use of spinlocks instead of mutexs (faster unless over subscribing processors)" FORCE)
   set(MAD_BIND_DEFAULT "1 0 2" CACHE STRING "The default binding for threads" FORCE)
@@ -475,7 +471,7 @@ endif(NOT CMAKE_SYSTEM_PROCESSOR)
 if(processor_name MATCHES "^(aarch64.*|AARCH64.*|arm64.*|ARM64.*)" OR processor_name MATCHES "^(arm.*|ARM.*)" OR processor_name MATCHES "^(mips.*|MIPS.*)")
   # on ARM everything, including Windows, targets ARM C++ ABI
   set(MADNESS_CXX_ABI ${MADNESS_CXX_ABI_GenericARM})
-elseif(processor_name MATCHES "amd64.*|x86_64.*|AMD64.*" OR processor_name MATCHES "i686.*|i386.*|x86.*" OR processor_name MATCHES "^(powerpc|ppc)64le" OR processor_name MATCHES "^(powerpc|ppc)64")
+elseif(processor_name MATCHES "amd64.*|x86_64.*|AMD64.*" OR processor_name MATCHES "i686.*|i386.*|x86.*" OR processor_name MATCHES "^(powerpc|ppc)64le" OR processor_name MATCHES "^(powerpc|ppc)64" OR processor_name MATCHES "^(powerpc|ppc)")
   if (CMAKE_SYSTEM_NAME STREQUAL Windows) # on x86 Windows all compilers (clang, intel) target Windows C++ ABI
     set(MADNESS_CXX_ABI ${MADNESS_CXX_ABI_Microsoft})
   else (CMAKE_SYSTEM_NAME STREQUAL Windows)  # everyone else uses Itanium C++ ABI
@@ -637,6 +633,16 @@ check_cxx_source_compiles(
     int main() { return 0; }
     " HAVE_UNQUALIFIED_STATIC_DECL)
 
+# If on ARM disable useless warning about pair<double,double> return in lambda in mra/kernel_range.h --- doing it via local pragma does not work due to nested includes
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    # Matches arm64 (macOS/Linux), aarch64 (Linux), and ARM64 (Windows)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|amd64)")
+        # Do nothing for x86_64
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64|arm64|ARM64)")
+        add_compile_options(-Wno-psabi)
+    endif()
+endif()
+
 # Check linker feature support ===============================================
 
 include(CheckDisablePIESupport)
@@ -680,11 +686,17 @@ include(external/gperftools.cmake)
 include(external/tbb.cmake)
 include(external/parsec.cmake)
 include(external/boost.cmake)
+# nlohmann_json is used as low as MADworld (cloud.h), so it must be available
+# even in the MADWORLD_ONLY build
+include(${PROJECT_SOURCE_DIR}/cmake/modules/FindOrFetchNlohmannJson.cmake)
 if (NOT MADNESS_BUILD_MADWORLD_ONLY OR MADNESS_BUILD_LIBRARIES_ONLY)
   include(external/lapack.cmake)
   include(external/libxc.cmake)
   include(external/pcm.cmake)
   include(external/integratorxx.cmake)
+  include(external/dftd3.cmake)
+  add_feature_info(DFTD3 MADNESS_HAS_DFTD3
+      "empirical DFT-D3 dispersion corrections to the energy and the nuclear gradient, via simple-dftd3")
 endif ()
 include(external/pybind11.cmake)
 
@@ -713,15 +725,27 @@ add_custom_target(install-madness-libraries)
 add_dependencies(everything madness-libraries)
 
 include_directories(${PROJECT_SOURCE_DIR}/src ${PROJECT_BINARY_DIR}/src)
+# make nlohmann/json.hpp visible to every in-tree target's sources (the MAD*-obj
+# object libraries do not inherit usage requirements through target linkage)
+include_directories($<TARGET_PROPERTY:nlohmann_json::nlohmann_json,INTERFACE_INCLUDE_DIRECTORIES>)
 set(CMAKE_INCLUDE_CURRENT_DIR_IN_INTERFACE TRUE)
 set(CMAKE_INCLUDE_CURRENT_DIR TRUE)
 include(CTest)
 if(BUILD_TESTING)
   set(MADNESS_HAS_GOOGLE_TEST 1)
+  include(FindOrFetchGTest)  # provides the MADgtest target (discover-or-fetch)
   add_custom_target_subproject(madness unittests)
   add_custom_target_subproject(madness scripted_tests)
+  # the qctest cases in src/examples/qc are driven by bin/run_qctest.py; a build
+  # without ENABLE_PYTHON has not looked for an interpreter yet (see
+  # external/pybind11.cmake), so ask for one here -- QUIET, since the cases are
+  # simply not registered without it
+  find_package(Python3 COMPONENTS Interpreter QUIET)
   add_custom_target_subproject(madness check COMMAND ${CMAKE_CTEST_COMMAND} -V -R "madness/test/" USES_TERMINAL) # to be GNU compatible
   add_custom_target_subproject(madness check-short COMMAND ${CMAKE_CTEST_COMMAND} -L \"short|medium\" -V -R "madness/test/" USES_TERMINAL) # to be GNU compatible
+  # quantum-chemistry example decks only (src/examples/qc); tiers still apply, so
+  # short/medium cases are additionally covered by check-short above
+  add_custom_target_subproject(madness check-qctest COMMAND ${CMAKE_CTEST_COMMAND} -L qctest -V USES_TERMINAL)
   add_dependencies(everything unittests)
 endif()
 add_subdirectory(src)

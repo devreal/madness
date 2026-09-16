@@ -35,6 +35,7 @@
 #include <madness/madness_config.h>
 #include <madness/misc/ran.h>
 #include <madness/world/posixmem.h>
+#include <madness/world/thread_specific.h>
 
 #include <memory>
 #include <complex>
@@ -2470,35 +2471,273 @@ MADNESS_PRAGMA_GCC(diagnostic pop)
         long dimi = 1;
         for (int n=1; n<t.ndim(); ++n) dimi *= dimj;
 
-#if HAVE_IBMBGQ
-        long nij = dimi*dimj;
-        if (IS_UNALIGNED(pc) || IS_UNALIGNED(t0) || IS_UNALIGNED(t1)) {
-            for (long i=0; i<nij; ++i) t0[i] = 0.0;
-            mTxm(dimi, dimj, dimj, t0, t.ptr(), pc);
-            for (int n=1; n<t.ndim(); ++n) {
-                for (long i=0; i<nij; ++i) t1[i] = 0.0;
-                mTxm(dimi, dimj, dimj, t1, t0, pc);
-                std::swap(t0,t1);
-            }
-        }
-        else {
-            mTxmq_padding(dimi, dimj, dimj, dimj, t0, t.ptr(), pc);
-            for (int n=1; n<t.ndim(); ++n) {
-                mTxmq_padding(dimi, dimj, dimj, dimj, t1, t0, pc);
-                std::swap(t0,t1);
-            }
-        }
-#else
-        // Now assume no restriction on the use of mtxmq
         mTxmq(dimi, dimj, dimj, t0, t.ptr(), pc);
         for (int n=1; n<t.ndim(); ++n) {
             mTxmq(dimi, dimj, dimj, t1, t0, pc);
             std::swap(t0,t1);
         }
-#endif
         
         return result;
     }
+
+    /// Optimized fast_transform for complex tensor * real matrix.
+    /// Transforms the real and imaginary parts across all dimensions in real
+    /// space, unpacking once on entry and repacking once into result on exit.
+    ///
+    /// Allocates nothing: the two caller-supplied complex tensors hold 2*sz
+    /// reals each, which is exactly the four real buffers of length sz that the
+    /// split needs.  The initial assignment is chosen so that the ndim swaps
+    /// below leave the live buffer in the workspace, letting the final repack
+    /// into result run without aliasing its own source.
+    template <class R>
+    Tensor<std::complex<R>>& fast_transform(const Tensor<std::complex<R>>& t,
+                                            const Tensor<R>& c,
+                                            Tensor<std::complex<R>>& result,
+                                            Tensor<std::complex<R>>& workspace) {
+        MADNESS_CHECK(t.iscontiguous() && result.iscontiguous() && workspace.iscontiguous());
+        MADNESS_CHECK(result.ptr() != workspace.ptr());
+        MADNESS_CHECK(t.ptr() != result.ptr() && t.ptr() != workspace.ptr());
+
+        const R* pc = c.ptr();
+        const long ndim = t.ndim();
+        const long sz = t.size();
+        MADNESS_CHECK(result.size() >= sz && workspace.size() >= sz);
+
+        long dimj = c.dim(1);
+        long dimi = 1;
+        for (int n = 1; n < ndim; ++n) dimi *= dimj;
+
+        R* res_raw = reinterpret_cast<R*>(result.ptr());
+        R* wrk_raw = reinterpret_cast<R*>(workspace.ptr());
+        R* bufA = (ndim & 1) ? res_raw : wrk_raw;
+        R* bufB = (ndim & 1) ? wrk_raw : res_raw;
+
+        R* in_re  = bufA;
+        R* in_im  = bufA + sz;
+        R* out_re = bufB;
+        R* out_im = bufB + sz;
+
+        // 1. Unpack complex input into Real and Imag arrays ONCE at the start
+        const R* t_raw = reinterpret_cast<const R*>(t.ptr());
+        for (long i = 0; i < sz; ++i) {
+            in_re[i] = t_raw[2 * i];
+            in_im[i] = t_raw[2 * i + 1];
+        }
+
+        for (int n = 0; n < ndim; ++n) {
+            mTxmq(dimi, dimj, dimj, out_re, in_re, pc);
+            mTxmq(dimi, dimj, dimj, out_im, in_im, pc);
+            std::swap(in_re, out_re);
+            std::swap(in_im, out_im);
+        }
+
+        // 2. Repack into result ONCE at the end (in_* is in the workspace here)
+        for (long i = 0; i < sz; ++i) {
+            res_raw[2 * i]     = in_re[i];
+            res_raw[2 * i + 1] = in_im[i];
+        }
+
+        return result;
+    }
+
+    /// Separated transform with a distinct matrix per dimension, reusing caller buffers.
+    ///
+    /// Computes, with no internal allocation,
+    ///   result(i,j,...) <-- sum(i',j',...) t(i',j',...) c[0](i',i) c[1](j',j) ...
+    /// like general_transform, but the caller supplies result and workspace so they
+    /// can be reused across many calls. Both must be contiguous and at least as large
+    /// as the biggest intermediate the contraction produces. That is t.size() when no
+    /// axis expands, but an expanding matrix (c[d].dim(1) > c[d].dim(0), e.g.
+    /// coeffs2values with npt > k) can grow it larger, so size to the running maximum,
+    /// not t.size(). c[d] may be rectangular; c[d].dim(0) must equal dim d of t.
+    /// t, result and workspace must be distinct: the contraction ping-pongs between
+    /// result and workspace and mTxmq cannot alias its source and destination.
+    /// No communication; safe on any worker thread as long as result and workspace
+    /// are not shared between concurrent calls.
+    ///
+    /// Instantiate only where TENSOR_RESULT_TYPE(T,Q) == T (the matrix type Q does not
+    /// promote the result). This covers every (T,double) the eval path needs; it
+    /// excludes real-tensor x complex-matrix pairs like (double,double_complex), which
+    /// lower to a mixed-type cblas gemm that MKL is missing.
+    template <class T, class Q>
+    Tensor<TENSOR_RESULT_TYPE(T,Q)>&
+    general_fast_transform(const Tensor<T>& t, const Tensor<Q>* c,
+                           Tensor<TENSOR_RESULT_TYPE(T,Q)>& result,
+                           Tensor<TENSOR_RESULT_TYPE(T,Q)>& workspace) {
+        typedef TENSOR_RESULT_TYPE(T,Q) R;
+        // Excluded pairs would compile by implicit instantiation and then hit the
+        // missing mixed-type gemm; fail loudly here instead (see the doc comment).
+        static_assert(std::is_same<TENSOR_RESULT_TYPE(T,Q), T>::value,
+                      "general_fast_transform requires the matrix type not to "
+                      "promote the result past the tensor type");
+        MADNESS_CHECK(t.iscontiguous() && result.iscontiguous() && workspace.iscontiguous());
+        // Catch the realistic accident of reusing one scratch tensor for two
+        // arguments (exact base-pointer aliasing); arbitrary partial overlap is
+        // the caller's responsibility.
+        MADNESS_CHECK(result.ptr() != workspace.ptr());
+        MADNESS_CHECK(t.ptr() != result.ptr() && t.ptr() != workspace.ptr());
+
+        const long D = t.ndim();
+
+        // Largest intermediate any buffer must hold = max over steps of the output
+        // size. The running count starts at t.size() and is rescaled by dimj/dimk
+        // each step; for expanding matrices (m_d > k) it can exceed t.size().
+        {
+            long running = t.size();
+            long max_running = running;
+            for (long d = 0; d < D; ++d) {
+                MADNESS_CHECK(c[d].ndim() == 2 && c[d].dim(0) > 0);
+                MADNESS_CHECK(running % c[d].dim(0) == 0);
+                running = (running / c[d].dim(0)) * c[d].dim(1);
+                if (running > max_running) max_running = running;
+            }
+            MADNESS_CHECK(result.size() >= max_running &&
+                          workspace.size() >= max_running);
+        }
+
+        R* buf0 = workspace.ptr();
+        R* buf1 = result.ptr();
+        if (D & 1) std::swap(buf0, buf1);  // odd # of steps: final write lands in result
+
+        R*   out = buf0;
+        R*   in_r = nullptr;               // R* source for steps d >= 1
+        long n = t.size();
+
+        for (long d = 0; d < D; ++d) {
+            const long dimk = c[d].dim(0);
+            const long dimj = c[d].dim(1);
+            const long dimi = n / dimk;
+            if (d == 0) {
+                mTxmq(dimi, dimj, dimk, out, t.ptr(), c[d].ptr());
+            } else {
+                mTxmq(dimi, dimj, dimk, out, in_r, c[d].ptr());
+            }
+            n = dimi * dimj;
+            in_r = out;
+            out  = (out == buf0) ? buf1 : buf0;
+        }
+        return result;
+    }
+
+    /// Optimized general_fast_transform for complex tensor * real matrices.
+    template <class R>
+    Tensor<std::complex<R>>&
+    general_fast_transform(const Tensor<std::complex<R>>& t,
+                           const Tensor<R>* c,
+                           Tensor<std::complex<R>>& result,
+                           Tensor<std::complex<R>>& workspace) {
+        MADNESS_CHECK(t.iscontiguous() && result.iscontiguous() && workspace.iscontiguous());
+        MADNESS_CHECK(result.ptr() != workspace.ptr());
+        MADNESS_CHECK(t.ptr() != result.ptr() && t.ptr() != workspace.ptr());
+
+        const long D = t.ndim();
+
+        long running = t.size();
+        long max_running = running;
+        for (long d = 0; d < D; ++d) {
+            MADNESS_CHECK(c[d].ndim() == 2 && c[d].dim(0) > 0);
+            MADNESS_CHECK(running % c[d].dim(0) == 0);
+            running = (running / c[d].dim(0)) * c[d].dim(1);
+            if (running > max_running) max_running = running;
+        }
+        MADNESS_CHECK(result.size() >= max_running &&
+                      workspace.size() >= max_running);
+
+        // Allocates nothing: result and workspace hold 2*max_running reals
+        // each, exactly the four real buffers the split needs.  Chosen so the
+        // D swaps below leave the live buffer in the workspace, so the final
+        // repack into result does not alias its own source.
+        R* res_raw = reinterpret_cast<R*>(result.ptr());
+        R* wrk_raw = reinterpret_cast<R*>(workspace.ptr());
+        R* bufA = (D & 1) ? res_raw : wrk_raw;
+        R* bufB = (D & 1) ? wrk_raw : res_raw;
+
+        R* bufA_re = bufA;
+        R* bufA_im = bufA + max_running;
+        R* bufB_re = bufB;
+        R* bufB_im = bufB + max_running;
+
+        // 1. Unpack complex input into Real and Imag arrays ONCE
+        const long sz0 = t.size();
+        const R* t_raw = reinterpret_cast<const R*>(t.ptr());
+        for (long i = 0; i < sz0; ++i) {
+            bufA_re[i] = t_raw[2 * i];
+            bufA_im[i] = t_raw[2 * i + 1];
+        }
+
+        R* in_re = bufA_re;
+        R* in_im = bufA_im;
+        R* out_re = bufB_re;
+        R* out_im = bufB_im;
+        long n = sz0;
+
+        for (long d = 0; d < D; ++d) {
+            const long dimk = c[d].dim(0);
+            const long dimj = c[d].dim(1);
+            const long dimi = n / dimk;
+
+            mTxmq(dimi, dimj, dimk, out_re, in_re, c[d].ptr());
+            mTxmq(dimi, dimj, dimk, out_im, in_im, c[d].ptr());
+
+            n = dimi * dimj;
+            std::swap(in_re, out_re);
+            std::swap(in_im, out_im);
+        }
+
+        // 2. Repack into result ONCE (in_* is in the workspace here)
+        const long final_sz = n;
+        for (long i = 0; i < final_sz; ++i) {
+            res_raw[2 * i]     = in_re[i];
+            res_raw[2 * i + 1] = in_im[i];
+        }
+
+        return result;
+    }
+
+    namespace detail {
+        /// Per-thread grow-on-demand buffer pair for general_fast_transform.
+        template <typename R>
+        struct EvalScratch { Tensor<R> a, b; };
+
+        /// The function-local static pool backing eval_scratch<R>().  One pool
+        /// per result type R, shared by every FunctionImpl<T,NDIM> of that type;
+        /// its lifetime is the process, but eval_scratch_clear<R>() reclaims the
+        /// buffers on demand.
+        template <typename R>
+        thread_specific<EvalScratch<R>>& eval_scratch_pool() {
+            static thread_specific<EvalScratch<R>> pool;
+            return pool;
+        }
+
+        /// Grow-on-demand per-thread buffer pair for general_fast_transform.
+        ///
+        /// Backed by a reclaimable thread_specific pool rather than a
+        /// thread_local: the pair can grow to k^NDIM each for 6-D eval, and a
+        /// thread_local would pin that per worker thread for the life of the
+        /// thread (≈ the process) with no way to free it — bad under the
+        /// TBB/PaRSEC backends, whose arenas touch more threads than
+        /// MAD_NUM_THREADS.  eval_scratch_clear<R>() frees them.  Each thread
+        /// first-touches its own pair (NUMA-local); buffers grow monotonically
+        /// to the largest need seen on that thread.  Never shared across threads.
+        template <typename R>
+        std::pair<Tensor<R>&, Tensor<R>&> eval_scratch(long need) {
+            EvalScratch<R>& s = eval_scratch_pool<R>().local();
+            if (s.a.size() < need) {
+                s.a = Tensor<R>(need);
+                s.b = Tensor<R>(need);
+            }
+            return {s.a, s.b};
+        }
+
+        /// Free every thread's general_fast_transform scratch buffers.  Call
+        /// only at a quiescent point — no eval may be in flight and no
+        /// reference returned by eval_scratch<R>() may still be in use (see
+        /// thread_specific::clear()).
+        template <typename R>
+        void eval_scratch_clear() {
+            eval_scratch_pool<R>().clear();
+        }
+    } // namespace detail
 
     /// Return a new tensor holding the absolute value of each element of t
 

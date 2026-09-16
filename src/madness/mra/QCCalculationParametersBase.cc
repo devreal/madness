@@ -15,6 +15,16 @@
 
 namespace madness {
 
+namespace {
+bool is_missing_datagroup_exception(const std::exception& ex) {
+    constexpr const char* kPrefix = "position_stream: failed to locate ";
+    const char* what = ex.what();
+    if (what == nullptr) return false;
+    const std::string message(what);
+    return message.rfind(kPrefix, 0) == 0;
+}
+} // namespace
+
 
 
 
@@ -75,6 +85,10 @@ void QCCalculationParametersBase::read_input(World& world, const std::string fil
 
 	std::string filecontents, line;
     std::string errmsg;
+    // 0: no error, 1: throw invalid_argument, 2: throw runtime_error. Only rank
+    // 0 reads the file, so both the message and its type have to be broadcast --
+    // see the collective throw at the end of this function.
+    int errtype=0;
 	if (world.rank()==0) {
         try {
             std::ifstream f(filename.c_str());
@@ -82,15 +96,34 @@ void QCCalculationParametersBase::read_input(World& world, const std::string fil
             read_internal(world, filecontents, tag);
         } catch (std::invalid_argument& e) {
             errmsg=e.what();
-            throw;
+            errtype=1;
         } catch (std::exception& e) {
-            std::stringstream ss;
-            ss << "could not read data group >>" << tag << "<< in file " << filename;
-            errmsg=ss.str();
+            const bool is_missing_group = is_missing_datagroup_exception(e);
+            if (is_missing_group && !throw_if_datagroup_not_found) {
+                // Missing groups are optional for multi-workflow inputs.
+                // Keep defaults silently unless this parameter group is required.
+            } else if (is_missing_group) {
+                std::stringstream ss;
+                ss << "could not read data group >>" << tag << "<< in file " << filename;
+                errmsg=ss.str();
+                errtype=2;
+            } else {
+                std::stringstream ss;
+                ss << "error while reading data group >>" << tag << "<< in file "
+                   << filename << ": " << e.what();
+                errmsg=ss.str();
+                errtype=2;
+            }
         }
     }
 	world.gop.broadcast_serializable(*this, 0);
-    if (errmsg.size()>0) throw std::runtime_error(errmsg);
+    // throw on *every* rank, with the same message and the same type. Throwing
+    // on rank 0 only would unwind one rank out of the application while the
+    // others keep computing.
+    world.gop.broadcast_serializable(errmsg, 0);
+    world.gop.broadcast(errtype, 0);
+    if (errtype==1) throw std::invalid_argument(errmsg);
+    if (errtype==2) throw std::runtime_error(errmsg);
 }
 
 /// read the parameters from the command line and broadcast
@@ -127,6 +160,11 @@ void QCCalculationParametersBase::read_internal(World& world, std::string& filec
 	// read input lines
 	while (std::getline(f,line)) {
 
+		// keep an original-case copy: values of case_sensitive_keys() (paths and
+		// other free-form identifiers) must not be folded, or a deck cannot
+		// round-trip them -- see case_sensitive_keys()
+		std::string line_raw = line;
+
 		// all in lower case
 		std::transform(line.begin(), line.end(), line.begin(), ::tolower);
 
@@ -134,6 +172,9 @@ void QCCalculationParametersBase::read_internal(World& world, std::string& filec
 		std::size_t last = line.find_first_of('#');
 		line=line.substr(0,last);
         std::replace_copy(line.begin(), line.end(), line.begin(),'=', ' ');
+
+		line_raw=line_raw.substr(0,line_raw.find_first_of('#'));
+        std::replace_copy(line_raw.begin(), line_raw.end(), line_raw.begin(),'=', ' ');
 
 		std::stringstream sline(line);
 
@@ -160,7 +201,10 @@ void QCCalculationParametersBase::read_internal(World& world, std::string& filec
 		}
 
 		std::string word,line1;
-		while (sline >> word) {line1+=word+" ";}
+		// for case-sensitive keys take the value from the original-case line
+		std::stringstream svalues(keeps_case(key) ? line_raw : line);
+		svalues >> word;                       // drop the key
+		while (svalues >> word) {line1+=word+" ";}
 		// trim result
 		last = line1.find_last_not_of(' ');
 		line1=line1.substr(0, last+1);
