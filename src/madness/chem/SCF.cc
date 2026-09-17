@@ -2141,6 +2141,10 @@ vecfuncT SCF::compute_residual(World& world, tensorT& occ, tensorT& fock,
     //scale(world, Vpsi, fac);
     END_TIMER(world, "Compute residual stuff");
 
+    vecfuncT new_psi;
+#ifdef HAVE_MRA_TTG
+    new_psi = apply_bsh_mrattg(world, Vpsi, eps, param);
+#else  // HAVE_MRA_TTG
     // bsh_apply selects the backend (executors above; eps fed identically to all).
     // auto: macrotask when multinode (rank-local apply, no inter-node convolution comm)
     // or at tight protocol (one orbital per task bounds the working set where memory
@@ -2165,10 +2169,6 @@ vecfuncT SCF::compute_residual(World& world, tensorT& occ, tensorT& fock,
     if (redistribute) batch = 1;   // one owner per task (explicit macrotask mode included)
     if (redistribute and param.print_level() >= 2 and world.rank() == 0)
         print("BSH apply: redistribute operand to single-owner batches (tight protocol)");
-    vecfuncT new_psi;
-#ifdef HAVE_MRA_TTG
-    new_psi = apply_bsh_mrattg(world, Vpsi, eps, param);
-#else  // HAVE_MRA_TTG
     if (bsh_apply_mode == "macrotask")  new_psi = apply_bsh_macrotask(world, Vpsi, eps, param, batch, redistribute);
     else if (bsh_apply_mode == "plain") new_psi = apply_bsh_plain(world, Vpsi, eps, param);
     else                                new_psi = apply_bsh_tiled(world, Vpsi, eps, param);
