@@ -45,6 +45,8 @@
 #include <madchem.h>
 
 #ifdef HAVE_MRA_TTG
+#include <array>
+#include <mutex>
 #include <mra/mra.h>
 #include <mra/vmra/vmra.h>
 #include <ttg.h>
@@ -1804,6 +1806,34 @@ static void execute_mra_ttg(auto&& start) {
     ttg::execute();
     ttg::fence();
 }
+
+/// Feed MADNESS functions into an MRA-TTG graph as compressed nodes on `out`.
+
+/// They are loaded reconstructed (compressed trees are reconstructed first) and
+/// compressed in the graph: a compressed MADNESS tree loaded as-is can carry
+/// interior nodes without coefficients, which the loader marks as leafs while
+/// still sending their children.
+template <typename T, mra::Dimension NDIM, typename FunctionSetT>
+static void load_compressed_mrattg(const std::vector<Function<T, (std::size_t)NDIM>>& f,
+                                   const std::shared_ptr<FunctionSetT>& fns, mra::size_type K,
+                                   const mra::FunctionData<T, NDIM>& functiondata,
+                                   ttg::Edge<mra::Key<NDIM>, void>& control,
+                                   ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>>& out,
+                                   std::vector<std::unique_ptr<ttg::TTBase>>& tts,
+                                   const std::string& name) {
+    ttg::Edge<mra::Key<NDIM>, mra::FunctionsReconstructedNode<T, NDIM>> reconstructed;
+    const auto state = f.front().get_impl()->get_tree_state();
+    if (state == madness::TreeState::reconstructed) {
+        tts.push_back(mra::vmra::make_vmra_load(f, control, reconstructed, "load_" + name));
+    } else if (state == madness::TreeState::compressed) {
+        ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>> loaded;
+        tts.push_back(mra::vmra::make_vmra_load(f, control, loaded, "load_" + name));
+        tts.push_back(mra::make_reconstruct(fns, K, false, functiondata, loaded, reconstructed, "reconstruct_" + name));
+    } else {
+        throw std::runtime_error(name + " must be in reconstructed or compressed form");
+    }
+    tts.push_back(mra::make_compress(fns, K, false, functiondata, reconstructed, out, "compress_" + name));
+}
 #endif // HAVE_MRA_TTG
 
 /// ~10 orbitals per rank in flight; nmo (one chunk) for small systems.
@@ -2006,11 +2036,13 @@ vecfuncT SCF::apply_bsh_plain(World& world, vecfuncT& Vpsi, const tensorT& eps,
 
 #ifdef HAVE_MRA_TTG
 vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
-                               const CalculationParameters& param) {
+                               const CalculationParameters& param,
+                               const vecfuncT* psi, std::vector<double>* rnorm) {
 
     START_TIMER(world);
 
-    vecfuncT new_psi;
+    const bool residual = (psi != nullptr);
+    MADNESS_CHECK_THROW(!residual || psi->size() == Vpsi.size(), "apply_bsh_mrattg: psi and Vpsi differ in size");
     std::vector<poperatorT> ops = make_bsh_operators(world, eps, param);
     set_thresh(world, Vpsi, FunctionDefaults<3>::get_thresh());
 
@@ -2028,10 +2060,10 @@ vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
     auto dmap = mra::make_devicemap<NDIM>(pmap);
     auto gaussians = mra::make_functionset<mra::Gaussian<T, NDIM>>(pmap.batch_manager());
 
-    /* create the result function vector; share impl for process-map ownership */
-    vecfuncT madconv_mra(N);
+    /* create the result function vector (new psi, or the residual); share impl for process-map ownership */
+    vecfuncT result(N);
     for (mra::size_type i = 0; i < N; ++i) {
-        madconv_mra[i].set_impl(Vpsi[i], false);
+        result[i].set_impl(Vpsi[i], false);
     }
 
     /**
@@ -2078,14 +2110,37 @@ vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
                                                 ttg::Void{}, ttg::Void{}, /*enable_truncate=*/true, precision,
                                                 madness::FunctionDefaults<NDIM>::get_truncate_mode(),
                                                 madness::FunctionDefaults<NDIM>::get_cell_min_width());
-    auto store_tt         = mra::vmra::make_vmra_store(madconv_mra, recompress_result);
+
+    // residual r = psi - BSH(Vpsi) and its norms, on the device
+    ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>> psi_compressed, residual_result;
+    ttg::Edge<mra::Key<NDIM>, mra::DenseTensor<T, 1>> norm_result;
+    std::vector<double> norms(N, 0.0);
+    if (residual) {
+        load_compressed_mrattg(*psi, gaussians, K, functiondata, load_control, psi_compressed, tts, "psi");
+        tts.push_back(mra::make_gaxpy(T(1.0), T(-1.0), gaussians, K, psi_compressed, recompress_result,
+                                      residual_result, "residual"));
+        tts.push_back(mra::make_norm(gaussians, K, residual_result, norm_result, "residual_norm"));
+        // the norms of all N functions arrive at the root of the (single) batch
+        tts.push_back(ttg::make_tt([&norms, N](const mra::Key<NDIM>& key, const mra::DenseTensor<T, 1>& n) {
+            MADNESS_CHECK_THROW(key.level() == 0 && n.size() == N, "residual norms: expected one batch at the root");
+            auto view = n.current_view();
+            for (mra::size_type i = 0; i < N; ++i) norms[i] = view[i];
+        }, ttg::edges(norm_result), ttg::edges(), "residual_norm_sink"));
+    }
+    // add_leaves: MRA-TTG does not forward nodes truncated away for all functions,
+    // MADNESS needs them as empty leaves to keep the compressed tree well-formed
+    auto store_tt         = mra::vmra::make_vmra_store(result, residual ? residual_result : recompress_result,
+                                                       true /* add_leaves */);
 
     execute_mra_ttg(start);
 
-    END_TIMER(world, "Apply BSH & truncate");
+    END_TIMER(world, residual ? "Apply BSH & residual" : "Apply BSH & truncate");
 
-
-    new_psi = std::move(madconv_mra);
+    if (residual) {
+        // only the rank owning the root key received the norms
+        world.gop.sum(norms.data(), norms.size());
+        if (rnorm) *rnorm = norms;
+    }
 
     if (validate_mra_ttg) {
         // nonstandard input of the convolution (before apply() changes Vpsi's state)
@@ -2098,14 +2153,465 @@ vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
         auto mad_new_psi = apply(world, ops, Vpsi);
         madness::compress(world, mad_new_psi);
         truncate(world, mad_new_psi);
-        compare_mra_madness(mad_new_psi, new_psi, "BSH-conv-result", 1e-8);
+        if (residual) {
+            madness::compress(world, *psi);
+            vecfuncT mad_r = sub(world, *psi, mad_new_psi);
+            compare_mra_madness(mad_r, result, "BSH-residual", 1e-8);
+            std::vector<double> mad_rnorm = norm2s(world, mad_r);
+            std::vector<double> mad_rnorm_ttg = norm2s(world, result);
+            double maxdiff = 0.0, maxdiff_stored = 0.0;
+            for (mra::size_type i = 0; i < N; ++i) {
+                maxdiff = std::max(maxdiff, std::abs(norms[i] - mad_rnorm[i]));
+                maxdiff_stored = std::max(maxdiff_stored, std::abs(mad_rnorm_ttg[i] - mad_rnorm[i]));
+            }
+            if (world.rank() == 0) {
+                print("BSH-residual norms (madness)   ", mad_rnorm);
+                print("BSH-residual norms (mra-ttg)   ", norms);
+                print("BSH-residual norms: max |mra-ttg - madness|", maxdiff,
+                      " max |norm2(stored r) - madness|", maxdiff_stored);
+            }
+        } else {
+            compare_mra_madness(mad_new_psi, result, "BSH-conv-result", 1e-8);
+        }
     }
 
     ops.clear();
     // TODO: move Vpsi into load-vmra so we can free nodes once they are loaded
     Vpsi.clear();
 
-    return new_psi;
+    return result;
+}
+
+/// function set of N functions in a single batch, as used by the loaders above
+static auto make_mrattg_functionset(mra::size_type N) {
+    auto pmap = mra::make_procmap<3>(N, 1 /* batch */);
+    return mra::make_functionset<mra::Gaussian<double, 3>>(pmap.batch_manager());
+}
+
+/// <f_i|g_i> computed with MRA-TTG; f and g must have the same size
+static Tensor<double> mrattg_inner(World& world, const vecfuncT& f, const vecfuncT& g) {
+    using T = double;
+    constexpr mra::Dimension NDIM = 3;
+    MADNESS_CHECK_THROW(f.size() == g.size(), "mrattg_inner: f and g differ in size");
+    const mra::size_type N = f.size();
+    const mra::size_type K = FunctionDefaults<3>::get_k();
+    mra::FunctionData<T, NDIM> functiondata(K);
+    auto fns = make_mrattg_functionset(N);
+
+    ttg::Edge<mra::Key<NDIM>, void> control;
+    ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>> fe, ge;
+    ttg::Edge<mra::Key<NDIM>, mra::DenseTensor<T, 1>> result_e;
+    std::vector<std::unique_ptr<ttg::TTBase>> tts;
+    auto start = mra::make_start(fns, control);
+    load_compressed_mrattg(f, fns, K, functiondata, control, fe, tts, "f");
+    load_compressed_mrattg(g, fns, K, functiondata, control, ge, tts, "g");
+    tts.push_back(mra::make_inner<T, NDIM>(fns, K, fe, ge, result_e));
+    Tensor<double> result(N);
+    tts.push_back(ttg::make_tt([&result, N](const mra::Key<NDIM>& key, const mra::DenseTensor<T, 1>& r) {
+        const T* data = r.current_view().data();
+        for (mra::size_type i = 0; i < N; ++i) result(i) = data[i];
+    }, ttg::edges(result_e), ttg::edges(), "inner_sink"));
+    execute_mra_ttg(start);
+    world.gop.sum(result.ptr(), result.size());   // only the root's owner received it
+    return result;
+}
+
+/// <f_i|g_j> computed with MRA-TTG; passing the same vector twice feeds one edge to both sides
+static Tensor<double> mrattg_matrix_inner(World& world, const vecfuncT& f, const vecfuncT& g) {
+    using T = double;
+    constexpr mra::Dimension NDIM = 3;
+    const bool same = (&f == &g);
+    const mra::size_type N = f.size(), M = g.size();
+    const mra::size_type K = FunctionDefaults<3>::get_k();
+    mra::FunctionData<T, NDIM> functiondata(K);
+    auto fnsF = make_mrattg_functionset(N);
+    auto fnsG = same ? fnsF : make_mrattg_functionset(M);
+
+    ttg::Edge<mra::Key<NDIM>, void> control;
+    ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>> fe, ge;
+    ttg::Edge<mra::Key<NDIM>, mra::DenseTensor<T, 2>> result_e;
+    std::vector<std::unique_ptr<ttg::TTBase>> tts;
+    auto start = mra::make_start(fnsF, control);
+    load_compressed_mrattg(f, fnsF, K, functiondata, control, fe, tts, "f");
+    if (!same) load_compressed_mrattg(g, fnsG, K, functiondata, control, ge, tts, "g");
+    tts.push_back(mra::make_matrix_inner<T, NDIM>(fnsF, fnsG, K, fe, same ? fe : ge, result_e));
+    Tensor<double> result(N, M);
+    tts.push_back(ttg::make_tt([&result, N, M](const mra::Key<NDIM>& key, const mra::DenseTensor<T, 2>& r) {
+        const T* data = r.current_view().data();
+        for (mra::size_type i = 0; i < N; ++i)
+            for (mra::size_type j = 0; j < M; ++j) result(i, j) = data[i*M + j];
+    }, ttg::edges(result_e), ttg::edges(), "matrix_inner_sink"));
+    execute_mra_ttg(start);
+    world.gop.sum(result.ptr(), result.size());
+    return result;
+}
+
+/// out_j = sum_i v_i U(i,j) computed with MRA-TTG; the result is compressed
+static vecfuncT mrattg_transform(World& world, const vecfuncT& v, const Tensor<double>& U) {
+    using T = double;
+    constexpr mra::Dimension NDIM = 3;
+    const mra::size_type N = v.size(), M = U.dim(1);
+    MADNESS_CHECK_THROW(U.dim(0) == long(N), "mrattg_transform: U must have v.size() rows");
+    const mra::size_type K = FunctionDefaults<3>::get_k();
+    mra::FunctionData<T, NDIM> functiondata(K);
+    auto fns_in = make_mrattg_functionset(N);
+    auto fns_out = make_mrattg_functionset(M);
+    auto Ud = std::make_shared<mra::DenseTensor<T, 2>>(std::array<mra::size_type, 2>{N, M});
+    T* Uh = Ud->buffer().host_ptr();
+    for (mra::size_type i = 0; i < N; ++i)
+        for (mra::size_type j = 0; j < M; ++j) Uh[i*M + j] = U(i, j);
+
+    vecfuncT out(M);
+    for (auto& f : out) f.set_impl(v.front(), false);   // same process map, empty tree
+
+    ttg::Edge<mra::Key<NDIM>, void> control;
+    ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>> in_e, out_e;
+    std::vector<std::unique_ptr<ttg::TTBase>> tts;
+    auto start = mra::make_start(fns_in, control);
+    load_compressed_mrattg(v, fns_in, K, functiondata, control, in_e, tts, "v");
+    tts.push_back(mra::make_transform<T, NDIM>(fns_in, fns_out, K, Ud, in_e, out_e));
+    tts.push_back(mra::vmra::make_vmra_store(out, out_e, true /* add_leaves */));
+    execute_mra_ttg(start);
+    return out;
+}
+
+/// compare the MRA-TTG inner products and transform against MADNESS on f and g (same size)
+static void validate_mrattg_linalg(World& world, const vecfuncT& f, const vecfuncT& g) {
+    const long N = f.size();
+    auto report = [&world](const std::string& what, const Tensor<double>& ttg, const Tensor<double>& mad) {
+        const double diff = (ttg - mad).absmax();
+        if (world.rank() == 0)
+            print("mra-ttg", what, ": max |mra-ttg - madness|", diff, " max |madness|", mad.absmax());
+    };
+    report("inner(f,g)", mrattg_inner(world, f, g), inner(world, f, g));
+    report("matrix_inner(f,g)", mrattg_matrix_inner(world, f, g), matrix_inner(world, f, g));
+    report("matrix_inner(f,f)", mrattg_matrix_inner(world, f, f), matrix_inner(world, f, f));
+
+    // dense square U, and a sparse rectangular one (identity plus a column mixing two functions)
+    Tensor<double> Udense(N, N), Usparse(N, N + 1);
+    for (long i = 0; i < N; ++i) {
+        for (long j = 0; j < N; ++j) Udense(i, j) = 1.0 / (1.0 + std::abs(i - j));
+        Usparse(i, i) = 1.0;
+    }
+    Usparse(0, N) = 0.5;
+    Usparse(N - 1, N) = -0.5;
+    for (const auto& [name, U] : {std::pair<std::string, Tensor<double>>{"dense", Udense},
+                                  std::pair<std::string, Tensor<double>>{"sparse", Usparse}}) {
+        vecfuncT ttg_res = mrattg_transform(world, f, U);
+        vecfuncT mad_res = transform(world, f, U, 0.0, true);
+        compress(world, mad_res);
+        compare_mra_madness(mad_res, ttg_res, "transform-" + name, 1e-10);
+        std::vector<double> dnorm = norm2s(world, sub(world, mad_res, ttg_res));
+        std::vector<double> mnorm = norm2s(world, mad_res);
+        if (world.rank() == 0)
+            print("mra-ttg transform", name, ": max ||mra-ttg - madness||",
+                  *std::max_element(dnorm.begin(), dnorm.end()),
+                  " max ||madness||", *std::max_element(mnorm.begin(), mnorm.end()));
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Orbitals held in device memory between MRA-TTG graphs (mra::FunctionVector). Each helper
+// below builds and executes one graph; vectors are fed into it and stored from it without
+// their coefficients passing through the host.
+// ---------------------------------------------------------------------------------------
+
+using DeviceFunctions = mra::FunctionVector<double, 3>;
+using NodeEdge = ttg::Edge<mra::Key<3>, mra::FunctionsCompressedNode<double, 3>>;
+
+/// boundary condition of the MRA-TTG derivative operators: that of FunctionDefaults, the same on all sides
+static mra::FunctionData<double, 3>::BCType device_bc() {
+    const BoundaryConditions<3>& bc = FunctionDefaults<3>::get_bc();
+    for (int d = 0; d < 3; ++d)
+        for (int s = 0; s < 2; ++s)
+            MADNESS_CHECK_THROW(bc(d, s) == bc(0, 0), "MRA-TTG: the boundary conditions must be the same on all sides");
+    if (bc(0, 0) == BC_FREE) return mra::FunctionData<double, 3>::BC_FREE;
+    if (bc(0, 0) == BC_ZERO) return mra::FunctionData<double, 3>::BC_ZERO;
+    MADNESS_EXCEPTION("MRA-TTG: only free and zero boundary conditions are supported", bc(0, 0));
+}
+
+/// the tasks of one graph, started at the root key of a single batch
+struct MraGraph {
+    ttg::Edge<mra::Key<3>, void> control;
+    std::vector<std::unique_ptr<ttg::TTBase>> tts;
+    const mra::size_type K = FunctionDefaults<3>::get_k();
+    mra::FunctionData<double, 3> functiondata{mra::size_type(FunctionDefaults<3>::get_k()), device_bc()};   // referenced by tasks
+
+    void add(auto&& tt) { tts.push_back(std::move(tt)); }
+    void execute() {
+        auto fns = make_mrattg_functionset(1);
+        auto start = mra::make_start(fns, control);
+        execute_mra_ttg(start);
+    }
+};
+
+/// copy MADNESS functions into a device vector
+static DeviceFunctions device_upload(World& world, const vecfuncT& f) {
+    MraGraph g;
+    NodeEdge e;
+    DeviceFunctions d;
+    load_compressed_mrattg(f, make_mrattg_functionset(f.size()), g.K, g.functiondata, g.control, e, g.tts, "upload");
+    g.add(d.make_store(e, f.size(), "upload_store"));
+    g.execute();
+    return d;
+}
+
+/// copy a device vector into (compressed) MADNESS functions with the process map of `like`
+static vecfuncT device_download(World& world, DeviceFunctions& d, const functionT& like) {
+    MraGraph g;
+    NodeEdge e;
+    vecfuncT out(d.size());
+    for (auto& f : out) f.set_impl(like, false);
+    g.add(d.make_feed(g.control, e, true /* keep */, "download"));
+    g.add(mra::vmra::make_vmra_store(out, e, true /* add_leaves */));
+    g.execute();
+    return out;
+}
+
+/// <a_i|b_j>; a and b may be the same vector
+static Tensor<double> device_matrix_inner(World& world, DeviceFunctions& a, DeviceFunctions& b) {
+    using T = double;
+    MraGraph g;
+    const bool same = (&a == &b);
+    const mra::size_type N = a.size(), M = b.size();
+    NodeEdge ea, eb;
+    ttg::Edge<mra::Key<3>, mra::DenseTensor<T, 2>> result_e;
+    g.add(a.make_feed(g.control, ea, true, "feed_a"));
+    if (!same) g.add(b.make_feed(g.control, eb, true, "feed_b"));
+    g.add(mra::make_matrix_inner<T, 3>(make_mrattg_functionset(N), make_mrattg_functionset(M), g.K,
+                                       ea, same ? ea : eb, result_e));
+    Tensor<double> result(N, M);
+    g.add(ttg::make_tt([&result, N, M](const mra::Key<3>& key, const mra::DenseTensor<T, 2>& r) {
+        const T* data = r.current_view().data();
+        for (mra::size_type i = 0; i < N; ++i)
+            for (mra::size_type j = 0; j < M; ++j) result(i, j) = data[i*M + j];
+    }, ttg::edges(result_e), ttg::edges(), "matrix_inner_sink"));
+    g.execute();
+    world.gop.sum(result.ptr(), result.size());   // only the root's owner received it
+    return result;
+}
+
+/// ||a_i||
+static std::vector<double> device_norms(World& world, DeviceFunctions& a) {
+    using T = double;
+    MraGraph g;
+    const mra::size_type N = a.size();
+    NodeEdge e;
+    ttg::Edge<mra::Key<3>, mra::DenseTensor<T, 1>> norm_e;
+    g.add(a.make_feed(g.control, e, true, "feed"));
+    g.add(mra::make_norm(make_mrattg_functionset(N), g.K, e, norm_e));
+    std::vector<double> norms(N, 0.0);
+    g.add(ttg::make_tt([&norms, N](const mra::Key<3>& key, const mra::DenseTensor<T, 1>& n) {
+        const T* data = n.current_view().data();
+        for (mra::size_type i = 0; i < N; ++i) norms[i] = data[i];
+    }, ttg::edges(norm_e), ttg::edges(), "norm_sink"));
+    g.execute();
+    world.gop.sum(norms.data(), norms.size());
+    return norms;
+}
+
+/// N x M MADNESS matrix as the device matrix make_transform expects
+static std::shared_ptr<mra::DenseTensor<double, 2>> device_matrix(const Tensor<double>& U) {
+    const mra::size_type N = U.dim(0), M = U.dim(1);
+    auto Ud = std::make_shared<mra::DenseTensor<double, 2>>(std::array<mra::size_type, 2>{N, M});
+    double* Uh = Ud->buffer().host_ptr();
+    for (mra::size_type i = 0; i < N; ++i)
+        for (mra::size_type j = 0; j < M; ++j) Uh[i*M + j] = U(i, j);
+    return Ud;
+}
+
+/// v_j <- sum_i v_i U(i,j), truncated with tol unless tol == 0 (cf. madness::transform)
+static void device_transform(World& world, DeviceFunctions& v, const Tensor<double>& U, double tol) {
+    MraGraph g;
+    const mra::size_type N = v.size(), M = U.dim(1);
+    MADNESS_CHECK_THROW(U.dim(0) == long(N), "device_transform: U must have v.size() rows");
+    auto fns_out = make_mrattg_functionset(M);
+    NodeEdge in_e, out_e, trunc_e;
+    g.add(v.make_feed(g.control, in_e, false, "feed"));
+    g.add(mra::make_transform<double, 3>(make_mrattg_functionset(N), fns_out, g.K, device_matrix(U), in_e, out_e));
+    if (tol > 0.0) {
+        g.add(mra::make_truncate(fns_out, g.K, tol, FunctionDefaults<3>::get_truncate_mode(),
+                                 FunctionDefaults<3>::get_cell_min_width(), out_e, trunc_e, "truncate"));
+    }
+    g.add(v.make_store(tol > 0.0 ? trunc_e : out_e, M, "store"));
+    g.execute();
+}
+
+/// v_i <- c_i v_i
+static void device_scale(World& world, DeviceFunctions& v, const std::vector<double>& c) {
+    Tensor<double> D(static_cast<long>(c.size()), static_cast<long>(c.size()));
+    for (size_t i = 0; i < c.size(); ++i) D(i, i) = c[i];
+    device_transform(world, v, D, 0.0);
+}
+
+/// v_i <- v_i / ||v_i||
+static void device_normalize(World& world, DeviceFunctions& v) {
+    std::vector<double> c = device_norms(world, v);
+    for (auto& x : c) x = 1.0 / x;
+    device_scale(world, v, c);
+}
+
+/// a_i <- a_i - c_i r_i; consumes r
+static void device_update(World& world, DeviceFunctions& a, DeviceFunctions& r, const std::vector<double>& c) {
+    MraGraph g;
+    const mra::size_type N = a.size();
+    auto fns = make_mrattg_functionset(N);
+    Tensor<double> D(static_cast<long>(N), static_cast<long>(N));
+    for (mra::size_type i = 0; i < N; ++i) D(i, i) = c[i];
+    NodeEdge a_e, r_e, cr_e, out_e;
+    g.add(r.make_feed(g.control, r_e, false, "feed_r"));
+    g.add(a.make_feed(g.control, a_e, false, "feed_a"));
+    g.add(mra::make_transform<double, 3>(fns, fns, g.K, device_matrix(D), r_e, cr_e, "scale_r"));
+    g.add(mra::make_gaxpy(1.0, -1.0, fns, g.K, a_e, cr_e, out_e, "update"));
+    g.add(a.make_store(out_e, N, "store"));
+    g.execute();
+}
+
+/// BSH residual on the device: with fockp the Fock matrix minus eps on the diagonal,
+///   rneg = G(-2 (Vpsi - psi fockp)) - psi,   rnorm_i = ||rneg_i||
+/// i.e., the negative of the residual r = psi - new psi. psi is kept, Vpsi is consumed.
+static DeviceFunctions device_bsh_residual(World& world, DeviceFunctions& psi, DeviceFunctions& Vpsi,
+                                           const Tensor<double>& fockp, const tensorT& eps,
+                                           const CalculationParameters& param, std::vector<double>& rnorm) {
+    using T = double;
+    MraGraph g;
+    const mra::size_type N = psi.size();
+    const T precision = FunctionDefaults<3>::get_thresh();
+    const int truncate_mode = FunctionDefaults<3>::get_truncate_mode();
+    const T cell_min_width = FunctionDefaults<3>::get_cell_min_width();
+    auto fns = make_mrattg_functionset(N);
+    std::vector<poperatorT> ops = SCF::make_bsh_operators(world, eps, param);
+    mra::GaussianConvolutionOperator<T, 3> op(ops);
+
+    using RecEdge = ttg::Edge<mra::Key<3>, mra::FunctionsReconstructedNode<T, 3>>;
+    NodeEdge psi_e, V_e, fpsi_e, Vp_e, conv_in_e, conv_e, recomp_e, trunc_e, r_e;
+    RecEdge rec_e, rec_conv_e;
+    ttg::Edge<mra::Key<3>, mra::DenseTensor<T, 1>> norm_e;
+    DeviceFunctions r;
+
+    g.add(psi.make_feed(g.control, psi_e, true, "feed_psi"));
+    g.add(Vpsi.make_feed(g.control, V_e, false, "feed_Vpsi"));
+    // Vpsi' = -2 Vpsi + 2 psi fockp
+    g.add(mra::make_transform<T, 3>(fns, fns, g.K, device_matrix(fockp), psi_e, fpsi_e, "fock_psi"));
+    g.add(mra::make_gaxpy(T(-2.0), T(2.0), fns, g.K, V_e, fpsi_e, Vp_e, "Vpsi_shift"));
+    // BSH apply: non-standard form for the convolution, compressed and truncated result
+    g.add(mra::make_reconstruct(fns, g.K, false, g.functiondata, Vp_e, rec_e, "reconstruct"));
+    g.add(mra::make_compress(fns, g.K, true, g.functiondata, rec_e, conv_in_e, "compress"));
+    g.add(mra::make_convolution(fns, g.K, conv_in_e, conv_e, op, precision, truncate_mode, cell_min_width, "convolution"));
+    g.add(mra::make_reconstruct(fns, g.K, true, g.functiondata, conv_e, rec_conv_e, "reconstruct_convolution"));
+    g.add(mra::make_compress(fns, g.K, false, g.functiondata, rec_conv_e, recomp_e, "recompress_convolution"));
+    g.add(mra::make_truncate(fns, g.K, precision, truncate_mode, cell_min_width, recomp_e, trunc_e, "truncate"));
+    // -r = new psi - psi, and its norms. Not psi - new psi: gaxpy forwards an operand with
+    // scalar 1 unchanged where the other one is empty, which would hand a kept psi node to
+    // the store of r (see mra::FunctionVector)
+    g.add(mra::make_gaxpy(T(1.0), T(-1.0), fns, g.K, trunc_e, psi_e, r_e, "residual"));
+    g.add(mra::make_norm(fns, g.K, r_e, norm_e, "residual_norm"));
+    rnorm.assign(N, 0.0);
+    g.add(ttg::make_tt([&rnorm, N](const mra::Key<3>& key, const mra::DenseTensor<T, 1>& n) {
+        const T* data = n.current_view().data();
+        for (mra::size_type i = 0; i < N; ++i) rnorm[i] = data[i];
+    }, ttg::edges(norm_e), ttg::edges(), "residual_norm_sink"));
+    g.add(r.make_store(r_e, N, "store_r"));
+    g.execute();
+    world.gop.sum(rnorm.data(), rnorm.size());
+    return r;
+}
+
+/// the simulation cell as the MRA-TTG Domain (a cube, as for molecules)
+static ttg::Buffer<mra::Domain<3>> device_domain() {
+    const Tensor<double>& cell = FunctionDefaults<3>::get_cell();
+    for (int d = 1; d < 3; ++d)
+        MADNESS_CHECK_THROW(cell(d, 0) == cell(0, 0) && cell(d, 1) == cell(0, 1),
+                            "MRA-TTG: the simulation cell must be a cube");
+    auto D = std::make_unique<mra::Domain<3>[]>(1);
+    D[0].set_cube(cell(0, 0), cell(0, 1));
+    return ttg::Buffer<mra::Domain<3>>(std::move(D), 1);
+}
+
+/// Vpsi_i = v psi_i for one (host) function v, compressed and truncated with tol unless tol == 0;
+/// psi is kept, Vpsi receives the result
+static void device_apply_local_potential(World& world, const functionT& v, DeviceFunctions& psi,
+                                         DeviceFunctions& Vpsi, double tol) {
+    using T = double;
+    using RecEdge = ttg::Edge<mra::Key<3>, mra::FunctionsReconstructedNode<T, 3>>;
+    MraGraph g;
+    const mra::size_type N = psi.size();
+    auto fns = make_mrattg_functionset(N);
+    auto fns_v = make_mrattg_functionset(1);
+    auto db = device_domain();
+    vecfuncT vv = {copy(v)};   // the loader needs it reconstructed
+    vv[0].reconstruct();
+    RecEdge v_e, psi_rec_e, prod_e;
+    NodeEdge psi_e, comp_e, trunc_e;
+    g.add(mra::vmra::make_vmra_load(vv, g.control, v_e, "load_v"));
+    g.add(psi.make_feed(g.control, psi_e, true, "feed_psi"));
+    g.add(mra::make_reconstruct(fns, g.K, false, g.functiondata, psi_e, psi_rec_e, "reconstruct_psi"));
+    g.add(mra::make_multiply_broadcast<T, 3>(db, fns_v, fns, g.functiondata, g.K, v_e, psi_rec_e, prod_e, "V*psi"));
+    g.add(mra::make_compress(fns, g.K, false, g.functiondata, prod_e, comp_e, "compress_Vpsi"));
+    if (tol > 0.0) {
+        g.add(mra::make_truncate(fns, g.K, tol, FunctionDefaults<3>::get_truncate_mode(),
+                                 FunctionDefaults<3>::get_cell_min_width(), comp_e, trunc_e, "truncate_Vpsi"));
+    }
+    g.add(Vpsi.make_store(tol > 0.0 ? trunc_e : comp_e, N, "store_Vpsi"));
+    g.execute();
+}
+
+/// sum_i occ_i psi_i^2 (cf. SCF::make_density), compressed, with the process map of `like`; psi is kept
+static functionT device_density(World& world, DeviceFunctions& psi, const tensorT& occ, const functionT& like) {
+    using T = double;
+    using RecEdge = ttg::Edge<mra::Key<3>, mra::FunctionsReconstructedNode<T, 3>>;
+    MraGraph g;
+    const mra::size_type N = psi.size();
+    auto fns = make_mrattg_functionset(N);
+    auto db = device_domain();
+    Tensor<double> w(static_cast<long>(N), 1L);
+    for (long i = 0; i < long(N); ++i) w(i, 0) = occ[i];
+    NodeEdge psi_e, sq_c_e, rho_e;
+    RecEdge psi_rec_e, sq_e;
+    g.add(psi.make_feed(g.control, psi_e, true, "feed_psi"));
+    g.add(mra::make_reconstruct(fns, g.K, false, g.functiondata, psi_e, psi_rec_e, "reconstruct_psi"));
+    g.add(mra::make_square<T, 3>(db, fns, g.functiondata, g.K, psi_rec_e, sq_e, "psi^2"));
+    g.add(mra::make_compress(fns, g.K, false, g.functiondata, sq_e, sq_c_e, "compress_psi^2"));
+    g.add(mra::make_transform<T, 3>(fns, make_mrattg_functionset(1), g.K, device_matrix(w), sq_c_e, rho_e, "sum_occ"));
+    vecfuncT rho(1);
+    rho[0].set_impl(like, false);
+    g.add(mra::vmra::make_vmra_store(rho, rho_e, true /* add_leaves */));
+    g.execute();
+    return rho[0];
+}
+
+/// 1/2 sum_axis <d psi_i|d psi_j> (cf. SCF::kinetic_energy_matrix with the abgv derivative); psi is kept
+static Tensor<double> device_kinetic_matrix(World& world, DeviceFunctions& psi) {
+    using T = double;
+    using RecEdge = ttg::Edge<mra::Key<3>, mra::FunctionsReconstructedNode<T, 3>>;
+    MraGraph g;
+    const mra::size_type N = psi.size();
+    auto fns = make_mrattg_functionset(N);
+    auto db = device_domain();
+    NodeEdge psi_e;
+    RecEdge psi_rec_e;
+    std::array<RecEdge, 3> d_e;
+    std::array<NodeEdge, 3> dc_e;
+    std::array<ttg::Edge<mra::Key<3>, mra::DenseTensor<T, 2>>, 3> m_e;
+    Tensor<double> result(static_cast<long>(N), static_cast<long>(N));
+    std::mutex m;
+    g.add(psi.make_feed(g.control, psi_e, true, "feed_psi"));
+    g.add(mra::make_reconstruct(fns, g.K, false, g.functiondata, psi_e, psi_rec_e, "reconstruct_psi"));
+    for (mra::Dimension axis = 0; axis < 3; ++axis) {
+        const std::string name = "d" + std::to_string(axis);
+        g.add(mra::make_derivative<T, 3>(db, fns, g.functiondata, g.K, axis, psi_rec_e, d_e[axis], name));
+        g.add(mra::make_compress(fns, g.K, false, g.functiondata, d_e[axis], dc_e[axis], "compress_" + name));
+        g.add(mra::make_matrix_inner<T, 3>(fns, fns, g.K, dc_e[axis], dc_e[axis], m_e[axis], "inner_" + name));
+        g.add(ttg::make_tt([&result, &m, N](const mra::Key<3>& key, const mra::DenseTensor<T, 2>& r) {
+            const T* data = r.current_view().data();
+            std::lock_guard<std::mutex> lock(m);
+            for (mra::size_type i = 0; i < N; ++i)
+                for (mra::size_type j = 0; j < N; ++j) result(i, j) += 0.5*data[i*N + j];
+        }, ttg::edges(m_e[axis]), ttg::edges(), "sink_" + name));
+    }
+    g.execute();
+    world.gop.sum(result.ptr(), result.size());   // only the root's owner received it
+    return result;
 }
 #endif // HAVE_MRA_TTG
 
@@ -2173,22 +2679,26 @@ vecfuncT SCF::compute_residual(World& world, tensorT& occ, tensorT& fock,
     if (redistribute) batch = 1;   // one owner per task (explicit macrotask mode included)
     if (redistribute and param.print_level() >= 2 and world.rank() == 0)
         print("BSH apply: redistribute operand to single-owner batches (tight protocol)");
-    vecfuncT new_psi;
+    vecfuncT r;
+    std::vector<double> rnorm;
 #ifdef HAVE_MRA_TTG
-    new_psi = apply_bsh_mrattg(world, Vpsi, eps, param);
+    // BSH apply, r = psi - new_psi and the residual norms in one MRA-TTG graph
+    r = apply_bsh_mrattg(world, Vpsi, eps, param, &psi, &rnorm);
+    START_TIMER(world);
 #else  // HAVE_MRA_TTG
+    vecfuncT new_psi;
     if (bsh_apply_mode == "macrotask")  new_psi = apply_bsh_macrotask(world, Vpsi, eps, param, batch, redistribute);
     else if (bsh_apply_mode == "plain") new_psi = apply_bsh_plain(world, Vpsi, eps, param);
     else                                new_psi = apply_bsh_tiled(world, Vpsi, eps, param);
-#endif // HAVE_MRA_TTG
 
     // Thought it was a bad idea to truncate *before* computing the residual
     // but simple tests suggest otherwise ... no more iterations and
     // reduced iteration time from truncating.
 
     START_TIMER(world);
-    vecfuncT r = sub(world, psi, new_psi);
-    std::vector<double> rnorm = norm2s(world, r);
+    r = sub(world, psi, new_psi);
+    rnorm = norm2s(world, r);
+#endif // HAVE_MRA_TTG
     if (world.rank() == 0 and (param.print_level() > 1))
         print("residuals", rnorm);
     double rms, maxval;
@@ -3102,5 +3612,351 @@ void SCF::solve(World& world) {
     }
 
 }        // end solve function
+
+/// Reduced SCF loop used as the target for porting the iteration to MRA-TTG.
+
+/// Closed-shell only (alpha orbitals, bmo aliases amo), canonical orbitals (the
+/// Fock matrix is diagonalized every iteration, localization is ignored), and a
+/// plain BSH update new = psi - r with step restriction instead of KAIN. Tags of
+/// the form [ttg: ...] note which MRA-TTG building block each step maps onto.
+void SCF::solve_simple(World& world) {
+    PROFILE_MEMBER_FUNC(SCF);
+    MADNESS_CHECK_THROW(param.spin_restricted() && param.nalpha() == param.nbeta(),
+                        "solve_simple supports closed-shell (spin-restricted, nalpha==nbeta) only");
+    MADNESS_CHECK_THROW(param.pcm_data() == "none", "solve_simple does not support PCM");
+    if (param.do_localize() && world.rank() == 0)
+        print("solve_simple: ignoring localize =", param.localize_method(), "-- using canonical orbitals");
+
+    const double dconv = std::max(FunctionDefaults<3>::get_thresh(), param.dconv());
+    functionT arho_old;
+    double bsh_residual = 0.0;
+    bool converged = false;
+    // closed shell: rho and the kinetic and nonlocal energies are twice the alpha part
+    const double spinfac = 2.0;
+#ifdef HAVE_MRA_TTG
+    // keep the orbitals in device memory. With a local potential (all-electron, no exact
+    // exchange, no meta-GGA tau term) and the abgv derivative the whole iteration runs on
+    // MRA-TTG and only the density and the potential pass through the host; otherwise the
+    // orbitals go to the host once per iteration to apply the potential there.
+    const bool resident = mrattg_resident;
+    const bool local_potential = molecule.parameters.pure_ae() && xc.hf_exchange_coefficient() == 0.0
+                                 && !xc.is_meta();
+    const bool device_only = resident && local_potential && param.deriv() == "abgv";
+    DeviceFunctions amo_d;
+#endif // HAVE_MRA_TTG
+
+    for (int iter = 0; iter < param.maxiter(); ++iter) {
+        if (world.rank() == 0 and (param.print_level() > 1))
+            printf("\nIteration %d at time %.1fs\n\n", iter, wall_time());
+#ifdef HAVE_MRA_TTG
+        if (resident) {
+            START_TIMER(world);
+            if (iter == 0) {
+                amo_d = device_upload(world, amo);
+            } else if (!device_only || validate_mra_ttg) {
+                amo = device_download(world, amo_d, amo.front());
+                bmo = amo;
+            }
+            END_TIMER(world, "Orbitals to host");
+        }
+#endif // HAVE_MRA_TTG
+
+        // [ttg: square + compress + transform with the occupations as one column]
+        START_TIMER(world);
+        functionT arho;
+#ifdef HAVE_MRA_TTG
+        if (device_only) {
+            arho = device_density(world, amo_d, aocc, amo.front());
+            if (validate_mra_ttg) {
+                functionT ref = make_density(world, aocc, amo);
+                const double d = (ref - arho).norm2(), n = ref.norm2();
+                if (world.rank() == 0) print("mra-ttg density : ||mra-ttg - madness||", d, " ||madness||", n);
+            }
+        } else
+#endif // HAVE_MRA_TTG
+        arho = make_density(world, aocc, amo);
+        END_TIMER(world, "Make densities");
+
+        // [ttg: no equivalent; redistributing invalidates any device-resident copy]
+        if (iter < 2 || (iter % 10) == 0) {
+            START_TIMER(world);
+            functionT brho = arho;
+            functionT brho_old = arho_old;
+            subspaceT nosubspace;
+            loadbal(world, arho, brho, arho_old, brho_old, nosubspace);
+            END_TIMER(world, "Load balancing");
+        }
+
+        // [ttg: gaxpy + norm]
+        double da = 0.0;
+        if (iter > 0) {
+            da = (arho - arho_old).norm2();
+            if (world.rank() == 0 and (param.print_level() > 2))
+                print("delta rho", da, "residual", bsh_residual);
+        }
+        arho_old = arho;
+
+        START_TIMER(world);
+        functionT rho = spinfac * arho;   // [ttg: gaxpy(scalar) + truncate]
+        rho.truncate();
+        real_function_3d vnuc;            // static per protocol: load once, keep resident
+        if (molecule.parameters.psp_calc()) {
+            vnuc = gthpseudopotential->vlocalpot();
+        } else if (molecule.parameters.pure_ae()) {
+            vnuc = potentialmanager->vnuclear();
+        } else {
+            vnuc = potentialmanager->vnuclear();
+            vnuc = vnuc + gthpseudopotential->vlocalpot();
+        }
+        double enuclear = inner(rho, vnuc);   // [ttg: inner(f,g) -> scalar -- missing]
+        END_TIMER(world, "Nuclear energy");
+
+        START_TIMER(world);
+        functionT vcoul = apply(*coulop, rho);   // [ttg: convolution with N=1 Coulomb op]
+        END_TIMER(world, "Coulomb");
+        double ecoulomb = 0.5 * inner(rho, vcoul);
+        rho.clear(false);
+        functionT vlocal = vcoul + vnuc;          // [ttg: gaxpy]
+        vcoul.clear(false);
+        vlocal.truncate();
+
+        // [ttg: XC potential (pointwise unaryop on rho) -- missing;
+        //  HF exchange (pair products, N^2 convolutions, reduction) -- missing]
+        double exc = 0.0, enl = 0.0, ekin = 0.0;
+        vecfuncT Vpsi;
+        tensorT fock;
+#ifdef HAVE_MRA_TTG
+        DeviceFunctions Vpsi_d;
+        // a local potential is applied on the device; anything else is applied on the host and
+        // the result moved to the device
+        if (resident && local_potential) {
+            START_TIMER(world);
+            functionT vloc = copy(vlocal);
+            if (xc.is_dft()) {
+                // closed shell: the beta density is the alpha density
+                XCOperator<double, 3> xcop(world, this, arho, arho, 0, param.dft_deriv());
+                xcop.set_print_level(param.print_level());
+                exc = xcop.compute_xc_energy();
+                vloc += xcop.make_xc_potential();
+            }
+            vloc.truncate();
+            END_TIMER(world, "DFT potential");
+
+            // [ttg: multiply_broadcast + compress + truncate]
+            START_TIMER(world);
+            device_apply_local_potential(world, vloc, amo_d, Vpsi_d, FunctionDefaults<3>::get_thresh());
+            END_TIMER(world, "V*psi (device)");
+            if (validate_mra_ttg) {
+                vecfuncT ref = mul(world, vloc, amo);
+                truncate(world, ref);
+                vecfuncT dev = device_download(world, Vpsi_d, amo.front());
+                std::vector<double> dnorm = norm2s(world, sub(world, ref, dev));
+                std::vector<double> rnorm = norm2s(world, ref);
+                if (world.rank() == 0)
+                    print("mra-ttg V*psi : max ||mra-ttg - madness||", *std::max_element(dnorm.begin(), dnorm.end()),
+                          " max ||madness||", *std::max_element(rnorm.begin(), rnorm.end()));
+            }
+
+            // [ttg: matrix_inner for the potential energy; derivative x3 + compress + matrix_inner for
+            //  the kinetic energy]
+            START_TIMER(world);
+            const long nmo = amo_d.size();
+            tensorT pe = device_matrix_inner(world, Vpsi_d, amo_d);
+            fock = tensorT(nmo, nmo);
+            if (device_only) {
+                fock = device_kinetic_matrix(world, amo_d);
+                if (validate_mra_ttg) {
+                    tensorT ref(nmo, nmo);
+                    distmatT k = kinetic_energy_matrix(world, amo);
+                    k.copy_to_replicated(ref);
+                    if (world.rank() == 0)
+                        print("mra-ttg kinetic matrix : max |mra-ttg - madness|", (ref - fock).absmax(),
+                              " max |madness|", ref.absmax());
+                }
+            } else {
+                distmatT k = kinetic_energy_matrix(world, amo);
+                k.copy_to_replicated(fock);
+            }
+            for (long i = 0; i < nmo; ++i) ekin += aocc[i] * fock(i, i);
+            fock += pe;
+            fock.gaxpy(0.5, transpose(fock), 0.5);
+            END_TIMER(world, "Fock matrix");
+        } else
+#endif // HAVE_MRA_TTG
+        {
+            Vpsi = apply_potential(world, aocc, amo, vlocal, exc, enl, 0);
+            // [ttg: derivative x3 + matrix_inner (Gram matrix of two sets)]
+            fock = make_fock_matrix(world, amo, Vpsi, aocc, ekin);
+        }
+        vlocal.clear(false);
+
+        // [ttg: matrix_inner + transform + truncate + norm; sygv stays on host (nmo x nmo)]
+#ifdef HAVE_MRA_TTG
+        if (resident) {
+            if (!Vpsi.empty()) {
+                START_TIMER(world);
+                Vpsi_d = device_upload(world, Vpsi);
+                Vpsi.clear();
+                END_TIMER(world, "Vpsi to device");
+            }
+            START_TIMER(world);
+            tensorT overlap = device_matrix_inner(world, amo_d, amo_d);
+            tensorT U = get_fock_transformation(world, overlap, fock, aeps, aocc,
+                                                FunctionDefaults<3>::get_thresh());
+            for (int i = 0; i < param.nalpha(); ++i)   // no occupied-virtual mixing
+                for (int j = param.nalpha(); j < U.dim(0); ++j) U(j, i) = 0.0;
+            device_transform(world, Vpsi_d, U, vtol);
+            device_transform(world, amo_d, U, FunctionDefaults<3>::get_thresh());
+            device_normalize(world, amo_d);
+            END_TIMER(world, "Diagonalization (device)");
+        } else
+#endif // HAVE_MRA_TTG
+        diag_fock_matrix(world, fock, amo, Vpsi, aeps, aocc, FunctionDefaults<3>::get_thresh());
+
+        const double enrep = molecule.nuclear_repulsion_energy();
+        const double edisp = dispersion.energy(world, molecule);
+        const double ekinetic = spinfac * ekin;
+        const double enonlocal = spinfac * enl;
+        const double etot = ekinetic + enuclear + ecoulomb + exc + enrep + enonlocal + edisp;
+        current_energy = etot;
+
+        if (world.rank() == 0 and (param.print_level() > 1)) {
+            printf("\n              kinetic %16.8f\n", ekinetic);
+            printf("         nonlocal psp %16.8f\n", enonlocal);
+            printf("   nuclear attraction %16.8f\n", enuclear);
+            printf("              coulomb %16.8f\n", ecoulomb);
+            printf(" exchange-correlation %16.8f\n", exc);
+            printf("    nuclear-repulsion %16.8f\n", enrep);
+            if (dispersion.active())
+                printf("      dispersion (D3) %16.8f\n", edisp);
+            printf("                total %16.8f\n\n", etot);
+        }
+        e_data.add_data({{"e_kinetic", ekinetic},
+                         {"e_local",   enonlocal},
+                         {"e_nuclear", enuclear},
+                         {"e_coulomb", ecoulomb},
+                         {"e_pcm",     0.0},
+                         {"e_disp",    edisp},
+                         {"e_xc",      exc},
+                         {"e_nrep",    enrep},
+                         {"e_tot",     etot}});
+
+        if (iter > 0) {
+            if (da < dconv * std::max(size_t(5), molecule.natom())
+                && (param.get<bool>("conv_only_dens") || bsh_residual < 5.0 * dconv))
+                converged = true;
+
+            if (converged || iter == param.maxiter() - 1) {
+                if (converged) {
+                    converged_for_thresh = FunctionDefaults<3>::get_thresh();
+                    converged_for_dconv = dconv;
+                }
+                if (world.rank() == 0 and (param.print_level() > 1)) {
+                    if (converged) print("\nConverged!\n");
+                    print("alpha eigenvalues");
+                    print(aeps);
+                }
+#ifdef HAVE_MRA_TTG
+                if (resident) {   // the diagonalized orbitals
+                    amo = device_download(world, amo_d, amo.front());
+                    bmo = amo;
+                }
+#endif // HAVE_MRA_TTG
+                break;
+            }
+        }
+
+        // orbitals with fractional occupation must be eigenfunctions
+        for (int i = 0; i < param.nmo_alpha(); i++) {
+            if (aocc[i] != 1.0) {
+                double tmp = fock(i, i);
+                fock(i, _) = 0.0;
+                fock(_, i) = 0.0;
+                fock(i, i) = tmp;
+            }
+        }
+
+#ifdef HAVE_MRA_TTG
+        if (resident) {
+            // [ttg: transform + gaxpy + BSH apply + gaxpy + norm, one graph]
+            START_TIMER(world);
+            const long nmo = amo_d.size();
+            tensorT eps(nmo), fockp = copy(fock);
+            for (long i = 0; i < nmo; ++i) {
+                eps(i) = std::min(-0.05, fock(i, i));
+                fockp(i, i) -= eps(i);
+            }
+            std::vector<double> rnorm;
+            DeviceFunctions rneg_d = device_bsh_residual(world, amo_d, Vpsi_d, fockp, eps, param, rnorm);
+            double rms, maxval;
+            vector_stats(rnorm, rms, maxval);
+            bsh_residual = maxval;
+            if (world.rank() == 0 and (param.print_level() > 1)) {
+                print("residuals", rnorm);
+                print("BSH residual: rms", rms, "   max", maxval);
+            }
+            END_TIMER(world, "BSH residual (device)");
+
+            // step restriction: amo - c r = amo + c rneg with ||c r|| <= maxrotn  [ttg: transform + gaxpy]
+            START_TIMER(world);
+            std::vector<double> c(nmo, -1.0);
+            for (long i = 0; i < nmo; ++i)
+                if (rnorm[i] > param.maxrotn()) c[i] = -param.maxrotn() / rnorm[i];
+            if (world.rank() == 0 and (param.print_level() > 2))
+                print("Norm of vector changes alpha : rms", rms, "   max", maxval);
+            device_update(world, amo_d, rneg_d, c);
+            END_TIMER(world, "Update orbitals (device)");
+
+            // [ttg: matrix_inner + transform + truncate + norm]
+            START_TIMER(world);
+            const double trantol = vtol / std::min(30.0, double(nmo));
+            device_normalize(world, amo_d);
+            double maxq;
+            do {
+                tensorT Q = Q2(device_matrix_inner(world, amo_d, amo_d));
+                maxq = 0.0;
+                for (int j = 1; j < Q.dim(0); j++)
+                    for (int i = 0; i < j; i++) maxq = std::max(std::abs(Q(j, i)), maxq);
+                Q.screen(trantol);
+                for (int j = param.nalpha(); j < Q.dim(0); ++j) {   // virtuals orthogonal to occupied
+                    for (int i = 0; i < param.nalpha(); ++i) {
+                        Q(j, i) = 0.0;
+                        Q(i, j) *= 2.0;
+                    }
+                }
+                device_transform(world, amo_d, Q, FunctionDefaults<3>::get_thresh());
+                if (world.rank() == 0 and (param.print_level() > 3)) print("ORTHOG2a: maxq trantol", maxq, trantol);
+            } while (maxq > 0.01);
+            device_normalize(world, amo_d);
+            END_TIMER(world, "Orthonormalize (device)");
+            continue;
+        }
+        if (validate_mra_ttg) validate_mrattg_linalg(world, amo, Vpsi);
+#endif // HAVE_MRA_TTG
+        vecfuncT r = compute_residual(world, aocc, fock, amo, Vpsi, bsh_residual);
+        world.gop.broadcast(bsh_residual, 0);
+
+        // [ttg: gaxpy, norm, gaxpy with per-function scalars]
+        START_TIMER(world);
+        vecfuncT amo_new = sub(world, amo, r);
+        r.clear();
+        END_TIMER(world, "Update orbitals");
+        do_step_restriction(world, amo, amo_new, "alpha");
+        // [ttg: matrix_inner + transform + truncate + norm/scale -- transform/inner missing]
+        orthonormalize(world, amo_new, param.nalpha());
+        amo = amo_new;
+        bmo = amo;
+    }
+
+    functionT rho = make_density(world, aocc, amo);
+    rho.scale(spinfac);
+    dipole(world, rho);
+
+    if (param.nwfile() == "none") {
+        if (world.rank() == 0 and (param.print_level() > 1))
+            print("Orbitals are eigenvectors - energies are eigenvalues\nAnalysis of alpha MO vectors");
+        analyze_vectors(world, amo, ao, vtol, molecule, param.print_level(), aobasis, aocc, aeps);
+    }
+}
 
 } // namespace madness

@@ -213,6 +213,8 @@ public:
     AtomicBasisSet aobasis;
     functionT mask;
     bool validate_mra_ttg = false;
+    bool use_solve_simple = false;   ///< run solve_simple instead of solve (--solve-simple)
+    bool mrattg_resident = false;    ///< solve_simple keeps the orbitals on MRA-TTG (--mra-ttg-resident)
 
     scf_data e_data;
 
@@ -265,6 +267,12 @@ public:
         : SCF(world, CalculationParameters(world, parser), Molecule(world, parser)) {
         if (parser.key_exists("validate-mra-ttg")) {
             validate_mra_ttg = true;
+        }
+        if (parser.key_exists("solve-simple")) {
+            use_solve_simple = true;
+        }
+        if (parser.key_exists("mra-ttg-resident")) {
+            mrattg_resident = true;
         }
         work_dir = std::filesystem::current_path();
     }
@@ -468,8 +476,12 @@ public:
     vecfuncT apply_bsh_plain(World& world, vecfuncT& Vpsi, const tensorT& eps,
                              const CalculationParameters& param);
 #ifdef HAVE_MRA_TTG
+    /// With psi given, the same graph also forms the residual r = psi - BSH(Vpsi)
+    /// and its norms (into rnorm) and returns r instead of the new orbitals.
     vecfuncT apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
-                              const CalculationParameters& param);
+                              const CalculationParameters& param,
+                              const vecfuncT* psi = nullptr,
+                              std::vector<double>* rnorm = nullptr);
 #endif // HAVE_MRA_TTG
 
     tensorT make_fock_matrix(World& world, const vecfuncT& psi,
@@ -555,6 +567,9 @@ public:
 
     // For given protocol, solve the DFT/HF/response equations
     void solve(World& world);
+
+    /// closed-shell, canonical-orbital SCF loop without KAIN (staging ground for MRA-TTG)
+    void solve_simple(World& world);
 
     void output_calc_info_schema() const;
 
@@ -713,7 +728,8 @@ public:
                 }
                 calc.ao.clear(); world.gop.fence();
                 calc.ao = calc.project_ao_basis(world, calc.aobasis);
-                calc.solve(world);
+                if (calc.use_solve_simple) calc.solve_simple(world);
+                else calc.solve(world);
 
                 if (calc.param.save())
                     calc.save_mos(world);

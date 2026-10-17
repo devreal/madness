@@ -1,4 +1,4 @@
-set(MADNESS_TRACKED_MRA_TTG_TAG batched_convolution)
+set(MADNESS_TRACKED_MRA_TTG_TAG scf-device-ops)
 set(MADNESS_TRACKED_PARSEC_TAG parsec-for-ttg-batching-backport-ordered-heap)
 set(MADNESS_TRACKED_NLOHMANN_JSON_VERSION 3.12.0)
 set(MADNESS_TRACKED_NLOHMANN_JSON_TAG v3.12.0)
