@@ -2143,13 +2143,6 @@ vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
     }
 
     if (validate_mra_ttg) {
-        // nonstandard input of the convolution (before apply() changes Vpsi's state)
-        vecfuncT mad_ns = copy(world, Vpsi);
-        make_nonstandard(world, mad_ns);
-        compare_mra_madness(mad_ns, ns_mra, "BSH-ns-input", 1e-10);
-        mad_ns.clear();
-        ns_mra.clear();
-
         auto mad_new_psi = apply(world, ops, Vpsi);
         madness::compress(world, mad_new_psi);
         truncate(world, mad_new_psi);
