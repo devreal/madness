@@ -2049,7 +2049,7 @@ vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
      */
     ttg::Edge<mra::Key<NDIM>, mra::FunctionsReconstructedNode<T, NDIM>> reconstruct_conv_result, compress_input;
     ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>> conv_input, compress_conv_result,
-                                                                    convolution_result, recompress_result, truncate_result;
+                                                                    convolution_result, recompress_result;
     ttg::Edge<mra::Key<NDIM>, void> load_control;
     std::vector<std::unique_ptr<ttg::TTBase>> tts; // crutch because we need to keep TTs alive
     auto start            = mra::make_start(gaussians, load_control);
@@ -2071,13 +2071,14 @@ vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
     auto convolve         = mra::make_convolution(gaussians, K, conv_input, convolution_result, op, precision, truncate_mode,
                                                     FunctionDefaults<NDIM>::get_cell_min_width(), "convolution");
     auto reconstruct_conv = mra::make_reconstruct(gaussians, K, true, functiondata, convolution_result, reconstruct_conv_result, "reconstruct_convolution");
-    auto recompress_conv  = mra::make_compress(gaussians, K, false, functiondata, reconstruct_conv_result, recompress_result, "recompress_convolution");
-
-    auto truncate_conv    = make_truncate(gaussians, K, precision,
-                                            madness::FunctionDefaults<NDIM>::get_truncate_mode(),
-                                            madness::FunctionDefaults<NDIM>::get_cell_min_width(),
-                                            recompress_result, truncate_result, "truncate");
-    auto store_tt         = mra::vmra::make_vmra_store(madconv_mra, truncate_result);
+    // truncation folded directly into recompress (screens out negligible
+    // wavelet coefficients as they are produced, instead of a second
+    // make_truncate pass over the fully compressed tree)
+    auto recompress_conv  = mra::make_compress(gaussians, K, false, functiondata, reconstruct_conv_result, recompress_result, "recompress_convolution",
+                                                ttg::Void{}, ttg::Void{}, /*enable_truncate=*/true, precision,
+                                                madness::FunctionDefaults<NDIM>::get_truncate_mode(),
+                                                madness::FunctionDefaults<NDIM>::get_cell_min_width());
+    auto store_tt         = mra::vmra::make_vmra_store(madconv_mra, recompress_result);
 
     execute_mra_ttg(start);
 
@@ -2087,6 +2088,13 @@ vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
     new_psi = std::move(madconv_mra);
 
     if (validate_mra_ttg) {
+        // nonstandard input of the convolution (before apply() changes Vpsi's state)
+        vecfuncT mad_ns = copy(world, Vpsi);
+        make_nonstandard(world, mad_ns);
+        compare_mra_madness(mad_ns, ns_mra, "BSH-ns-input", 1e-10);
+        mad_ns.clear();
+        ns_mra.clear();
+
         auto mad_new_psi = apply(world, ops, Vpsi);
         madness::compress(world, mad_new_psi);
         truncate(world, mad_new_psi);
@@ -2141,10 +2149,6 @@ vecfuncT SCF::compute_residual(World& world, tensorT& occ, tensorT& fock,
     //scale(world, Vpsi, fac);
     END_TIMER(world, "Compute residual stuff");
 
-    vecfuncT new_psi;
-#ifdef HAVE_MRA_TTG
-    new_psi = apply_bsh_mrattg(world, Vpsi, eps, param);
-#else  // HAVE_MRA_TTG
     // bsh_apply selects the backend (executors above; eps fed identically to all).
     // auto: macrotask when multinode (rank-local apply, no inter-node convolution comm)
     // or at tight protocol (one orbital per task bounds the working set where memory
@@ -2169,6 +2173,10 @@ vecfuncT SCF::compute_residual(World& world, tensorT& occ, tensorT& fock,
     if (redistribute) batch = 1;   // one owner per task (explicit macrotask mode included)
     if (redistribute and param.print_level() >= 2 and world.rank() == 0)
         print("BSH apply: redistribute operand to single-owner batches (tight protocol)");
+    vecfuncT new_psi;
+#ifdef HAVE_MRA_TTG
+    new_psi = apply_bsh_mrattg(world, Vpsi, eps, param);
+#else  // HAVE_MRA_TTG
     if (bsh_apply_mode == "macrotask")  new_psi = apply_bsh_macrotask(world, Vpsi, eps, param, batch, redistribute);
     else if (bsh_apply_mode == "plain") new_psi = apply_bsh_plain(world, Vpsi, eps, param);
     else                                new_psi = apply_bsh_tiled(world, Vpsi, eps, param);
