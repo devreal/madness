@@ -17,18 +17,29 @@ add_definitions(-DMRA_CHEMDATA_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}\")
 
 set(MADCHEM_SCF_SOURCES SCF.cc)
 
-if (TARGET mra::cuda OR TARGET mra::hip)
-  mra_generate_gpu_wrappers(
-      SOURCES SCF.cc
-      CUDA_OUTPUT_VAR _scf_cu
-      HIP_OUTPUT_VAR  _scf_hip
+# The MRA-TTG graphs of the SCF live in device/, in several translation units that
+# compile in parallel; SCF.cc itself does not include TTG and stays plain C++.
+if (HAVE_MRA_TTG)
+  set(MADCHEM_SCF_DEVICE_SOURCES
+      device/functions.cc
+      device/bsh.cc
+      device/potential.cc
+      device/kinetic.cc
+      device/validate.cc
     )
-  if (TARGET mra::cuda)
-    set(MADCHEM_SCF_SOURCES ${_scf_cu})
+  if (TARGET mra::cuda OR TARGET mra::hip)
+    mra_generate_gpu_wrappers(
+        SOURCES ${MADCHEM_SCF_DEVICE_SOURCES}
+        CUDA_OUTPUT_VAR _scf_device_cu
+        HIP_OUTPUT_VAR  _scf_device_hip
+      )
+    if (TARGET mra::cuda)
+      set(MADCHEM_SCF_DEVICE_SOURCES ${_scf_device_cu})
+    elseif (TARGET mra::hip)
+      set(MADCHEM_SCF_DEVICE_SOURCES ${_scf_device_hip})
+    endif()
   endif()
-  if (TARGET mra::hip)
-    set(MADCHEM_SCF_SOURCES ${_scf_hip})
-  endif()
+  list(APPEND MADCHEM_SCF_SOURCES ${MADCHEM_SCF_DEVICE_SOURCES})
 endif()
 
 # Set the CHEM sources and header files
