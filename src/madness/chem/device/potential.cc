@@ -51,17 +51,16 @@ void device_apply_local_potential(World& world, const functionT& v, DeviceFuncti
     vecfuncT vv = {copy(v)};   // the loader needs it reconstructed
     vv[0].reconstruct();
     RecEdge v_e, psi_rec_e, prod_e;
-    NodeEdge psi_e, comp_e, trunc_e;
+    NodeEdge psi_e, comp_e;
     g.add(mra::vmra::make_vmra_load(vv, g.control, v_e, "load_v"));
     g.add(fv(psi).make_feed(g.control, psi_e, true, "feed_psi"));
     g.add(mra::make_reconstruct(fns, g.K, false, g.functiondata, psi_e, psi_rec_e, "reconstruct_psi"));
     g.add(mra::make_multiply_broadcast<T, 3>(db, fns_v, fns, g.functiondata, g.K, v_e, psi_rec_e, prod_e, "V*psi"));
-    g.add(mra::make_compress(fns, g.K, false, g.functiondata, prod_e, comp_e, "compress_Vpsi"));
-    if (tol > 0.0) {
-        g.add(mra::make_truncate(fns, g.K, tol, FunctionDefaults<3>::get_truncate_mode(),
-                                 FunctionDefaults<3>::get_cell_min_width(), comp_e, trunc_e, "truncate_Vpsi"));
-    }
-    g.add(fv(Vpsi).make_store(tol > 0.0 ? trunc_e : comp_e, N, "store_Vpsi"));
+    // truncation folded into the compression, as madness::truncate does after compress
+    g.add(mra::make_compress(fns, g.K, false, g.functiondata, prod_e, comp_e, "compress_Vpsi",
+                             ttg::Void{}, ttg::Void{}, /*enable_truncate=*/tol > 0.0, tol,
+                             FunctionDefaults<3>::get_truncate_mode(), FunctionDefaults<3>::get_cell_min_width()));
+    g.add(fv(Vpsi).make_store(comp_e, N, "store_Vpsi"));
     g.execute();
     check_device_tree(Vpsi, "device_apply_local_potential");
 }

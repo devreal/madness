@@ -195,7 +195,7 @@ DeviceFunctions device_bsh_residual(World& world, DeviceFunctions& psi, DeviceFu
     mra::GaussianConvolutionOperator<T, 3> op(ops);
 
     using RecEdge = ttg::Edge<mra::Key<3>, mra::FunctionsReconstructedNode<T, 3>>;
-    NodeEdge psi_e, V_e, fpsi_e, Vp_e, conv_in_e, conv_e, recomp_e, trunc_e, r_e;
+    NodeEdge psi_e, V_e, fpsi_e, Vp_e, conv_in_e, conv_e, trunc_e, r_e;
     RecEdge rec_e, rec_conv_e;
     ttg::Edge<mra::Key<3>, mra::DenseTensor<T, 1>> norm_e;
     DeviceFunctions r;
@@ -210,8 +210,10 @@ DeviceFunctions device_bsh_residual(World& world, DeviceFunctions& psi, DeviceFu
     g.add(mra::make_compress(fns, g.K, true, g.functiondata, rec_e, conv_in_e, "compress"));
     g.add(mra::make_convolution(fns, g.K, conv_in_e, conv_e, op, precision, truncate_mode, cell_min_width, "convolution"));
     g.add(mra::make_reconstruct(fns, g.K, true, g.functiondata, conv_e, rec_conv_e, "reconstruct_convolution"));
-    g.add(mra::make_compress(fns, g.K, false, g.functiondata, rec_conv_e, recomp_e, "recompress_convolution"));
-    g.add(mra::make_truncate(fns, g.K, precision, truncate_mode, cell_min_width, recomp_e, trunc_e, "truncate"));
+    // truncation folded into the recompression
+    g.add(mra::make_compress(fns, g.K, false, g.functiondata, rec_conv_e, trunc_e, "recompress_convolution",
+                             ttg::Void{}, ttg::Void{}, /*enable_truncate=*/true, precision, truncate_mode,
+                             cell_min_width));
     // -r = new psi - psi, and its norms. Not psi - new psi: gaxpy forwards an operand with
     // scalar 1 unchanged where the other one is empty, which would hand a kept psi node to
     // the store of r (see mra::FunctionVector)
