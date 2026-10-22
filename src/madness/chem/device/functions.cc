@@ -142,6 +142,63 @@ void device_transform(World& world, DeviceFunctions& v, const Tensor<double>& U,
     check_device_tree(v, "device_transform");
 }
 
+/// [a, b]: the functions of a followed by those of b, in a new vector; a and b are kept or consumed
+DeviceFunctions device_concat(World& world, DeviceFunctions& a, bool keep_a, DeviceFunctions& b, bool keep_b) {
+    MraGraph g;
+    const mra::size_type NA = a.size(), NB = b.size();
+    NodeEdge a_e, b_e, out_e;
+    DeviceFunctions out;
+    g.add(fv(a).make_feed(g.control, a_e, keep_a, "feed_a"));
+    g.add(fv(b).make_feed(g.control, b_e, keep_b, "feed_b"));
+    g.add(mra::make_concat<double, 3>(make_mrattg_functionset(NA), make_mrattg_functionset(NB), g.K, a_e, b_e, out_e));
+    g.add(fv(out).make_store(out_e, NA + NB, "store"));
+    g.execute();
+    check_device_tree(out, "device_concat");
+    return out;
+}
+
+/// out_j = sum_i v_i U(i,j) in a new vector, truncated with tol unless tol == 0; v is kept
+DeviceFunctions device_transformed(World& world, DeviceFunctions& v, const Tensor<double>& U, double tol) {
+    MraGraph g;
+    const mra::size_type N = v.size(), M = U.dim(1);
+    MADNESS_CHECK_THROW(U.dim(0) == long(N), "device_transformed: U must have v.size() rows");
+    auto fns_out = make_mrattg_functionset(M);
+    NodeEdge in_e, out_e, trunc_e;
+    DeviceFunctions out;
+    g.add(fv(v).make_feed(g.control, in_e, true, "feed"));
+    g.add(mra::make_transform<double, 3>(make_mrattg_functionset(N), fns_out, g.K, device_matrix(U), in_e, out_e));
+    if (tol > 0.0) {
+        g.add(mra::make_truncate(fns_out, g.K, tol, FunctionDefaults<3>::get_truncate_mode(),
+                                 FunctionDefaults<3>::get_cell_min_width(), out_e, trunc_e, "truncate"));
+    }
+    g.add(fv(out).make_store(tol > 0.0 ? trunc_e : out_e, M, "store"));
+    g.execute();
+    check_device_tree(out, "device_transformed");
+    return out;
+}
+
+/// ||sum_i v_i U(i,j)|| for every column j of U; v is kept
+std::vector<double> device_transform_norms(World& world, DeviceFunctions& v, const Tensor<double>& U) {
+    using T = double;
+    MraGraph g;
+    const mra::size_type N = v.size(), M = U.dim(1);
+    MADNESS_CHECK_THROW(U.dim(0) == long(N), "device_transform_norms: U must have v.size() rows");
+    auto fns_out = make_mrattg_functionset(M);
+    NodeEdge in_e, out_e;
+    ttg::Edge<mra::Key<3>, mra::DenseTensor<T, 1>> norm_e;
+    g.add(fv(v).make_feed(g.control, in_e, true, "feed"));
+    g.add(mra::make_transform<T, 3>(make_mrattg_functionset(N), fns_out, g.K, device_matrix(U), in_e, out_e));
+    g.add(mra::make_norm(fns_out, g.K, out_e, norm_e));
+    std::vector<double> norms(M, 0.0);
+    g.add(ttg::make_tt([&norms, M](const mra::Key<3>& key, const mra::DenseTensor<T, 1>& n) {
+        const T* data = n.current_view().data();
+        for (mra::size_type i = 0; i < M; ++i) norms[i] = data[i];
+    }, ttg::edges(norm_e), ttg::edges(), "norm_sink"));
+    g.execute();
+    world.gop.sum(norms.data(), norms.size());
+    return norms;
+}
+
 /// v_i <- c_i v_i
 void device_scale(World& world, DeviceFunctions& v, const std::vector<double>& c) {
     Tensor<double> D(static_cast<long>(c.size()), static_cast<long>(c.size()));

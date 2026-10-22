@@ -86,6 +86,15 @@ namespace madness {
     /// v_j <- sum_i v_i U(i,j), truncated with tol unless tol == 0 (cf. madness::transform)
     void device_transform(World& world, DeviceFunctions& v, const Tensor<double>& U, double tol);
 
+    /// [a, b]: the functions of a followed by those of b, in a new vector; a and b are kept or consumed
+    DeviceFunctions device_concat(World& world, DeviceFunctions& a, bool keep_a, DeviceFunctions& b, bool keep_b);
+
+    /// out_j = sum_i v_i U(i,j) in a new vector, truncated with tol unless tol == 0; v is kept
+    DeviceFunctions device_transformed(World& world, DeviceFunctions& v, const Tensor<double>& U, double tol);
+
+    /// ||sum_i v_i U(i,j)|| for every column j of U; v is kept
+    std::vector<double> device_transform_norms(World& world, DeviceFunctions& v, const Tensor<double>& U);
+
     /// v_i <- c_i v_i
     void device_scale(World& world, DeviceFunctions& v, const std::vector<double>& c);
 

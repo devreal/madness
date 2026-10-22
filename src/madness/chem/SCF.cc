@@ -2914,6 +2914,13 @@ void SCF::solve_simple(World& world) {
                                  && !xc.is_meta();
     const bool device_only = resident && local_potential && param.deriv() == "abgv";
     DeviceFunctions amo_d;
+    // KAIN (maxsub > 1): the history of iterates and residuals as one device vector, pair s
+    // holding psi^(s) at [2sN, 2sN+N) and -r^(s) at [2sN+N, 2sN+2N), oldest first; kain_Q is
+    // the KAIN matrix of the pairs
+    const bool kain = param.maxsub() > 1;
+    DeviceFunctions hist_d;
+    long nhist = 0;
+    tensorT kain_Q;
 #endif // HAVE_MRA_TTG
 
     for (int iter = 0; iter < param.maxiter(); ++iter) {
@@ -3079,6 +3086,13 @@ void SCF::solve_simple(World& world) {
             device_transform(world, Vpsi_d, U, vtol);
             device_transform(world, amo_d, U, FunctionDefaults<3>::get_thresh());
             device_normalize(world, amo_d);
+            if (kain && nhist > 0) {   // rotate the KAIN history along (cf. rotate_subspace)
+                const long n = U.dim(0);
+                tensorT Ublock(2 * nhist * n, 2 * nhist * n);
+                for (long b = 0; b < 2 * nhist; ++b)
+                    Ublock(Slice(b * n, b * n + n - 1), Slice(b * n, b * n + n - 1)) = U;
+                device_transform(world, hist_d, Ublock, 0.0);
+            }
             END_TIMER(world, "Diagonalization (device)");
         } else
 #endif // HAVE_MRA_TTG
@@ -3168,6 +3182,100 @@ void SCF::solve_simple(World& world) {
             }
             END_TIMER(world, "BSH residual (device)");
 
+            if (kain) {
+                // KAIN (cf. update_subspace) [ttg: concat + matrix_inner + transform + norm]
+                START_TIMER(world);
+                const long n = nmo;
+                // append the current pair [psi, -r] to the history
+                DeviceFunctions pair_d = device_concat(world, amo_d, true, rneg_d, false);
+                tensorT M;   // <pair_i | hist_j>
+                if (nhist == 0) {
+                    M = device_matrix_inner(world, pair_d, pair_d);
+                    hist_d = std::move(pair_d);
+                } else {
+                    hist_d = device_concat(world, hist_d, false, pair_d, true);
+                    M = device_matrix_inner(world, pair_d, hist_d);
+                }
+                long m = ++nhist;
+
+                // new row and column of the KAIN matrix: sum_i <psi_i|r^(t)_i>, sum_i <psi^(t)_i|r_i>
+                tensorT ms(m), sm(m);
+                for (long t = 0; t < m; ++t) {
+                    for (long i = 0; i < n; ++i) {
+                        ms[t] -= M(i, 2 * t * n + n + i);
+                        sm[t] -= M(n + i, 2 * t * n + i);
+                    }
+                }
+                tensorT newQ(m, m);
+                if (m > 1) newQ(Slice(0, -2), Slice(0, -2)) = kain_Q;
+                newQ(m - 1, _) = ms;
+                newQ(_, m - 1) = sm;
+                kain_Q = newQ;
+
+                tensorT kc;
+                double rcond = 1e-12;
+                while (true) {
+                    if (m == 1) {   // a single pair: the plain update
+                        kc = tensorT(1);
+                        kc[0] = 1.0;
+                        break;
+                    }
+                    kc = KAIN(kain_Q, rcond);
+                    if (world.rank() == 0 and (param.print_level() > 3)) print("kain c:", kc);
+                    if (kc.absmax() < 3.0) break;
+                    if (rcond < 0.01) {
+                        if (world.rank() == 0 and (param.print_level() > 3))
+                            print("Increasing subspace singular value threshold ", kc[m - 1], rcond);
+                        rcond *= 100;
+                        continue;
+                    }
+                    // subspace malfunction: keep only the current pair
+                    if (world.rank() == 0 and (param.print_level() > 3)) print("Restarting KAIN due to subspace malfunction");
+                    tensorT keep_last(2 * m * n, 2 * n);
+                    for (long i = 0; i < 2 * n; ++i) keep_last(2 * (m - 1) * n + i, i) = 1.0;
+                    device_transform(world, hist_d, keep_last, 0.0);
+                    const double q = kain_Q(m - 1, m - 1);
+                    nhist = m = 1;
+                    kain_Q = tensorT(1, 1);
+                    kain_Q(0, 0) = q;
+                    rcond = 1e-12;
+                }
+                world.gop.broadcast_serializable(kc, 0);
+                if (world.rank() == 0 and (param.print_level() > 3)) print("Subspace solution", kc);
+
+                // new orbitals sum_t c_t (psi^(t) - r^(t)), as the step D from the current psi (the
+                // last pair), restricted to ||D_i|| <= maxrotn (cf. do_step_restriction)
+                tensorT D(2 * m * n, n);
+                for (long t = 0; t < m; ++t) {
+                    for (long i = 0; i < n; ++i) {
+                        D(2 * t * n + i, i) = kc[t];
+                        D(2 * t * n + n + i, i) = kc[t];
+                    }
+                }
+                for (long i = 0; i < n; ++i) D(2 * (m - 1) * n + i, i) -= 1.0;
+                std::vector<double> dnorm = device_transform_norms(world, hist_d, D);
+                tensorT Unew(2 * m * n, n);
+                for (long i = 0; i < n; ++i) {
+                    const double step = (dnorm[i] > param.maxrotn()) ? param.maxrotn() / dnorm[i] : 1.0;
+                    Unew(_, i) = step * D(_, i);
+                    Unew(2 * (m - 1) * n + i, i) += 1.0;
+                }
+                amo_d = device_transformed(world, hist_d, Unew, 0.0);
+                double drms, dmax;
+                vector_stats(dnorm, drms, dmax);
+                if (world.rank() == 0 and (param.print_level() > 2))
+                    print("Norm of vector changes alpha : rms", drms, "   max", dmax);
+
+                // drop the oldest pair once the history is full
+                if (nhist == param.maxsub()) {
+                    tensorT drop_first(2 * m * n, 2 * (m - 1) * n);
+                    for (long i = 0; i < 2 * (m - 1) * n; ++i) drop_first(2 * n + i, i) = 1.0;
+                    device_transform(world, hist_d, drop_first, 0.0);
+                    --nhist;
+                    kain_Q = copy(kain_Q(Slice(1, -1), Slice(1, -1)));
+                }
+                END_TIMER(world, "KAIN update (device)");
+            } else {
             // step restriction: amo - c r = amo + c rneg with ||c r|| <= maxrotn  [ttg: transform + gaxpy]
             START_TIMER(world);
             std::vector<double> c(nmo, -1.0);
@@ -3177,6 +3285,7 @@ void SCF::solve_simple(World& world) {
                 print("Norm of vector changes alpha : rms", rms, "   max", maxval);
             device_update(world, amo_d, rneg_d, c);
             END_TIMER(world, "Update orbitals (device)");
+            }
 
             // [ttg: matrix_inner + transform + truncate + norm]
             START_TIMER(world);
