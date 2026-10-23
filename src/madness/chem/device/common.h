@@ -193,6 +193,29 @@ void load_compressed_mrattg(const std::vector<Function<T, (std::size_t)NDIM>>& f
     tts.push_back(mra::make_compress(fns, K, false, functiondata, reconstructed, out, "compress_" + name));
 }
 
+/// Compress the reconstructed nodes on `in` onto `out`, truncated with tol unless tol == 0.
+/// The truncation is folded into the compression, unless MRA_TTG_SEPARATE_TRUNCATE is set:
+/// then a separate make_truncate pass follows, a workaround for MRA-TTG versions whose folded
+/// truncation still sends nodes their parent drops.
+template <typename FunctionSetT>
+inline void add_compress(std::vector<std::unique_ptr<ttg::TTBase>>& tts, const std::shared_ptr<FunctionSetT>& fns,
+                         mra::size_type K, const mra::FunctionData<double, 3>& functiondata,
+                         ttg::Edge<mra::Key<3>, mra::FunctionsReconstructedNode<double, 3>>& in,
+                         ttg::Edge<mra::Key<3>, mra::FunctionsCompressedNode<double, 3>>& out,
+                         double tol, const std::string& name) {
+    static const bool separate = std::getenv("MRA_TTG_SEPARATE_TRUNCATE") != nullptr;
+    const int mode = FunctionDefaults<3>::get_truncate_mode();
+    const double min_width = FunctionDefaults<3>::get_cell_min_width();
+    if (tol <= 0.0 || !separate) {
+        tts.push_back(mra::make_compress(fns, K, false, functiondata, in, out, name, ttg::Void{}, ttg::Void{},
+                                         /*enable_truncate=*/tol > 0.0, tol, mode, min_width));
+    } else {
+        ttg::Edge<mra::Key<3>, mra::FunctionsCompressedNode<double, 3>> compressed;
+        tts.push_back(mra::make_compress(fns, K, false, functiondata, in, compressed, name));
+        tts.push_back(mra::make_truncate(fns, K, tol, mode, min_width, compressed, out, name + "-truncate"));
+    }
+}
+
 /// function set of N functions in a single batch
 inline auto make_mrattg_functionset(mra::size_type N) {
     auto pmap = mra::make_procmap<3>(N, 1 /* batch */);

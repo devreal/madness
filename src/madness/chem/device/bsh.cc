@@ -105,13 +105,9 @@ vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
     auto convolve         = mra::make_convolution(gaussians, K, conv_input, convolution_result, op, precision, truncate_mode,
                                                     FunctionDefaults<NDIM>::get_cell_min_width(), "convolution");
     auto reconstruct_conv = mra::make_reconstruct(gaussians, K, true, functiondata, convolution_result, reconstruct_conv_result, "reconstruct_convolution");
-    // truncation folded directly into recompress (screens out negligible
-    // wavelet coefficients as they are produced, instead of a second
-    // make_truncate pass over the fully compressed tree)
-    auto recompress_conv  = mra::make_compress(gaussians, K, false, functiondata, reconstruct_conv_result, recompress_result, "recompress_convolution",
-                                                ttg::Void{}, ttg::Void{}, /*enable_truncate=*/true, precision,
-                                                madness::FunctionDefaults<NDIM>::get_truncate_mode(),
-                                                madness::FunctionDefaults<NDIM>::get_cell_min_width());
+    // truncation folded into the recompression (see add_compress)
+    add_compress(tts, gaussians, K, functiondata, reconstruct_conv_result, recompress_result, precision,
+                 "recompress_convolution");
 
     // residual r = psi - BSH(Vpsi) and its norms, on the device
     ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>> psi_compressed, residual_result;
@@ -135,7 +131,7 @@ vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
                                                        true /* add_leaves */);
 
     execute_mra_ttg(start, mrattg_tt_list(tts, {compress.get(), convolve.get(), reconstruct_conv.get(),
-                                                recompress_conv.get(), store_tt.get()}));
+                                                store_tt.get()}));
 
     scf_end_timer(world, residual ? "Apply BSH & residual" : "Apply BSH & truncate");
 
@@ -210,10 +206,8 @@ DeviceFunctions device_bsh_residual(World& world, DeviceFunctions& psi, DeviceFu
     g.add(mra::make_compress(fns, g.K, true, g.functiondata, rec_e, conv_in_e, "compress"));
     g.add(mra::make_convolution(fns, g.K, conv_in_e, conv_e, op, precision, truncate_mode, cell_min_width, "convolution"));
     g.add(mra::make_reconstruct(fns, g.K, true, g.functiondata, conv_e, rec_conv_e, "reconstruct_convolution"));
-    // truncation folded into the recompression
-    g.add(mra::make_compress(fns, g.K, false, g.functiondata, rec_conv_e, trunc_e, "recompress_convolution",
-                             ttg::Void{}, ttg::Void{}, /*enable_truncate=*/true, precision, truncate_mode,
-                             cell_min_width));
+    // truncation folded into the recompression (see add_compress)
+    add_compress(g.tts, fns, g.K, g.functiondata, rec_conv_e, trunc_e, precision, "recompress_convolution");
     // -r = new psi - psi, and its norms. Not psi - new psi: gaxpy forwards an operand with
     // scalar 1 unchanged where the other one is empty, which would hand a kept psi node to
     // the store of r (see mra::FunctionVector)

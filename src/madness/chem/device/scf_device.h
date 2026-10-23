@@ -39,6 +39,7 @@
 /// the graphs are built in device/*.cc (as CUDA/HIP sources in device builds).
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <vector>
 #include <madness/chem/SCF.h>
@@ -62,6 +63,70 @@ namespace madness {
         std::size_t size() const;
 
         Impl& impl();
+
+    private:
+        std::unique_ptr<Impl> pimpl;
+    };
+
+    /**
+     * One MRA-TTG graph built from several operations that pass sets of functions
+     * along edges, instead of storing them into DeviceFunctions after each graph and
+     * feeding them into the next. The caller decides which sets to persist (store()).
+     *
+     * Reductions (matrix_inner, norms, kinetic_matrix) yield results on the host after
+     * execute(). A reduction can also feed decide(), which computes a matrix from it
+     * on the host while the graph runs; transform() then applies that matrix, its input
+     * nodes waiting in the graph until the matrix is there. decide() runs inside a
+     * task on the process owning the root of the tree: the callback must not use
+     * MADNESS collectives (world.gop), and host state it writes is set on that process
+     * only.
+     *
+     * Handles are only valid for the graph that made them, until it is executed.
+     */
+    class DeviceGraph {
+    public:
+        struct Impl;
+        /// a set of functions flowing through the graph (compressed nodes)
+        struct Functions { int id = -1; std::size_t size = 0; };
+        /// a reduction, available on the host (all processes) after execute()
+        struct Result { int id = -1; };
+        /// a matrix computed while the graph executes
+        struct Matrix { int id = -1; };
+        using Decision = std::function<Tensor<double>(const Tensor<double>&)>;
+
+        explicit DeviceGraph(World& world);
+        ~DeviceGraph();
+        DeviceGraph(const DeviceGraph&) = delete;
+        DeviceGraph& operator=(const DeviceGraph&) = delete;
+
+        /// the functions of v; without keep, v is empty afterwards and can be stored into
+        Functions feed(DeviceFunctions& v, bool keep);
+        /// persist f into v, which must be empty (or fed without keep in this graph)
+        void store(Functions f, DeviceFunctions& v);
+
+        /// v psi_i for one (host) function v, truncated with tol unless tol == 0
+        Functions apply_local_potential(const functionT& v, Functions psi, double tol);
+        /// out_j = sum_i in_i U(i,j), truncated with tol unless tol == 0
+        Functions transform(Functions in, const Tensor<double>& U, double tol);
+        /// the same with U computed in the graph; M is the number of columns of U
+        Functions transform(Functions in, Matrix U, std::size_t M, double tol);
+
+        /// <a_i|b_j>; a and b may be the same
+        Result matrix_inner(Functions a, Functions b);
+        /// ||a_i||
+        Result norms(Functions a);
+        /// 1/2 sum_axis <d psi_i|d psi_j> (abgv derivative)
+        Result kinetic_matrix(Functions psi);
+
+        /// a matrix computed from a reduction (matrix_inner or norms) while the graph runs
+        Matrix decide(Result r, Decision f);
+        /// a matrix computed from another one
+        Matrix decide(Matrix m, Decision f);
+
+        /// build and run the graph (collective)
+        void execute();
+        /// a reduction's value, after execute()
+        Tensor<double> get(Result r) const;
 
     private:
         std::unique_ptr<Impl> pimpl;

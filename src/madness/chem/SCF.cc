@@ -3020,10 +3020,25 @@ void SCF::solve_simple(World& world) {
             vloc.truncate();
             END_TIMER(world, "DFT potential");
 
-            // [ttg: multiply_broadcast + compress + truncate]
+            // one graph from one feed and one reconstruction of psi: V*psi, stored for the residual,
+            // the potential-energy matrix <V psi|psi>, and the kinetic matrix
+            // [ttg: multiply_broadcast + compress + matrix_inner; derivative x3 + compress + matrix_inner]
             START_TIMER(world);
-            device_apply_local_potential(world, vloc, amo_d, Vpsi_d, FunctionDefaults<3>::get_thresh());
-            END_TIMER(world, "V*psi (device)");
+            const long nmo = amo_d.size();
+            tensorT pe, kin;
+            {
+                DeviceGraph g(world);
+                auto psi = g.feed(amo_d, true);
+                auto vpsi = g.apply_local_potential(vloc, psi, FunctionDefaults<3>::get_thresh());
+                g.store(vpsi, Vpsi_d);
+                auto pe_r = g.matrix_inner(vpsi, psi);
+                DeviceGraph::Result kin_r;
+                if (device_only) kin_r = g.kinetic_matrix(psi);
+                g.execute();
+                pe = g.get(pe_r);
+                if (device_only) kin = g.get(kin_r);
+            }
+            END_TIMER(world, "V*psi, PE, KE (device)");
             if (validate_mra_ttg) {
                 vecfuncT ref = mul(world, vloc, amo);
                 truncate(world, ref);
@@ -3035,14 +3050,10 @@ void SCF::solve_simple(World& world) {
                           " max ||madness||", *std::max_element(rnorm.begin(), rnorm.end()));
             }
 
-            // [ttg: matrix_inner for the potential energy; derivative x3 + compress + matrix_inner for
-            //  the kinetic energy]
             START_TIMER(world);
-            const long nmo = amo_d.size();
-            tensorT pe = device_matrix_inner(world, Vpsi_d, amo_d);
             fock = tensorT(nmo, nmo);
             if (device_only) {
-                fock = device_kinetic_matrix(world, amo_d);
+                fock = kin;
                 if (validate_mra_ttg) {
                     tensorT ref(nmo, nmo);
                     distmatT k = kinetic_energy_matrix(world, amo);
@@ -3077,22 +3088,54 @@ void SCF::solve_simple(World& world) {
                 Vpsi.clear();
                 END_TIMER(world, "Vpsi to device");
             }
+            // one graph, psi and Vpsi fed and stored once: the overlap, from it U (computed on the
+            // host while the graph runs, cf. get_fock_transformation), the rotation of psi, Vpsi and
+            // the KAIN history, and the normalization of psi
+            // [ttg: matrix_inner + transform + truncate + norm + transform]
             START_TIMER(world);
-            tensorT overlap = device_matrix_inner(world, amo_d, amo_d);
-            tensorT U = get_fock_transformation(world, overlap, fock, aeps, aocc,
-                                                FunctionDefaults<3>::get_thresh());
-            for (int i = 0; i < param.nalpha(); ++i)   // no occupied-virtual mixing
-                for (int j = param.nalpha(); j < U.dim(0); ++j) U(j, i) = 0.0;
-            device_transform(world, Vpsi_d, U, vtol);
-            device_transform(world, amo_d, U, FunctionDefaults<3>::get_thresh());
-            device_normalize(world, amo_d);
-            if (kain && nhist > 0) {   // rotate the KAIN history along (cf. rotate_subspace)
-                const long n = U.dim(0);
-                tensorT Ublock(2 * nhist * n, 2 * nhist * n);
-                for (long b = 0; b < 2 * nhist; ++b)
-                    Ublock(Slice(b * n, b * n + n - 1), Slice(b * n, b * n + n - 1)) = U;
-                device_transform(world, hist_d, Ublock, 0.0);
+            const long n = amo_d.size();
+            const double thresh = FunctionDefaults<3>::get_thresh();
+            const long nalpha = param.nalpha();
+            const tensorT fock_h = copy(fock);
+            tensorT evals(n);
+            {
+                DeviceGraph g(world);
+                auto psi = g.feed(amo_d, false);
+                auto vpsi = g.feed(Vpsi_d, false);
+                // runs in a task on one process: no collectives (sygv, not sygvp)
+                auto U = g.decide(g.matrix_inner(psi, psi), [&](const Tensor<double>& overlap) {
+                    tensorT u, e;
+                    sygv(fock_h, overlap, 1, u, e);
+                    Localizer::undo_reordering(u, aocc, e);
+                    Localizer::undo_degenerate_rotations(u, e, thresh);
+                    for (long i = 0; i < nalpha; ++i)   // no occupied-virtual mixing
+                        for (long j = nalpha; j < u.dim(0); ++j) u(j, i) = 0.0;
+                    evals = e;
+                    return u;
+                });
+                g.store(g.transform(vpsi, U, n, vtol), Vpsi_d);
+                auto psi_rot = g.transform(psi, U, n, thresh);
+                auto scale = g.decide(g.norms(psi_rot), [](const Tensor<double>& norms) {
+                    Tensor<double> D(norms.dim(0), norms.dim(0));
+                    for (long i = 0; i < norms.dim(0); ++i) D(i, i) = 1.0 / norms(i);
+                    return D;
+                });
+                g.store(g.transform(psi_rot, scale, n, 0.0), amo_d);
+                if (kain && nhist > 0) {   // rotate the KAIN history along (cf. rotate_subspace)
+                    const long nb = 2 * nhist;
+                    auto Ublock = g.decide(U, [n, nb](const Tensor<double>& u) {
+                        Tensor<double> b(nb * n, nb * n);
+                        for (long k = 0; k < nb; ++k) b(Slice(k * n, k * n + n - 1), Slice(k * n, k * n + n - 1)) = u;
+                        return b;
+                    });
+                    g.store(g.transform(g.feed(hist_d, false), Ublock, nb * n, 0.0), hist_d);
+                }
+                g.execute();
             }
+            world.gop.sum(evals.ptr(), evals.size());   // only the process owning the root computed them
+            aeps = evals;
+            fock = 0.0;
+            for (long i = 0; i < n; ++i) fock(i, i) = evals(i);
             END_TIMER(world, "Diagonalization (device)");
         } else
 #endif // HAVE_MRA_TTG

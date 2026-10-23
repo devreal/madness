@@ -24,8 +24,8 @@ if (HAVE_MRA_TTG)
       device/functions.cc
       device/bsh.cc
       device/potential.cc
-      device/kinetic.cc
       device/validate.cc
+      device/graph.cc
     )
   if (TARGET mra::cuda OR TARGET mra::hip)
     mra_generate_gpu_wrappers(

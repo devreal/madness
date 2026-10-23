@@ -40,29 +40,10 @@ namespace madness {
 /// Vpsi_i = v psi_i for one (host) function v, compressed and truncated with tol unless tol == 0;
 /// psi is kept, Vpsi receives the result
 void device_apply_local_potential(World& world, const functionT& v, DeviceFunctions& psi,
-                                         DeviceFunctions& Vpsi, double tol) {
-    using T = double;
-    using RecEdge = ttg::Edge<mra::Key<3>, mra::FunctionsReconstructedNode<T, 3>>;
-    MraGraph g;
-    const mra::size_type N = psi.size();
-    auto fns = make_mrattg_functionset(N);
-    auto fns_v = make_mrattg_functionset(1);
-    auto db = device_domain();
-    vecfuncT vv = {copy(v)};   // the loader needs it reconstructed
-    vv[0].reconstruct();
-    RecEdge v_e, psi_rec_e, prod_e;
-    NodeEdge psi_e, comp_e;
-    g.add(mra::vmra::make_vmra_load(vv, g.control, v_e, "load_v"));
-    g.add(fv(psi).make_feed(g.control, psi_e, true, "feed_psi"));
-    g.add(mra::make_reconstruct(fns, g.K, false, g.functiondata, psi_e, psi_rec_e, "reconstruct_psi"));
-    g.add(mra::make_multiply_broadcast<T, 3>(db, fns_v, fns, g.functiondata, g.K, v_e, psi_rec_e, prod_e, "V*psi"));
-    // truncation folded into the compression, as madness::truncate does after compress
-    g.add(mra::make_compress(fns, g.K, false, g.functiondata, prod_e, comp_e, "compress_Vpsi",
-                             ttg::Void{}, ttg::Void{}, /*enable_truncate=*/tol > 0.0, tol,
-                             FunctionDefaults<3>::get_truncate_mode(), FunctionDefaults<3>::get_cell_min_width()));
-    g.add(fv(Vpsi).make_store(comp_e, N, "store_Vpsi"));
+                                  DeviceFunctions& Vpsi, double tol) {
+    DeviceGraph g(world);
+    g.store(g.apply_local_potential(v, g.feed(psi, true), tol), Vpsi);
     g.execute();
-    check_device_tree(Vpsi, "device_apply_local_potential");
 }
 
 /// sum_i occ_i psi_i^2 (cf. SCF::make_density), compressed, with the process map of `like`; psi is kept
@@ -86,6 +67,7 @@ functionT device_density(World& world, DeviceFunctions& psi, const tensorT& occ,
     rho[0].set_impl(like, false);
     g.add(mra::vmra::make_vmra_store(rho, rho_e, true /* add_leaves */));
     g.execute();
+    check_device_tree(psi, "device_density feed(keep)");
     return rho[0];
 }
 
