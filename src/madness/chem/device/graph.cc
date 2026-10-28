@@ -46,6 +46,8 @@ struct DeviceGraph::Impl {
     World& world;
     MraGraph g;
     std::optional<ttg::Buffer<mra::Domain<3>>> db;
+    /// the instances of an operation in this graph batch their device tasks together
+    mra::BatchGroup concat_group, inner_group;
 
     /// a set of functions: compressed nodes, and reconstructed ones once needed
     struct Fn {
@@ -193,12 +195,22 @@ DeviceGraph::Functions DeviceGraph::transform(Functions in, Matrix U, std::size_
     return pimpl->add_functions(add_transform(pimpl->g, pimpl->get(in).compressed, in.size, M, pimpl->matrix(U), tol), M);
 }
 
+DeviceGraph::Functions DeviceGraph::concat(Functions a, Functions b) {
+    auto& g = pimpl->g;
+    NodeEdge out_e;
+    g.add(mra::make_concat<double, 3>(make_mrattg_functionset(a.size), make_mrattg_functionset(b.size), g.K,
+                                      pimpl->get(a).compressed, pimpl->get(b).compressed, out_e, "concat",
+                                      ttg::Void{}, ttg::Void{}, pimpl->concat_group));
+    return pimpl->add_functions(out_e, a.size + b.size);
+}
+
 DeviceGraph::Result DeviceGraph::matrix_inner(Functions a, Functions b) {
     auto& g = pimpl->g;
     Impl::Res& r = pimpl->add_result(long(a.size), long(b.size));
     r.matrix.emplace();
     g.add(mra::make_matrix_inner<double, 3>(make_mrattg_functionset(a.size), make_mrattg_functionset(b.size), g.K,
-                                            pimpl->get(a).compressed, pimpl->get(b).compressed, *r.matrix));
+                                            pimpl->get(a).compressed, pimpl->get(b).compressed, *r.matrix,
+                                            "matrix_inner", ttg::Void{}, ttg::Void{}, pimpl->inner_group));
     pimpl->add_matrix_sink(*r.matrix, r, 1.0, "matrix_inner_sink");
     return Result{int(pimpl->results.size()) - 1};
 }
@@ -221,14 +233,17 @@ DeviceGraph::Result DeviceGraph::kinetic_matrix(Functions psi) {
     auto fns = make_mrattg_functionset(N);
     Impl::Res& r = pimpl->add_result(long(N), long(N));
     RecEdge& psi_rec = pimpl->reconstructed(psi);
+    mra::BatchGroup compress_group;   // the three axes batch together
     for (mra::Dimension axis = 0; axis < 3; ++axis) {
         const std::string name = "d" + std::to_string(axis);
         RecEdge d_e;
         NodeEdge dc_e;
         MatrixEdge m_e;
         g.add(mra::make_derivative<T, 3>(pimpl->domain(), fns, g.functiondata, g.K, axis, psi_rec, d_e, name));
-        g.add(mra::make_compress(fns, g.K, false, g.functiondata, d_e, dc_e, "compress_" + name));
-        g.add(mra::make_matrix_inner<T, 3>(fns, fns, g.K, dc_e, dc_e, m_e, "inner_" + name));
+        g.add(mra::make_compress(fns, g.K, false, g.functiondata, d_e, dc_e, "compress_" + name,
+                                 ttg::Void{}, ttg::Void{}, false, T{}, 0, T{}, compress_group));
+        g.add(mra::make_matrix_inner<T, 3>(fns, fns, g.K, dc_e, dc_e, m_e, "inner_" + name,
+                                           ttg::Void{}, ttg::Void{}, pimpl->inner_group));
         pimpl->add_matrix_sink(m_e, r, 0.5, "sink_" + name);
     }
     return Result{int(pimpl->results.size()) - 1};

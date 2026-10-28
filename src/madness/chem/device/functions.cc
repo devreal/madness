@@ -101,16 +101,11 @@ void device_transform(World& world, DeviceFunctions& v, const Tensor<double>& U,
 
 /// [a, b]: the functions of a followed by those of b, in a new vector; a and b are kept or consumed
 DeviceFunctions device_concat(World& world, DeviceFunctions& a, bool keep_a, DeviceFunctions& b, bool keep_b) {
-    MraGraph g;
-    const mra::size_type NA = a.size(), NB = b.size();
-    NodeEdge a_e, b_e, out_e;
+    DeviceGraph g(world);
     DeviceFunctions out;
-    g.add(fv(a).make_feed(g.control, a_e, keep_a, "feed_a"));
-    g.add(fv(b).make_feed(g.control, b_e, keep_b, "feed_b"));
-    g.add(mra::make_concat<double, 3>(make_mrattg_functionset(NA), make_mrattg_functionset(NB), g.K, a_e, b_e, out_e));
-    g.add(fv(out).make_store(out_e, NA + NB, "store"));
+    auto fa = g.feed(a, keep_a);
+    g.store(g.concat(fa, g.feed(b, keep_b)), out);
     g.execute();
-    check_device_tree(out, "device_concat");
     return out;
 }
 

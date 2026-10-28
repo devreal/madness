@@ -110,6 +110,8 @@ namespace madness {
         Functions transform(Functions in, const Tensor<double>& U, double tol);
         /// the same with U computed in the graph; M is the number of columns of U
         Functions transform(Functions in, Matrix U, std::size_t M, double tol);
+        /// [a, b]: the functions of a followed by those of b
+        Functions concat(Functions a, Functions b);
 
         /// <a_i|b_j>; a and b may be the same
         Result matrix_inner(Functions a, Functions b);

@@ -3229,15 +3229,17 @@ void SCF::solve_simple(World& world) {
                 // KAIN (cf. update_subspace) [ttg: concat + matrix_inner + transform + norm]
                 START_TIMER(world);
                 const long n = nmo;
-                // append the current pair [psi, -r] to the history
-                DeviceFunctions pair_d = device_concat(world, amo_d, true, rneg_d, false);
+                // append the current pair [psi, -r] to the history [ttg: concat(s) + matrix_inner, one graph]
                 tensorT M;   // <pair_i | hist_j>
-                if (nhist == 0) {
-                    M = device_matrix_inner(world, pair_d, pair_d);
-                    hist_d = std::move(pair_d);
-                } else {
-                    hist_d = device_concat(world, hist_d, false, pair_d, true);
-                    M = device_matrix_inner(world, pair_d, hist_d);
+                {
+                    DeviceGraph g(world);
+                    auto psi = g.feed(amo_d, true);
+                    auto pair = g.concat(psi, g.feed(rneg_d, false));
+                    auto hist = (nhist == 0) ? pair : g.concat(g.feed(hist_d, false), pair);
+                    auto r = g.matrix_inner(pair, hist);
+                    g.store(hist, hist_d);
+                    g.execute();
+                    M = g.get(r);
                 }
                 long m = ++nhist;
 
