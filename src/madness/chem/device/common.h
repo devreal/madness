@@ -216,6 +216,28 @@ inline void add_compress(std::vector<std::unique_ptr<ttg::TTBase>>& tts, const s
     }
 }
 
+/// Compress the non-standard nodes on `in` (e.g., a convolution result) onto `out` in a single
+/// bottom-up pass, truncated as in add_compress. Replaces make_reconstruct(accumulate_NS = true)
+/// followed by add_compress.
+template <typename FunctionSetT>
+inline void add_compress_from_ns(std::vector<std::unique_ptr<ttg::TTBase>>& tts, const std::shared_ptr<FunctionSetT>& fns,
+                                 mra::size_type K, const mra::FunctionData<double, 3>& functiondata,
+                                 ttg::Edge<mra::Key<3>, mra::FunctionsCompressedNode<double, 3>>& in,
+                                 ttg::Edge<mra::Key<3>, mra::FunctionsCompressedNode<double, 3>>& out,
+                                 double tol, const std::string& name) {
+    static const bool separate = std::getenv("MRA_TTG_SEPARATE_TRUNCATE") != nullptr;
+    const int mode = FunctionDefaults<3>::get_truncate_mode();
+    const double min_width = FunctionDefaults<3>::get_cell_min_width();
+    if (tol <= 0.0 || !separate) {
+        tts.push_back(mra::make_compress_from_ns(fns, K, functiondata, in, out, name, ttg::Void{}, ttg::Void{},
+                                                 /*enable_truncate=*/tol > 0.0, tol, mode, min_width));
+    } else {
+        ttg::Edge<mra::Key<3>, mra::FunctionsCompressedNode<double, 3>> compressed;
+        tts.push_back(mra::make_compress_from_ns(fns, K, functiondata, in, compressed, name));
+        tts.push_back(mra::make_truncate(fns, K, tol, mode, min_width, compressed, out, name + "-truncate"));
+    }
+}
+
 /// function set of N functions in a single batch
 inline auto make_mrattg_functionset(mra::size_type N) {
     auto pmap = mra::make_procmap<3>(N, 1 /* batch */);

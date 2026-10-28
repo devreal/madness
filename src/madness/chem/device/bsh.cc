@@ -81,33 +81,28 @@ vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
     /**
      * TODO: have the make* functions return their output edge so we don't have to define it up front.
      */
-    ttg::Edge<mra::Key<NDIM>, mra::FunctionsReconstructedNode<T, NDIM>> reconstruct_conv_result, compress_input;
-    ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>> conv_input, compress_conv_result,
-                                                                    convolution_result, recompress_result;
+    ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>> conv_input, convolution_result, recompress_result;
     ttg::Edge<mra::Key<NDIM>, void> load_control;
     std::vector<std::unique_ptr<ttg::TTBase>> tts; // crutch because we need to keep TTs alive
     auto start            = mra::make_start(gaussians, load_control);
     if (Vpsi.front().get_impl()->get_tree_state() == madness::TreeState::reconstructed) {
         // Reconstructed nodes: load and compress into nonstandard form
-        auto load = mra::vmra::make_vmra_load(Vpsi, load_control, compress_input, "load_vmra");
-        tts.push_back(std::move(load));
+        ttg::Edge<mra::Key<NDIM>, mra::FunctionsReconstructedNode<T, NDIM>> load_vmra;
+        tts.push_back(mra::vmra::make_vmra_load(Vpsi, load_control, load_vmra, "load_vmra"));
+        tts.push_back(mra::make_compress(gaussians, K, true, functiondata, load_vmra, conv_input, "compress"));
     } else if (Vpsi.front().get_impl()->get_tree_state() == madness::TreeState::compressed) {
-        // Compressed nodes: load, reconstruct, and compress into nonstandard form
+        // Compressed nodes: load and convert into nonstandard form in a single top-down pass
         ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>> load_vmra;
-        auto load = mra::vmra::make_vmra_load(Vpsi, load_control, load_vmra, "load_vmra");
-        auto reconstruct = mra::make_reconstruct(gaussians, K, false, functiondata, load_vmra, compress_input, "reconstruct");
-        tts.push_back(std::move(load));
-        tts.push_back(std::move(reconstruct));
+        tts.push_back(mra::vmra::make_vmra_load(Vpsi, load_control, load_vmra, "load_vmra"));
+        tts.push_back(mra::make_nonstandard(gaussians, K, functiondata, load_vmra, conv_input, "nonstandard"));
     } else {
         throw std::runtime_error("Vpsi must be in reconstructed or compressed form");
     }
-    auto compress         = mra::make_compress(gaussians, K, true, functiondata, compress_input, conv_input, "compress");
     auto convolve         = mra::make_convolution(gaussians, K, conv_input, convolution_result, op, precision, truncate_mode,
                                                     FunctionDefaults<NDIM>::get_cell_min_width(), "convolution");
-    auto reconstruct_conv = mra::make_reconstruct(gaussians, K, true, functiondata, convolution_result, reconstruct_conv_result, "reconstruct_convolution");
-    // truncation folded into the recompression (see add_compress)
-    add_compress(tts, gaussians, K, functiondata, reconstruct_conv_result, recompress_result, precision,
-                 "recompress_convolution");
+    // back to standard form in a single bottom-up pass, truncation folded in (see add_compress_from_ns)
+    add_compress_from_ns(tts, gaussians, K, functiondata, convolution_result, recompress_result, precision,
+                         "recompress_convolution");
 
     // residual r = psi - BSH(Vpsi) and its norms, on the device
     ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>> psi_compressed, residual_result;
@@ -130,8 +125,7 @@ vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
     auto store_tt         = mra::vmra::make_vmra_store(result, residual ? residual_result : recompress_result,
                                                        true /* add_leaves */);
 
-    execute_mra_ttg(start, mrattg_tt_list(tts, {compress.get(), convolve.get(), reconstruct_conv.get(),
-                                                store_tt.get()}));
+    execute_mra_ttg(start, mrattg_tt_list(tts, {convolve.get(), store_tt.get()}));
 
     scf_end_timer(world, residual ? "Apply BSH & residual" : "Apply BSH & truncate");
 
@@ -190,9 +184,7 @@ DeviceFunctions device_bsh_residual(World& world, DeviceFunctions& psi, DeviceFu
     std::vector<poperatorT> ops = SCF::make_bsh_operators(world, eps, param);
     mra::GaussianConvolutionOperator<T, 3> op(ops);
 
-    using RecEdge = ttg::Edge<mra::Key<3>, mra::FunctionsReconstructedNode<T, 3>>;
     NodeEdge psi_e, V_e, fpsi_e, Vp_e, conv_in_e, conv_e, trunc_e, r_e;
-    RecEdge rec_e, rec_conv_e;
     ttg::Edge<mra::Key<3>, mra::DenseTensor<T, 1>> norm_e;
     DeviceFunctions r;
 
@@ -201,13 +193,12 @@ DeviceFunctions device_bsh_residual(World& world, DeviceFunctions& psi, DeviceFu
     // Vpsi' = -2 Vpsi + 2 psi fockp
     g.add(mra::make_transform<T, 3>(fns, fns, g.K, device_matrix(fockp), psi_e, fpsi_e, "fock_psi"));
     g.add(mra::make_gaxpy(T(-2.0), T(2.0), fns, g.K, V_e, fpsi_e, Vp_e, "Vpsi_shift"));
-    // BSH apply: non-standard form for the convolution, compressed and truncated result
-    g.add(mra::make_reconstruct(fns, g.K, false, g.functiondata, Vp_e, rec_e, "reconstruct"));
-    g.add(mra::make_compress(fns, g.K, true, g.functiondata, rec_e, conv_in_e, "compress"));
+    // BSH apply: non-standard form for the convolution, compressed and truncated result,
+    // each conversion in a single pass
+    g.add(mra::make_nonstandard(fns, g.K, g.functiondata, Vp_e, conv_in_e, "nonstandard"));
     g.add(mra::make_convolution(fns, g.K, conv_in_e, conv_e, op, precision, truncate_mode, cell_min_width, "convolution"));
-    g.add(mra::make_reconstruct(fns, g.K, true, g.functiondata, conv_e, rec_conv_e, "reconstruct_convolution"));
-    // truncation folded into the recompression (see add_compress)
-    add_compress(g.tts, fns, g.K, g.functiondata, rec_conv_e, trunc_e, precision, "recompress_convolution");
+    // truncation folded into the recompression (see add_compress_from_ns)
+    add_compress_from_ns(g.tts, fns, g.K, g.functiondata, conv_e, trunc_e, precision, "recompress_convolution");
     // -r = new psi - psi, and its norms. Not psi - new psi: gaxpy forwards an operand with
     // scalar 1 unchanged where the other one is empty, which would hand a kept psi node to
     // the store of r (see mra::FunctionVector)
