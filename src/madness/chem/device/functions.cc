@@ -34,7 +34,39 @@
 
 #include "common.h"
 
+#if defined(MRA_ENABLE_CUDA)
+#include <nvtx3/nvToolsExt.h>
+#endif
+
 namespace madness {
+
+#if defined(MRA_ENABLE_CUDA)
+static nvtxDomainHandle_t scf_nvtx_domain() {
+    static nvtxDomainHandle_t domain = nvtxDomainCreateA("MRA-TTG SCF");
+    return domain;
+}
+#endif
+
+DeviceRange::DeviceRange(const char* name) {
+#if defined(MRA_ENABLE_CUDA)
+    nvtxEventAttributes_t attr = {};
+    attr.version = NVTX_VERSION;
+    attr.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+    attr.colorType = NVTX_COLOR_ARGB;
+    attr.color = 0xff76b900;
+    attr.messageType = NVTX_MESSAGE_TYPE_ASCII;
+    attr.message.ascii = name;
+    nvtxDomainRangePushEx(scf_nvtx_domain(), &attr);
+#else
+    (void)name;
+#endif
+}
+
+DeviceRange::~DeviceRange() {
+#if defined(MRA_ENABLE_CUDA)
+    nvtxDomainRangePop(scf_nvtx_domain());
+#endif
+}
 
 DeviceFunctions::DeviceFunctions() : pimpl(std::make_unique<Impl>()) {}
 DeviceFunctions::~DeviceFunctions() = default;

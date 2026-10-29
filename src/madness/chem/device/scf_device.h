@@ -138,6 +138,17 @@ namespace madness {
     void scf_start_timer(World& world);
     void scf_end_timer(World& world, const char* msg);
 
+    /// Marks a device-offloaded region of the SCF for the profiler: an NVTX range in the
+    /// "MRA-TTG SCF" domain from construction to destruction (CUDA builds; a no-op otherwise).
+    /// Must be destroyed on the thread that created it.
+    class DeviceRange {
+    public:
+        explicit DeviceRange(const char* name);
+        ~DeviceRange();
+        DeviceRange(const DeviceRange&) = delete;
+        DeviceRange& operator=(const DeviceRange&) = delete;
+    };
+
     /// copy MADNESS functions into a device vector
     DeviceFunctions device_upload(World& world, const vecfuncT& f);
 

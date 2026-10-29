@@ -1954,7 +1954,10 @@ vecfuncT SCF::compute_residual(World& world, tensorT& occ, tensorT& fock,
     std::vector<double> rnorm;
 #ifdef HAVE_MRA_TTG
     // BSH apply, r = psi - new_psi and the residual norms in one MRA-TTG graph
-    r = apply_bsh_mrattg(world, Vpsi, eps, param, &psi, &rnorm);
+    {
+        DeviceRange range("BSH apply (device)");
+        r = apply_bsh_mrattg(world, Vpsi, eps, param, &psi, &rnorm);
+    }
     START_TIMER(world);
 #else  // HAVE_MRA_TTG
     vecfuncT new_psi;
@@ -2930,8 +2933,10 @@ void SCF::solve_simple(World& world) {
         if (resident) {
             START_TIMER(world);
             if (iter == 0) {
+                DeviceRange range("Orbitals to device");
                 amo_d = device_upload(world, amo);
             } else if (!device_only || validate_mra_ttg) {
+                DeviceRange range("Orbitals to host");
                 amo = device_download(world, amo_d, amo.front());
                 bmo = amo;
             }
@@ -2944,7 +2949,10 @@ void SCF::solve_simple(World& world) {
         functionT arho;
 #ifdef HAVE_MRA_TTG
         if (device_only) {
-            arho = device_density(world, amo_d, aocc, amo.front());
+            {
+                DeviceRange range("Make density (device)");
+                arho = device_density(world, amo_d, aocc, amo.front());
+            }
             if (validate_mra_ttg) {
                 functionT ref = make_density(world, aocc, amo);
                 const double d = (ref - arho).norm2(), n = ref.norm2();
@@ -3027,6 +3035,7 @@ void SCF::solve_simple(World& world) {
             const long nmo = amo_d.size();
             tensorT pe, kin;
             {
+                DeviceRange range("V*psi, PE, KE (device)");
                 DeviceGraph g(world);
                 auto psi = g.feed(amo_d, true);
                 auto vpsi = g.apply_local_potential(vloc, psi, FunctionDefaults<3>::get_thresh());
@@ -3084,6 +3093,7 @@ void SCF::solve_simple(World& world) {
         if (resident) {
             if (!Vpsi.empty()) {
                 START_TIMER(world);
+                DeviceRange range("Vpsi to device");
                 Vpsi_d = device_upload(world, Vpsi);
                 Vpsi.clear();
                 END_TIMER(world, "Vpsi to device");
@@ -3099,6 +3109,7 @@ void SCF::solve_simple(World& world) {
             const tensorT fock_h = copy(fock);
             tensorT evals(n);
             {
+                DeviceRange range("Diagonalization (device)");
                 DeviceGraph g(world);
                 auto psi = g.feed(amo_d, false);
                 auto vpsi = g.feed(Vpsi_d, false);
@@ -3186,6 +3197,7 @@ void SCF::solve_simple(World& world) {
                 }
 #ifdef HAVE_MRA_TTG
                 if (resident) {   // the diagonalized orbitals
+                    DeviceRange range("Orbitals to host");
                     amo = device_download(world, amo_d, amo.front());
                     bmo = amo;
                 }
@@ -3215,7 +3227,11 @@ void SCF::solve_simple(World& world) {
                 fockp(i, i) -= eps(i);
             }
             std::vector<double> rnorm;
-            DeviceFunctions rneg_d = device_bsh_residual(world, amo_d, Vpsi_d, fockp, eps, param, rnorm);
+            DeviceFunctions rneg_d;
+            {
+                DeviceRange range("BSH residual (device)");
+                rneg_d = device_bsh_residual(world, amo_d, Vpsi_d, fockp, eps, param, rnorm);
+            }
             double rms, maxval;
             vector_stats(rnorm, rms, maxval);
             bsh_residual = maxval;
@@ -3232,6 +3248,7 @@ void SCF::solve_simple(World& world) {
                 // append the current pair [psi, -r] to the history [ttg: concat(s) + matrix_inner, one graph]
                 tensorT M;   // <pair_i | hist_j>
                 {
+                    DeviceRange range("KAIN append history (device)");
                     DeviceGraph g(world);
                     auto psi = g.feed(amo_d, true);
                     auto pair = g.concat(psi, g.feed(rneg_d, false));
@@ -3278,7 +3295,10 @@ void SCF::solve_simple(World& world) {
                     if (world.rank() == 0 and (param.print_level() > 3)) print("Restarting KAIN due to subspace malfunction");
                     tensorT keep_last(2 * m * n, 2 * n);
                     for (long i = 0; i < 2 * n; ++i) keep_last(2 * (m - 1) * n + i, i) = 1.0;
-                    device_transform(world, hist_d, keep_last, 0.0);
+                    {
+                        DeviceRange range("KAIN restart (device)");
+                        device_transform(world, hist_d, keep_last, 0.0);
+                    }
                     const double q = kain_Q(m - 1, m - 1);
                     nhist = m = 1;
                     kain_Q = tensorT(1, 1);
@@ -3298,14 +3318,21 @@ void SCF::solve_simple(World& world) {
                     }
                 }
                 for (long i = 0; i < n; ++i) D(2 * (m - 1) * n + i, i) -= 1.0;
-                std::vector<double> dnorm = device_transform_norms(world, hist_d, D);
+                std::vector<double> dnorm;
+                {
+                    DeviceRange range("KAIN step norms (device)");
+                    dnorm = device_transform_norms(world, hist_d, D);
+                }
                 tensorT Unew(2 * m * n, n);
                 for (long i = 0; i < n; ++i) {
                     const double step = (dnorm[i] > param.maxrotn()) ? param.maxrotn() / dnorm[i] : 1.0;
                     Unew(_, i) = step * D(_, i);
                     Unew(2 * (m - 1) * n + i, i) += 1.0;
                 }
-                amo_d = device_transformed(world, hist_d, Unew, 0.0);
+                {
+                    DeviceRange range("KAIN update orbitals (device)");
+                    amo_d = device_transformed(world, hist_d, Unew, 0.0);
+                }
                 double drms, dmax;
                 vector_stats(dnorm, drms, dmax);
                 if (world.rank() == 0 and (param.print_level() > 2))
@@ -3315,7 +3342,10 @@ void SCF::solve_simple(World& world) {
                 if (nhist == param.maxsub()) {
                     tensorT drop_first(2 * m * n, 2 * (m - 1) * n);
                     for (long i = 0; i < 2 * (m - 1) * n; ++i) drop_first(2 * n + i, i) = 1.0;
-                    device_transform(world, hist_d, drop_first, 0.0);
+                    {
+                        DeviceRange range("KAIN drop oldest (device)");
+                        device_transform(world, hist_d, drop_first, 0.0);
+                    }
                     --nhist;
                     kain_Q = copy(kain_Q(Slice(1, -1), Slice(1, -1)));
                 }
@@ -3328,13 +3358,17 @@ void SCF::solve_simple(World& world) {
                 if (rnorm[i] > param.maxrotn()) c[i] = -param.maxrotn() / rnorm[i];
             if (world.rank() == 0 and (param.print_level() > 2))
                 print("Norm of vector changes alpha : rms", rms, "   max", maxval);
-            device_update(world, amo_d, rneg_d, c);
+            {
+                DeviceRange range("Update orbitals (device)");
+                device_update(world, amo_d, rneg_d, c);
+            }
             END_TIMER(world, "Update orbitals (device)");
             }
 
             // [ttg: matrix_inner + transform + truncate + norm]
             START_TIMER(world);
             const double trantol = vtol / std::min(30.0, double(nmo));
+            DeviceRange orth_range("Orthonormalize (device)");   // until the continue below
             device_normalize(world, amo_d);
             double maxq;
             do {
