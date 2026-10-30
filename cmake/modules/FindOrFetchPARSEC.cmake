@@ -11,6 +11,13 @@ if (NOT TARGET PaRSEC::parsec)
   set(SUPPORT_FORTRAN OFF CACHE BOOL "Disable Fortran support in PaRSEC")
   set(CMAKE_CROSSCOMPILING OFF)
   set(CMAKE_SYSTEM_PROCESSOR ${CMAKE_HOST_SYSTEM_PROCESSOR})
+  # MRA-TTG needs more parameters per task than PaRSEC's default of 20 (it checks the
+  # PaRSEC it uses, see its FindOrFetchTTG.cmake), and PaRSEC is configured here, before
+  # MRA-TTG: raise the default to 32, the most PaRSEC supports.
+  if (ENABLE_MRA_TTG AND (NOT DEFINED PARSEC_MAX_PARAM_COUNT OR PARSEC_MAX_PARAM_COUNT LESS 32))
+    message(STATUS "MRA-TTG enabled, setting PARSEC_MAX_PARAM_COUNT=32")
+    set(PARSEC_MAX_PARAM_COUNT 32 CACHE STRING "Number of parameters for tasks" FORCE)
+  endif ()
 
   FetchContent_Declare(
           PARSEC
