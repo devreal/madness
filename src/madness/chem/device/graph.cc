@@ -162,11 +162,12 @@ DeviceGraph::Functions DeviceGraph::apply_local_potential(const functionT& v, Fu
     pimpl->keepalive.push_back({copy(v)});   // the loader needs it reconstructed
     vecfuncT& vv = pimpl->keepalive.back();
     vv[0].reconstruct();
-    RecEdge v_e, prod_e;
-    NodeEdge comp_e;
-    g.add(mra::vmra::make_vmra_load(vv, g.control, v_e, "load_v"));
-    g.add(mra::make_multiply_broadcast<T, 3>(pimpl->domain(), make_mrattg_functionset(1), fns, g.functiondata, g.K,
-                                             v_e, pimpl->reconstructed(psi), prod_e, "V*psi"));
+    RecEdge prod_e;
+    NodeEdge v_e, comp_e;
+    load_compressed_mrattg(vv, make_mrattg_functionset(1), g.K, g.functiondata, g.control, v_e, g.tts, "v");
+    // multiplied in compressed form: psi is not reconstructed for this
+    g.add(mra::make_multiply_compressed<T, 3>(pimpl->domain(), make_mrattg_functionset(1), fns, g.functiondata, g.K,
+                                              v_e, pimpl->get(psi).compressed, prod_e, "V*psi"));
     add_compress(g.tts, fns, g.K, g.functiondata, prod_e, comp_e, tol, "compress_Vpsi");
     return pimpl->add_functions(comp_e, N);
 }
@@ -232,15 +233,16 @@ DeviceGraph::Result DeviceGraph::kinetic_matrix(Functions psi) {
     const mra::size_type N = psi.size;
     auto fns = make_mrattg_functionset(N);
     Impl::Res& r = pimpl->add_result(long(N), long(N));
-    RecEdge& psi_rec = pimpl->reconstructed(psi);
     mra::BatchGroup compress_group;   // the three axes batch together
+    // the three derivatives in one descent over the compressed orbitals, which are not reconstructed
+    std::array<RecEdge, 3> d_e;
+    g.add(mra::make_gradient_compressed<T, 3>(pimpl->domain(), fns, g.functiondata, g.K, pimpl->get(psi).compressed,
+                                              d_e, "gradient"));
     for (mra::Dimension axis = 0; axis < 3; ++axis) {
         const std::string name = "d" + std::to_string(axis);
-        RecEdge d_e;
         NodeEdge dc_e;
         MatrixEdge m_e;
-        g.add(mra::make_derivative<T, 3>(pimpl->domain(), fns, g.functiondata, g.K, axis, psi_rec, d_e, name));
-        g.add(mra::make_compress(fns, g.K, false, g.functiondata, d_e, dc_e, "compress_" + name,
+        g.add(mra::make_compress(fns, g.K, false, g.functiondata, d_e[axis], dc_e, "compress_" + name,
                                  ttg::Void{}, ttg::Void{}, false, T{}, 0, T{}, compress_group));
         g.add(mra::make_matrix_inner<T, 3>(fns, fns, g.K, dc_e, dc_e, m_e, "inner_" + name,
                                            ttg::Void{}, ttg::Void{}, pimpl->inner_group));

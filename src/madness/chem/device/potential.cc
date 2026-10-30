@@ -57,10 +57,10 @@ functionT device_density(World& world, DeviceFunctions& psi, const tensorT& occ,
     Tensor<double> w(static_cast<long>(N), 1L);
     for (long i = 0; i < long(N); ++i) w(i, 0) = occ[i];
     NodeEdge psi_e, sq_c_e, rho_e;
-    RecEdge psi_rec_e, sq_e;
+    RecEdge sq_e;
     g.add(fv(psi).make_feed(g.control, psi_e, true, "feed_psi"));
-    g.add(mra::make_reconstruct(fns, g.K, false, g.functiondata, psi_e, psi_rec_e, "reconstruct_psi"));
-    g.add(mra::make_square<T, 3>(db, fns, g.functiondata, g.K, psi_rec_e, sq_e, "psi^2"));
+    // squared straight from the compressed orbitals, without reconstructing them
+    g.add(mra::make_square_compressed<T, 3>(db, fns, g.functiondata, g.K, psi_e, sq_e, "psi^2"));
     g.add(mra::make_compress(fns, g.K, false, g.functiondata, sq_e, sq_c_e, "compress_psi^2"));
     g.add(mra::make_transform<T, 3>(fns, make_mrattg_functionset(1), g.K, device_matrix(w), sq_c_e, rho_e, "sum_occ"));
     vecfuncT rho(1);
