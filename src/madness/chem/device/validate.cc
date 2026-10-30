@@ -159,4 +159,33 @@ void validate_mrattg_linalg(World& world, const vecfuncT& f, const vecfuncT& g) 
     }
 }
 
+void validate_device_functions(World& world, const vecfuncT& ref, DeviceFunctions& d, const functionT& like,
+                               const std::string& what) {
+    MADNESS_CHECK_THROW(ref.size() == d.size(), "validate_device_functions: sizes differ");
+    vecfuncT dev = device_download(world, d, like);
+    compress(world, ref);
+    std::vector<double> dnorm = norm2s(world, sub(world, ref, dev));
+    std::vector<double> rnorm = norm2s(world, ref);
+    if (world.rank() == 0)
+        print("mra-ttg", what, ": max ||mra-ttg - madness||", *std::max_element(dnorm.begin(), dnorm.end()),
+              " max ||madness||", *std::max_element(rnorm.begin(), rnorm.end()));
+}
+
+void validate_device_values(World& world, const Tensor<double>& ref, const Tensor<double>& d,
+                            const std::string& what) {
+    if (world.rank() == 0)
+        print("mra-ttg", what, ": max |mra-ttg - madness|", (ref - d).absmax(), " max |madness|", ref.absmax());
+}
+
+void validate_device_values(World& world, const std::vector<double>& ref, const std::vector<double>& d,
+                            const std::string& what) {
+    MADNESS_CHECK_THROW(ref.size() == d.size(), "validate_device_values: sizes differ");
+    double diff = 0.0, max = 0.0;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+        diff = std::max(diff, std::abs(ref[i] - d[i]));
+        max = std::max(max, std::abs(ref[i]));
+    }
+    if (world.rank() == 0) print("mra-ttg", what, ": max |mra-ttg - madness|", diff, " max |madness|", max);
+}
+
 } // namespace madness

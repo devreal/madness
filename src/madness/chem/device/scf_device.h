@@ -200,6 +200,16 @@ namespace madness {
     /// compare the MRA-TTG inner products and transform against MADNESS on f and g (same size)
     void validate_mrattg_linalg(World& world, const vecfuncT& f, const vecfuncT& g);
 
+    /// print max ||ref_i - d_i|| and max ||ref_i||, d downloaded with the process map of `like`; d is kept
+    void validate_device_functions(World& world, const vecfuncT& ref, DeviceFunctions& d, const functionT& like,
+                                   const std::string& what);
+
+    /// print max |ref - d| and max |ref|
+    void validate_device_values(World& world, const Tensor<double>& ref, const Tensor<double>& d,
+                                const std::string& what);
+    void validate_device_values(World& world, const std::vector<double>& ref, const std::vector<double>& d,
+                                const std::string& what);
+
 } // namespace madness
 
 #endif // MADNESS_CHEM_DEVICE_SCF_DEVICE_H__INCLUDED

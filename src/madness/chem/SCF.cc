@@ -3108,6 +3108,14 @@ void SCF::solve_simple(World& world) {
             const long nalpha = param.nalpha();
             const tensorT fock_h = copy(fock);
             tensorT evals(n);
+            // validation: the inputs, and the overlap and U the graph decided on
+            vecfuncT psi_ref, Vpsi_ref, hist_ref;
+            tensorT overlap_dev(n, n), U_dev(n, n);
+            if (validate_mra_ttg) {
+                psi_ref = device_download(world, amo_d, amo.front());
+                Vpsi_ref = device_download(world, Vpsi_d, amo.front());
+                if (kain && nhist > 0) hist_ref = device_download(world, hist_d, amo.front());
+            }
             {
                 DeviceRange range("Diagonalization (device)");
                 DeviceGraph g(world);
@@ -3122,6 +3130,10 @@ void SCF::solve_simple(World& world) {
                     for (long i = 0; i < nalpha; ++i)   // no occupied-virtual mixing
                         for (long j = nalpha; j < u.dim(0); ++j) u(j, i) = 0.0;
                     evals = e;
+                    if (validate_mra_ttg) {
+                        overlap_dev = copy(overlap);
+                        U_dev = copy(u);
+                    }
                     return u;
                 });
                 g.store(g.transform(vpsi, U, n, vtol), Vpsi_d);
@@ -3144,6 +3156,32 @@ void SCF::solve_simple(World& world) {
                 g.execute();
             }
             world.gop.sum(evals.ptr(), evals.size());   // only the process owning the root computed them
+            if (validate_mra_ttg) {
+                world.gop.sum(overlap_dev.ptr(), overlap_dev.size());
+                world.gop.sum(U_dev.ptr(), U_dev.size());
+                const tensorT overlap_ref = matrix_inner(world, psi_ref, psi_ref);
+                validate_device_values(world, overlap_ref, overlap_dev, "overlap");
+                tensorT u, e;
+                sygv(fock_h, overlap_ref, 1, u, e);
+                Localizer::undo_reordering(u, aocc, e);
+                validate_device_values(world, e, evals, "eigenvalues");
+                // the rotations with the U the device used: U is only defined up to signs and
+                // rotations among degenerate eigenvectors
+                vecfuncT Vpsi_rot = transform(world, Vpsi_ref, U_dev, 0.0, true);
+                truncate(world, Vpsi_rot, vtol);
+                validate_device_functions(world, Vpsi_rot, Vpsi_d, amo.front(), "rotated Vpsi");
+                vecfuncT psi_rot = transform(world, psi_ref, U_dev, 0.0, true);
+                truncate(world, psi_rot, thresh);
+                normalize(world, psi_rot);
+                validate_device_functions(world, psi_rot, amo_d, amo.front(), "rotated psi");
+                if (kain && nhist > 0) {
+                    const long nb = 2 * nhist;
+                    tensorT Ublock(nb * n, nb * n);
+                    for (long k = 0; k < nb; ++k) Ublock(Slice(k * n, k * n + n - 1), Slice(k * n, k * n + n - 1)) = U_dev;
+                    validate_device_functions(world, transform(world, hist_ref, Ublock, 0.0, true), hist_d,
+                                              amo.front(), "rotated KAIN history");
+                }
+            }
             aeps = evals;
             fock = 0.0;
             for (long i = 0; i < n; ++i) fock(i, i) = evals(i);
@@ -3228,9 +3266,29 @@ void SCF::solve_simple(World& world) {
             }
             std::vector<double> rnorm;
             DeviceFunctions rneg_d;
+            // the inputs of the reference, taken before Vpsi_d is consumed
+            vecfuncT psi_ref, Vpsi_ref;
+            if (validate_mra_ttg) {
+                psi_ref = device_download(world, amo_d, amo.front());
+                Vpsi_ref = device_download(world, Vpsi_d, amo.front());
+            }
             {
                 DeviceRange range("BSH residual (device)");
                 rneg_d = device_bsh_residual(world, amo_d, Vpsi_d, fockp, eps, param, rnorm);
+            }
+            if (validate_mra_ttg) {
+                // rneg = G(-2 (Vpsi - psi fockp)) - psi, as in device_bsh_residual
+                vecfuncT fpsi = transform(world, psi_ref, fockp, 0.0, true);
+                gaxpy(world, -2.0, Vpsi_ref, 2.0, fpsi);
+                fpsi.clear();
+                std::vector<poperatorT> ops = make_bsh_operators(world, eps, param);
+                vecfuncT ref = apply(world, ops, Vpsi_ref);
+                madness::compress(world, ref);
+                truncate(world, ref);
+                gaxpy(world, 1.0, ref, -1.0, psi_ref);
+                validate_device_functions(world, ref, rneg_d, amo.front(), "BSH residual");
+                const std::vector<double> mnorm = norm2s(world, ref);
+                validate_device_values(world, mnorm, rnorm, "BSH residual norms");
             }
             double rms, maxval;
             vector_stats(rnorm, rms, maxval);
@@ -3247,6 +3305,13 @@ void SCF::solve_simple(World& world) {
                 const long n = nmo;
                 // append the current pair [psi, -r] to the history [ttg: concat(s) + matrix_inner, one graph]
                 tensorT M;   // <pair_i | hist_j>
+                // validation: the history as MADNESS functions, followed through every change below
+                vecfuncT hist_ref;
+                if (validate_mra_ttg) {
+                    if (nhist > 0) hist_ref = device_download(world, hist_d, amo.front());
+                    for (auto& f : device_download(world, amo_d, amo.front())) hist_ref.push_back(f);
+                    for (auto& f : device_download(world, rneg_d, amo.front())) hist_ref.push_back(f);
+                }
                 {
                     DeviceRange range("KAIN append history (device)");
                     DeviceGraph g(world);
@@ -3257,6 +3322,11 @@ void SCF::solve_simple(World& world) {
                     g.store(hist, hist_d);
                     g.execute();
                     M = g.get(r);
+                }
+                if (validate_mra_ttg) {
+                    validate_device_functions(world, hist_ref, hist_d, amo.front(), "KAIN history");
+                    const vecfuncT pair_ref(hist_ref.end() - 2 * n, hist_ref.end());
+                    validate_device_values(world, matrix_inner(world, pair_ref, hist_ref), M, "KAIN <pair|history>");
                 }
                 long m = ++nhist;
 
@@ -3299,6 +3369,10 @@ void SCF::solve_simple(World& world) {
                         DeviceRange range("KAIN restart (device)");
                         device_transform(world, hist_d, keep_last, 0.0);
                     }
+                    if (validate_mra_ttg) {
+                        hist_ref = transform(world, hist_ref, keep_last, 0.0, true);
+                        validate_device_functions(world, hist_ref, hist_d, amo.front(), "KAIN history (restart)");
+                    }
                     const double q = kain_Q(m - 1, m - 1);
                     nhist = m = 1;
                     kain_Q = tensorT(1, 1);
@@ -3323,6 +3397,10 @@ void SCF::solve_simple(World& world) {
                     DeviceRange range("KAIN step norms (device)");
                     dnorm = device_transform_norms(world, hist_d, D);
                 }
+                if (validate_mra_ttg) {
+                    const std::vector<double> ref = norm2s(world, transform(world, hist_ref, D, 0.0, true));
+                    validate_device_values(world, ref, dnorm, "KAIN step norms");
+                }
                 tensorT Unew(2 * m * n, n);
                 for (long i = 0; i < n; ++i) {
                     const double step = (dnorm[i] > param.maxrotn()) ? param.maxrotn() / dnorm[i] : 1.0;
@@ -3333,6 +3411,9 @@ void SCF::solve_simple(World& world) {
                     DeviceRange range("KAIN update orbitals (device)");
                     amo_d = device_transformed(world, hist_d, Unew, 0.0);
                 }
+                if (validate_mra_ttg)
+                    validate_device_functions(world, transform(world, hist_ref, Unew, 0.0, true), amo_d, amo.front(),
+                                              "KAIN orbitals");
                 double drms, dmax;
                 vector_stats(dnorm, drms, dmax);
                 if (world.rank() == 0 and (param.print_level() > 2))
@@ -3346,6 +3427,9 @@ void SCF::solve_simple(World& world) {
                         DeviceRange range("KAIN drop oldest (device)");
                         device_transform(world, hist_d, drop_first, 0.0);
                     }
+                    if (validate_mra_ttg)
+                        validate_device_functions(world, transform(world, hist_ref, drop_first, 0.0, true), hist_d,
+                                                  amo.front(), "KAIN history (drop oldest)");
                     --nhist;
                     kain_Q = copy(kain_Q(Slice(1, -1), Slice(1, -1)));
                 }
@@ -3358,10 +3442,18 @@ void SCF::solve_simple(World& world) {
                 if (rnorm[i] > param.maxrotn()) c[i] = -param.maxrotn() / rnorm[i];
             if (world.rank() == 0 and (param.print_level() > 2))
                 print("Norm of vector changes alpha : rms", rms, "   max", maxval);
+            vecfuncT update_ref;   // a - c r, from rneg before it is consumed
+            if (validate_mra_ttg) {
+                update_ref = device_download(world, amo_d, amo.front());
+                vecfuncT rneg = device_download(world, rneg_d, amo.front());
+                for (long i = 0; i < nmo; ++i) update_ref[i].gaxpy(1.0, rneg[i], -c[i], false);
+                world.gop.fence();
+            }
             {
                 DeviceRange range("Update orbitals (device)");
                 device_update(world, amo_d, rneg_d, c);
             }
+            if (validate_mra_ttg) validate_device_functions(world, update_ref, amo_d, amo.front(), "update orbitals");
             END_TIMER(world, "Update orbitals (device)");
             }
 
@@ -3369,10 +3461,24 @@ void SCF::solve_simple(World& world) {
             START_TIMER(world);
             const double trantol = vtol / std::min(30.0, double(nmo));
             DeviceRange orth_range("Orthonormalize (device)");   // until the continue below
-            device_normalize(world, amo_d);
+            // validation: each step against MADNESS from the device's input to it
+            auto normalize_validated = [&](const char* what) {
+                vecfuncT ref;
+                if (validate_mra_ttg) ref = device_download(world, amo_d, amo.front());
+                device_normalize(world, amo_d);
+                if (validate_mra_ttg) {
+                    normalize(world, ref);
+                    validate_device_functions(world, ref, amo_d, amo.front(), what);
+                }
+            };
+            normalize_validated("normalize");
             double maxq;
             do {
-                tensorT Q = Q2(device_matrix_inner(world, amo_d, amo_d));
+                vecfuncT orth_ref;
+                if (validate_mra_ttg) orth_ref = device_download(world, amo_d, amo.front());
+                const tensorT S = device_matrix_inner(world, amo_d, amo_d);
+                if (validate_mra_ttg) validate_device_values(world, matrix_inner(world, orth_ref, orth_ref), S, "orthonormalize overlap");
+                tensorT Q = Q2(S);
                 maxq = 0.0;
                 for (int j = 1; j < Q.dim(0); j++)
                     for (int i = 0; i < j; i++) maxq = std::max(std::abs(Q(j, i)), maxq);
@@ -3384,9 +3490,14 @@ void SCF::solve_simple(World& world) {
                     }
                 }
                 device_transform(world, amo_d, Q, FunctionDefaults<3>::get_thresh());
+                if (validate_mra_ttg) {
+                    orth_ref = transform(world, orth_ref, Q, 0.0, true);
+                    truncate(world, orth_ref, FunctionDefaults<3>::get_thresh());
+                    validate_device_functions(world, orth_ref, amo_d, amo.front(), "orthonormalize transform");
+                }
                 if (world.rank() == 0 and (param.print_level() > 3)) print("ORTHOG2a: maxq trantol", maxq, trantol);
             } while (maxq > 0.01);
-            device_normalize(world, amo_d);
+            normalize_validated("final normalize");
             END_TIMER(world, "Orthonormalize (device)");
             continue;
         }
