@@ -23,9 +23,12 @@ if (HAVE_MRA_TTG)
   set(MADCHEM_SCF_DEVICE_SOURCES
       device/functions.cc
       device/bsh.cc
+      device/bsh_resident.cc
       device/potential.cc
       device/validate.cc
       device/graph.cc
+      device/graph_ops.cc
+      device/graph_reduce.cc
     )
   if (TARGET mra::cuda OR TARGET mra::hip)
     mra_generate_gpu_wrappers(
@@ -35,6 +38,16 @@ if (HAVE_MRA_TTG)
       )
     if (TARGET mra::cuda)
       set(MADCHEM_SCF_DEVICE_SOURCES ${_scf_device_cu})
+      # Full host debug info on these TTG-heavy TUs more than doubles their host compile
+      # (graph.cu: 625 s vs 253 s) and makes each object 300-850 MB, almost all .debug_str.
+      # nvcc appends its own -g after any -Xcompiler flags, so the -g must be swapped out of
+      # the config flags themselves; this is directory-scoped and only touches CUDA TUs here.
+      option(MADNESS_CUDA_HOST_DEBUG_LINE_TABLES_ONLY
+             "RelWithDebInfo: limit host debug info of the CUDA TUs in src/madness/chem to line tables (-g1)" ON)
+      if (MADNESS_CUDA_HOST_DEBUG_LINE_TABLES_ONLY)
+        string(REGEX REPLACE "(^| )-g( |$)" "\\1-Xcompiler=-g1\\2"
+               CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO}")
+      endif()
     elseif (TARGET mra::hip)
       set(MADCHEM_SCF_DEVICE_SOURCES ${_scf_device_hip})
     endif()

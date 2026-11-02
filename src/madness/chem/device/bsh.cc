@@ -30,7 +30,8 @@
 */
 
 /// \file device/bsh.cc
-/// \brief BSH apply on MRA-TTG: SCF::apply_bsh_mrattg and the device-resident BSH residual.
+/// \brief BSH apply on MRA-TTG: SCF::apply_bsh_mrattg. The device-resident BSH residual is in
+/// bsh_resident.cc; each builds a full convolution pipeline, too much for one translation unit.
 
 #include "common.h"
 #include "compare.h"
@@ -166,54 +167,6 @@ vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
     Vpsi.clear();
 
     return result;
-}
-
-/// BSH residual on the device: with fockp the Fock matrix minus eps on the diagonal,
-///   rneg = G(-2 (Vpsi - psi fockp)) - psi,   rnorm_i = ||rneg_i||
-/// i.e., the negative of the residual r = psi - new psi. psi is kept, Vpsi is consumed.
-DeviceFunctions device_bsh_residual(World& world, DeviceFunctions& psi, DeviceFunctions& Vpsi,
-                                           const Tensor<double>& fockp, const tensorT& eps,
-                                           const CalculationParameters& param, std::vector<double>& rnorm) {
-    using T = double;
-    MraGraph g;
-    const mra::size_type N = psi.size();
-    const T precision = FunctionDefaults<3>::get_thresh();
-    const int truncate_mode = FunctionDefaults<3>::get_truncate_mode();
-    const T cell_min_width = FunctionDefaults<3>::get_cell_min_width();
-    auto fns = make_mrattg_functionset(N);
-    std::vector<poperatorT> ops = SCF::make_bsh_operators(world, eps, param);
-    mra::GaussianConvolutionOperator<T, 3> op(ops);
-
-    NodeEdge psi_e, V_e, fpsi_e, Vp_e, conv_in_e, conv_e, trunc_e, r_e;
-    ttg::Edge<mra::Key<3>, mra::DenseTensor<T, 1>> norm_e;
-    DeviceFunctions r;
-
-    g.add(fv(psi).make_feed(g.control, psi_e, true, "feed_psi"));
-    g.add(fv(Vpsi).make_feed(g.control, V_e, false, "feed_Vpsi"));
-    // Vpsi' = -2 Vpsi + 2 psi fockp
-    g.add(mra::make_transform<T, 3>(fns, fns, g.K, device_matrix(fockp), psi_e, fpsi_e, "fock_psi"));
-    g.add(mra::make_gaxpy(T(-2.0), T(2.0), fns, g.K, V_e, fpsi_e, Vp_e, "Vpsi_shift"));
-    // BSH apply: non-standard form for the convolution, compressed and truncated result,
-    // each conversion in a single pass
-    g.add(mra::make_nonstandard(fns, g.K, g.functiondata, Vp_e, conv_in_e, "nonstandard"));
-    g.add(mra::make_convolution(fns, g.K, conv_in_e, conv_e, op, precision, truncate_mode, cell_min_width, "convolution"));
-    // truncation folded into the recompression (see add_compress_from_ns)
-    add_compress_from_ns(g.tts, fns, g.K, g.functiondata, conv_e, trunc_e, precision, "recompress_convolution");
-    // -r = new psi - psi, and its norms. Not psi - new psi: gaxpy forwards an operand with
-    // scalar 1 unchanged where the other one is empty, which would hand a kept psi node to
-    // the store of r (see mra::FunctionVector)
-    g.add(mra::make_gaxpy(T(1.0), T(-1.0), fns, g.K, trunc_e, psi_e, r_e, "residual"));
-    g.add(mra::make_norm(fns, g.K, r_e, norm_e, "residual_norm"));
-    rnorm.assign(N, 0.0);
-    g.add(ttg::make_tt([&rnorm, N](const mra::Key<3>& key, const mra::DenseTensor<T, 1>& n) {
-        const T* data = n.current_view().data();
-        for (mra::size_type i = 0; i < N; ++i) rnorm[i] = data[i];
-    }, ttg::edges(norm_e), ttg::edges(), "residual_norm_sink"));
-    g.add(fv(r).make_store(r_e, N, "store_r"));
-    g.execute();
-    check_device_tree(r, "device_bsh_residual");
-    world.gop.sum(rnorm.data(), rnorm.size());
-    return r;
 }
 
 } // namespace madness
