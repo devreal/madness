@@ -167,10 +167,7 @@ inline void check_device_tree(DeviceFunctions& d, const char* what) {
 
 /// Feed MADNESS functions into an MRA-TTG graph as compressed nodes on `out`.
 
-/// They are loaded reconstructed (compressed trees are reconstructed first) and
-/// compressed in the graph: a compressed MADNESS tree loaded as-is can carry
-/// interior nodes without coefficients, which the loader marks as leafs while
-/// still sending their children.
+/// Compressed trees are loaded as-is; reconstructed trees are compressed in the graph.
 template <typename T, mra::Dimension NDIM, typename FunctionSetT>
 void load_compressed_mrattg(const std::vector<Function<T, (std::size_t)NDIM>>& f,
                             const std::shared_ptr<FunctionSetT>& fns, mra::size_type K,
@@ -179,18 +176,16 @@ void load_compressed_mrattg(const std::vector<Function<T, (std::size_t)NDIM>>& f
                             ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>>& out,
                             std::vector<std::unique_ptr<ttg::TTBase>>& tts,
                             const std::string& name) {
-    ttg::Edge<mra::Key<NDIM>, mra::FunctionsReconstructedNode<T, NDIM>> reconstructed;
     const auto state = f.front().get_impl()->get_tree_state();
     if (state == madness::TreeState::reconstructed) {
+        ttg::Edge<mra::Key<NDIM>, mra::FunctionsReconstructedNode<T, NDIM>> reconstructed;
         tts.push_back(mra::vmra::make_vmra_load(f, control, reconstructed, "load_" + name));
+        tts.push_back(mra::make_compress(fns, K, false, functiondata, reconstructed, out, "compress_" + name));
     } else if (state == madness::TreeState::compressed) {
-        ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>> loaded;
-        tts.push_back(mra::vmra::make_vmra_load(f, control, loaded, "load_" + name));
-        tts.push_back(mra::make_reconstruct(fns, K, false, functiondata, loaded, reconstructed, "reconstruct_" + name));
+        tts.push_back(mra::vmra::make_vmra_load(f, control, out, "load_" + name));
     } else {
         throw std::runtime_error(name + " must be in reconstructed or compressed form");
     }
-    tts.push_back(mra::make_compress(fns, K, false, functiondata, reconstructed, out, "compress_" + name));
 }
 
 /// Compress the reconstructed nodes on `in` onto `out`, truncated with tol unless tol == 0.

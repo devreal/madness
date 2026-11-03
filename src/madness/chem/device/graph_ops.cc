@@ -41,9 +41,8 @@ DeviceGraph::Functions DeviceGraph::apply_local_potential(const functionT& v, Fu
     auto& g = pimpl->g;
     const mra::size_type N = psi.size;
     auto fns = make_mrattg_functionset(N);
-    pimpl->keepalive.push_back({copy(v)});   // the loader needs it reconstructed
-    vecfuncT& vv = pimpl->keepalive.back();
-    vv[0].reconstruct();
+    pimpl->keepalive.push_back({v});   // the loader refers to it until the graph has run
+    const vecfuncT& vv = pimpl->keepalive.back();
     RecEdge prod_e;
     NodeEdge v_e, comp_e;
     load_compressed_mrattg(vv, make_mrattg_functionset(1), g.K, g.functiondata, g.control, v_e, g.tts, "v");

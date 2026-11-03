@@ -41,6 +41,7 @@
 #ifndef MADNESS_CHEM_DEVICE_GRAPH_IMPL_H__INCLUDED
 #define MADNESS_CHEM_DEVICE_GRAPH_IMPL_H__INCLUDED
 
+#include <deque>
 #include <mutex>
 #include <optional>
 #include "common.h"
@@ -75,7 +76,7 @@ struct DeviceGraph::Impl {
     std::vector<std::unique_ptr<Res>> results;
 
     std::vector<MatrixEdge> matrices;
-    std::vector<vecfuncT> keepalive;   // host functions loaded into the graph
+    std::deque<vecfuncT> keepalive;   // host functions loaded into the graph; a deque, as loaders refer to its elements
     std::vector<DeviceFunctions*> stored;
     std::vector<DeviceFunctions*> kept;
 
