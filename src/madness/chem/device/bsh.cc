@@ -58,7 +58,10 @@ vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
     const mra::size_type K = FunctionDefaults<3>::get_k();
     const T precision = FunctionDefaults<3>::get_thresh();
     mra::FunctionData<T, NDIM> functiondata(K);
-    mra::GaussianConvolutionOperator<T, NDIM> op(ops);
+    // the matrices of the 1D terms the previous BSH operators generated are reused
+    DeviceOperatorCache& cache = device_operator_cache();
+    mra::GaussianConvolutionOperator<T, NDIM> op(ops, cache.bsh_tables);
+    cache.bsh_tables = op.term_tables();
     auto pmap = mra::make_procmap<NDIM>(N, 1 /* batch */);
     auto dmap = mra::make_devicemap<NDIM>(pmap);
     auto gaussians = mra::make_functionset<mra::Gaussian<T, NDIM>>(pmap.batch_manager());

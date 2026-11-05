@@ -192,6 +192,8 @@ public:
         void add_gradient(const Tensor<double> &grad);
     };
 
+/// MRA-TTG convolution operators kept across iterations (device/scf_device.h)
+struct DeviceOperatorCache;
 
 class SCF {
 public:
@@ -238,6 +240,9 @@ public:
     /// orbital energies for alpha and beta orbitals
     tensorT aeps, beps;
     poperatorT coulop;
+    /// MRA-TTG counterparts of coulop and of the BSH operators' 1D terms, made on first use
+    /// (device_operator_cache()) and reset with the protocol, like coulop
+    std::shared_ptr<DeviceOperatorCache> device_operators;
     std::vector<std::shared_ptr<real_derivative_3d> > gradop;
     double vtol;
     double current_energy;
@@ -343,6 +348,7 @@ public:
         FunctionDefaults<NDIM>::set_project_randomize(false);
         FunctionDefaults<NDIM>::set_cubic_cell(-param.L(), param.L());
         GaussianConvolution1DCache<double>::map.clear();
+        device_operators.reset();
         double safety = 0.1;
         vtol = FunctionDefaults<NDIM>::get_thresh() * safety;
         coulop = poperatorT(CoulombOperatorPtr(world, param.lo(), 0.001*thresh));
@@ -482,6 +488,8 @@ public:
                               const CalculationParameters& param,
                               const vecfuncT* psi = nullptr,
                               std::vector<double>* rnorm = nullptr);
+    /// the MRA-TTG operators of the current protocol (device_operators), made on first use
+    DeviceOperatorCache& device_operator_cache();
 #endif // HAVE_MRA_TTG
 
     tensorT make_fock_matrix(World& world, const vecfuncT& psi,

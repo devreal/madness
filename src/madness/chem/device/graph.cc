@@ -85,6 +85,7 @@ void DeviceGraph::execute() {
     for (auto& r : pimpl->results) {   // only the process owning the root received them
         pimpl->world.gop.sum(r->value.ptr(), r->value.size());
     }
+    for (std::size_t i = 0; i < pimpl->host_targets.size(); ++i) *pimpl->host_targets[i] = pimpl->host_out[i][0];
 }
 
 Tensor<double> DeviceGraph::get(Result r) const {

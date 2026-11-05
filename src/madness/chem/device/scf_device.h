@@ -103,9 +103,20 @@ namespace madness {
         Functions feed(DeviceFunctions& v, bool keep);
         /// persist f into v, which must be empty (or fed without keep in this graph)
         void store(Functions f, DeviceFunctions& v);
+        /// one host function, compressed in the graph unless it is already
+        Functions load(const functionT& f);
+        /// persist one function f into the host function out, compressed, with the process map
+        /// of `like`; out is set by execute()
+        void store(Functions f, functionT& out, const functionT& like);
 
         /// v psi_i for one (host) function v, truncated with tol unless tol == 0
         Functions apply_local_potential(const functionT& v, Functions psi, double tol);
+        /// op(in_i) for one convolution operator (e.g., Coulomb), compressed and truncated with
+        /// tol unless tol == 0. With a cache, the MRA-TTG operator made for op is kept there and
+        /// reused, with every level of 1D matrices it generated, while op stays the same.
+        Functions convolution(const poperatorT& op, Functions in, double tol, DeviceOperatorCache* cache = nullptr);
+        /// a x_i + b y_i, truncated with tol unless tol == 0
+        Functions gaxpy(double a, Functions x, double b, Functions y, double tol);
         /// out_j = sum_i in_i U(i,j), truncated with tol unless tol == 0
         Functions transform(Functions in, const Tensor<double>& U, double tol);
         /// the same with U computed in the graph; M is the number of columns of U
@@ -182,10 +193,12 @@ namespace madness {
     /// a_i <- a_i - c_i r_i; consumes r
     void device_update(World& world, DeviceFunctions& a, DeviceFunctions& r, const std::vector<double>& c);
 
-    /// rneg = G(-2 (Vpsi - psi fockp)) - psi and its norms; psi is kept, Vpsi is consumed
+    /// rneg = G(-2 (Vpsi - psi fockp)) - psi and its norms; psi is kept, Vpsi is consumed. With a
+    /// cache, the BSH operators reuse the 1D matrices of earlier ones (see DeviceOperatorCache).
     DeviceFunctions device_bsh_residual(World& world, DeviceFunctions& psi, DeviceFunctions& Vpsi,
                                         const Tensor<double>& fockp, const tensorT& eps,
-                                        const CalculationParameters& param, std::vector<double>& rnorm);
+                                        const CalculationParameters& param, std::vector<double>& rnorm,
+                                        DeviceOperatorCache* cache = nullptr);
 
     /// Vpsi_i = v psi_i for one (host) function v, truncated with tol unless tol == 0; psi is kept
     void device_apply_local_potential(World& world, const functionT& v, DeviceFunctions& psi,

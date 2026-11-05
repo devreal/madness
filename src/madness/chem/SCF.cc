@@ -2982,9 +2982,6 @@ void SCF::solve_simple(World& world) {
         }
         arho_old = arho;
 
-        START_TIMER(world);
-        functionT rho = spinfac * arho;   // [ttg: gaxpy(scalar) + truncate]
-        rho.truncate();
         real_function_3d vnuc;            // static per protocol: load once, keep resident
         if (molecule.parameters.psp_calc()) {
             vnuc = gthpseudopotential->vlocalpot();
@@ -2994,17 +2991,57 @@ void SCF::solve_simple(World& world) {
             vnuc = potentialmanager->vnuclear();
             vnuc = vnuc + gthpseudopotential->vlocalpot();
         }
-        double enuclear = inner(rho, vnuc);   // [ttg: inner(f,g) -> scalar -- missing]
-        END_TIMER(world, "Nuclear energy");
-
-        START_TIMER(world);
-        functionT vcoul = apply(*coulop, rho);   // [ttg: convolution with N=1 Coulomb op]
-        END_TIMER(world, "Coulomb");
-        double ecoulomb = 0.5 * inner(rho, vcoul);
-        rho.clear(false);
-        functionT vlocal = vcoul + vnuc;          // [ttg: gaxpy]
-        vcoul.clear(false);
-        vlocal.truncate();
+        // rho = 2 arho, the nuclear and Coulomb energies, and the local potential vnuc + J[rho]
+        double enuclear = 0.0, ecoulomb = 0.0;
+        functionT vlocal;
+        auto host_coulomb = [&](functionT& vloc, double& enuc, double& ecoul) {
+            functionT rho = spinfac * arho;
+            rho.truncate();
+            enuc = inner(rho, vnuc);
+            functionT vcoul = apply(*coulop, rho);
+            ecoul = 0.5 * inner(rho, vcoul);
+            rho.clear(false);
+            vloc = vcoul + vnuc;
+            vcoul.clear(false);
+            vloc.truncate();
+        };
+#ifdef HAVE_MRA_TTG
+        if (resident) {
+            // [ttg: transform(scale) + truncate + convolution + gaxpy + truncate + matrix_inner x2, one graph]
+            START_TIMER(world);
+            {
+                DeviceRange range("Coulomb potential (device)");
+                const double thresh = FunctionDefaults<3>::get_thresh();
+                DeviceGraph g(world);
+                tensorT scale(1, 1);
+                scale(0, 0) = spinfac;
+                auto rho = g.transform(g.load(arho), scale, thresh);
+                auto vn = g.load(vnuc);
+                auto enuc_r = g.matrix_inner(rho, vn);
+                auto vcoul = g.convolution(coulop, rho, 0.0, &device_operator_cache());
+                auto ecoul_r = g.matrix_inner(rho, vcoul);
+                g.store(g.gaxpy(1.0, vcoul, 1.0, vn, thresh), vlocal, arho);
+                g.execute();
+                enuclear = g.get(enuc_r)(0, 0);
+                ecoulomb = 0.5 * g.get(ecoul_r)(0, 0);
+            }
+            END_TIMER(world, "Coulomb potential (device)");
+            if (validate_mra_ttg) {
+                functionT vloc_ref;
+                double enuc_ref, ecoul_ref;
+                host_coulomb(vloc_ref, enuc_ref, ecoul_ref);
+                const double d = (vloc_ref - vlocal).norm2(), n = vloc_ref.norm2();
+                if (world.rank() == 0) print("mra-ttg local potential : ||mra-ttg - madness||", d, " ||madness||", n);
+                validate_device_values(world, std::vector<double>{enuc_ref, ecoul_ref},
+                                       std::vector<double>{enuclear, ecoulomb}, "nuclear and Coulomb energies");
+            }
+        } else
+#endif // HAVE_MRA_TTG
+        {
+            START_TIMER(world);
+            host_coulomb(vlocal, enuclear, ecoulomb);
+            END_TIMER(world, "Coulomb potential");
+        }
 
         // [ttg: XC potential (pointwise unaryop on rho) -- missing;
         //  HF exchange (pair products, N^2 convolutions, reduction) -- missing]
@@ -3274,7 +3311,8 @@ void SCF::solve_simple(World& world) {
             }
             {
                 DeviceRange range("BSH residual (device)");
-                rneg_d = device_bsh_residual(world, amo_d, Vpsi_d, fockp, eps, param, rnorm);
+                rneg_d = device_bsh_residual(world, amo_d, Vpsi_d, fockp, eps, param, rnorm,
+                                             &device_operator_cache());
             }
             if (validate_mra_ttg) {
                 // rneg = G(-2 (Vpsi - psi fockp)) - psi, as in device_bsh_residual

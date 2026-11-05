@@ -36,16 +36,44 @@
 
 namespace madness {
 
+DeviceGraph::Functions DeviceGraph::load(const functionT& f) {
+    auto& g = pimpl->g;
+    pimpl->keepalive.push_back({f});   // the loader refers to it until the graph has run
+    NodeEdge e;
+    load_compressed_mrattg(pimpl->keepalive.back(), make_mrattg_functionset(1), g.K, g.functiondata, g.control, e,
+                           g.tts, "host");
+    return pimpl->add_functions(e, 1);
+}
+
+void DeviceGraph::store(Functions f, functionT& out, const functionT& like) {
+    MADNESS_CHECK_THROW(f.size == 1, "DeviceGraph::store: one function can be stored to the host");
+    pimpl->host_out.emplace_back(1);
+    vecfuncT& v = pimpl->host_out.back();
+    v[0].set_impl(like, false);
+    pimpl->g.add(mra::vmra::make_vmra_store(v, pimpl->get(f).compressed, true /* add_leaves */));
+    pimpl->host_targets.push_back(&out);
+}
+
+DeviceGraph::Functions DeviceGraph::gaxpy(double a, Functions x, double b, Functions y, double tol) {
+    MADNESS_CHECK_THROW(x.size == y.size, "DeviceGraph::gaxpy: x and y must have the same size");
+    auto& g = pimpl->g;
+    auto fns = make_mrattg_functionset(x.size);
+    NodeEdge out_e, trunc_e;
+    g.add(mra::make_gaxpy(a, b, fns, g.K, pimpl->get(x).compressed, pimpl->get(y).compressed, out_e, "gaxpy"));
+    if (tol <= 0.0) return pimpl->add_functions(out_e, x.size);
+    g.add(mra::make_truncate(fns, g.K, tol, FunctionDefaults<3>::get_truncate_mode(),
+                             FunctionDefaults<3>::get_cell_min_width(), out_e, trunc_e, "gaxpy-truncate"));
+    return pimpl->add_functions(trunc_e, x.size);
+}
+
 DeviceGraph::Functions DeviceGraph::apply_local_potential(const functionT& v, Functions psi, double tol) {
     using T = double;
     auto& g = pimpl->g;
     const mra::size_type N = psi.size;
     auto fns = make_mrattg_functionset(N);
-    pimpl->keepalive.push_back({v});   // the loader refers to it until the graph has run
-    const vecfuncT& vv = pimpl->keepalive.back();
     RecEdge prod_e;
-    NodeEdge v_e, comp_e;
-    load_compressed_mrattg(vv, make_mrattg_functionset(1), g.K, g.functiondata, g.control, v_e, g.tts, "v");
+    NodeEdge comp_e;
+    const NodeEdge v_e = pimpl->get(load(v)).compressed;
     // multiplied in compressed form: psi is not reconstructed for this
     g.add(mra::make_multiply_compressed<T, 3>(pimpl->domain(), make_mrattg_functionset(1), fns, g.functiondata, g.K,
                                               v_e, pimpl->get(psi).compressed, prod_e, "V*psi"));

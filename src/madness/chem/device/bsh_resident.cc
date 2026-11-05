@@ -41,7 +41,8 @@ namespace madness {
 /// i.e., the negative of the residual r = psi - new psi. psi is kept, Vpsi is consumed.
 DeviceFunctions device_bsh_residual(World& world, DeviceFunctions& psi, DeviceFunctions& Vpsi,
                                            const Tensor<double>& fockp, const tensorT& eps,
-                                           const CalculationParameters& param, std::vector<double>& rnorm) {
+                                           const CalculationParameters& param, std::vector<double>& rnorm,
+                                           DeviceOperatorCache* cache) {
     using T = double;
     MraGraph g;
     const mra::size_type N = psi.size();
@@ -50,7 +51,9 @@ DeviceFunctions device_bsh_residual(World& world, DeviceFunctions& psi, DeviceFu
     const T cell_min_width = FunctionDefaults<3>::get_cell_min_width();
     auto fns = make_mrattg_functionset(N);
     std::vector<poperatorT> ops = SCF::make_bsh_operators(world, eps, param);
-    mra::GaussianConvolutionOperator<T, 3> op(ops);
+    // the matrices of the 1D terms the previous BSH operators generated are reused
+    mra::GaussianConvolutionOperator<T, 3> op(ops, cache ? cache->bsh_tables : nullptr);
+    if (cache) cache->bsh_tables = op.term_tables();
 
     NodeEdge psi_e, V_e, fpsi_e, Vp_e, conv_in_e, conv_e, trunc_e, r_e;
     ttg::Edge<mra::Key<3>, mra::DenseTensor<T, 1>> norm_e;

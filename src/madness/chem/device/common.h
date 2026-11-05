@@ -62,6 +62,23 @@ struct DeviceFunctions::Impl {
     mra::FunctionVector<double, 3> v;
 };
 
+/// MRA-TTG convolution operators kept across graphs, for one protocol (SCF::device_operators).
+///
+/// The device generates the 1D operator matrices of every distinct Gaussian term once per
+/// level and keeps them in the operator's term tables (mra::GaussianTermTables). The Coulomb
+/// operator does not change within a protocol, so its MRA-TTG operator is kept whole. The BSH
+/// operators change every iteration, but only in their coefficients: their terms lie on a
+/// lattice independent of the orbital energy, so the next iteration's operators find all their
+/// terms in the tables of the previous ones and reuse the matrices generated so far.
+struct DeviceOperatorCache {
+    using ConvOp = mra::GaussianConvolutionOperator<double, 3>;
+    /// the last operator of DeviceGraph::convolution (Coulomb), and its MRA-TTG operator
+    poperatorT op;
+    std::shared_ptr<ConvOp> device_op;
+    /// the term tables of the last BSH operators
+    std::shared_ptr<mra::GaussianTermTables<double, 3>> bsh_tables;
+};
+
 /// the MRA-TTG function vector behind a DeviceFunctions handle
 inline mra::FunctionVector<double, 3>& fv(DeviceFunctions& d) { return d.impl().v; }
 

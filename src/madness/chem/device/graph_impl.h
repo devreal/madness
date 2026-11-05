@@ -77,6 +77,10 @@ struct DeviceGraph::Impl {
 
     std::vector<MatrixEdge> matrices;
     std::deque<vecfuncT> keepalive;   // host functions loaded into the graph; a deque, as loaders refer to its elements
+    /// host functions stored from the graph, and where execute() hands them; a deque, as stores refer to its elements
+    std::deque<vecfuncT> host_out;
+    std::vector<functionT*> host_targets;
+    std::vector<std::shared_ptr<void>> operators;   // operators (and function sets) tasks refer to
     std::vector<DeviceFunctions*> stored;
     std::vector<DeviceFunctions*> kept;
 
