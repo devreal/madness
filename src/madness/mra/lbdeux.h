@@ -34,13 +34,18 @@
 #define MADNESS_MRA_IBDEUX_H__INCLUDED
 
 #include <madness/madness_config.h>
+#include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <queue>
 #include <string>
+#include <utility>
+#include <vector>
 #include <madness/world/atomicint.h>
 #include <madness/world/worlddc.h>
 
@@ -92,6 +97,89 @@ namespace madness {
 
         void print() const {
             madness::print("LBDeuxPmap");
+        }
+    };
+
+
+    /// Position of boxes along the Morton (Z-order) space-filling curve.
+
+    /// The curve is resolved at the finest level whose translations fit 64 bits interleaved
+    /// (max_level = 63/NDIM); a deeper box takes the position of its ancestor at that level.
+    /// A box covers the contiguous range [code(key), code(key) + extent(key)) of the curve,
+    /// and so does its subtree.
+    template <std::size_t NDIM>
+    struct SFCCode {
+        static constexpr Level max_level = 63/NDIM;
+
+        static uint64_t code(const Key<NDIM>& key) {
+            const Level n = key.level();
+            std::array<uint64_t, NDIM> t;   // translations at max_level
+            for (std::size_t d=0; d<NDIM; ++d) {
+                const uint64_t l = key.translation()[d];
+                t[d] = (n <= max_level) ? (l << (max_level - n)) : (l >> (n - max_level));
+            }
+            uint64_t c = 0;
+            for (int b=max_level-1; b>=0; --b) {
+                for (std::size_t d=0; d<NDIM; ++d) c = (c << 1) | ((t[d] >> b) & 1);
+            }
+            return c;
+        }
+
+        static uint64_t extent(const Key<NDIM>& key) {
+            const Level n = key.level();
+            return (n >= max_level) ? 1 : (uint64_t(1) << (NDIM*(max_level - n)));
+        }
+    };
+
+
+    /// A process map that cuts the space-filling curve (SFCCode) into contiguous pieces.
+
+    /// Made by LoadBalanceDeux::load_balance_sfc. It has two levels: the piece of each process
+    /// is cut further into one piece per device of the process, for runtimes that distribute
+    /// the work of a process across several devices (device()). A key belongs to the piece
+    /// holding the start of its box, so a box spanning pieces goes with its first descendant.
+    /// Lookup is a binary search over the pieces (a few per device).
+    template <std::size_t NDIM>
+    class SFCPmap : public WorldDCPmapInterface< Key<NDIM> > {
+        std::vector<uint64_t> start;    ///< first code of each piece, ascending, start[0] == 0
+        std::vector<int> part;          ///< the piece's part, process*ndevice + device
+        int ndevice;
+        std::vector<double> part_cost;  ///< cost assigned to each part by the load balancer
+
+        int find(const Key<NDIM>& key) const {
+            const uint64_t c = SFCCode<NDIM>::code(key);
+            return part[std::upper_bound(start.begin(), start.end(), c) - start.begin() - 1];
+        }
+
+    public:
+        /// pieces: (first code, part) in ascending order of codes, the first at code 0
+        SFCPmap(const std::vector<std::pair<uint64_t,int>>& pieces, int ndevice,
+                std::vector<double> part_cost = {})
+            : ndevice(ndevice), part_cost(std::move(part_cost)) {
+            MADNESS_CHECK_THROW(ndevice > 0, "SFCPmap: need at least one device per process");
+            MADNESS_CHECK_THROW(!pieces.empty() && pieces.front().first == 0, "SFCPmap: the first piece must start at 0");
+            for (const auto& [c, p] : pieces) {
+                MADNESS_CHECK_THROW(start.empty() || c > start.back(), "SFCPmap: pieces must ascend");
+                start.push_back(c);
+                part.push_back(p);
+            }
+        }
+
+        ProcessID owner(const Key<NDIM>& key) const override { return find(key)/ndevice; }
+
+        /// the device of the owner that key belongs to, in [0, num_devices())
+        int device(const Key<NDIM>& key) const { return find(key)%ndevice; }
+
+        int num_devices() const { return ndevice; }
+
+        /// number of contiguous pieces of the curve
+        std::size_t num_pieces() const { return start.size(); }
+
+        /// cost assigned to each part (process*num_devices() + device) by the load balancer
+        const std::vector<double>& costs() const { return part_cost; }
+
+        void print() const override {
+            madness::print("SFCPmap:", start.size(), "pieces,", ndevice, "devices per process");
         }
     };
 
@@ -295,6 +383,18 @@ namespace madness {
             const_cast<Function<T,NDIM>&>(f).unaryop_node(add_op<T,costT>(this,costfn), fence);
         }
 
+        /// Accumulates the cost of one node, from any process (non-blocking)
+
+        /// For costs from other sources than a Function. As in a Function, a node that has
+        /// children must have all of them added (by some source), possibly with zero cost.
+        /// Collective with load_balance: fence before it.
+        void add_cost(const keyT& key, double cost, bool has_children) {
+            if (tree.is_local(key))
+                tree.send(key, &nodeT::add, cost, has_children);
+            else
+                tree.task(key, &nodeT::add, cost, has_children);
+        }
+
         /// Printing for the curious
         void print_tree(const keyT& key = keyT(0)) {
             Future<iteratorT> futit = tree.find(key);
@@ -386,15 +486,12 @@ namespace madness {
             }
         };
 
-        /// Actually does the partitioning of the tree
-        std::shared_ptr< WorldDCPmapInterface<keyT> > load_balance(double fac = 1.0, bool printstuff=false) {
-            world.gop.fence();
-            // Compute full tree of costs
-            double avg = sum()/(world.size()*fac);
-            //if (world.rank() == 0) print_tree();
-            world.gop.fence();
+        /// Splits the summed tree into subtrees costing at most about avg
 
-            // Create partitioning
+        /// Returns, on process 0, the root of each subtree with its cost: that of the root's
+        /// subtree without the subtrees split off below it. Every node of the tree belongs to
+        /// the subtree of its nearest listed ancestor (or its own), and the root is listed.
+        std::vector< std::pair<keyT,double> > partition_subtrees(double avg) {
             keyT key0(0);
             if (world.rank() == tree.owner(key0)) {
                 tree.send(key0, &nodeT::partition, tree, key0, avg*1.1);
@@ -411,6 +508,126 @@ namespace madness {
             }
             results = world.gop.concat0(results, 128*1024*1024);
             world.gop.fence();
+            return results;
+        }
+
+        /// Cuts the subtrees, ordered along the space-filling curve, into nproc*ndevice parts
+
+        /// The cut is by cost: first into one contiguous part per process, then each of those
+        /// into one per device. A subtree goes to the part its cost midpoint falls into.
+        /// Returns the pieces of the curve, (first code, part) ascending from code 0, and the
+        /// cost of each part.
+        static std::pair<std::vector<std::pair<uint64_t,int>>, std::vector<double>>
+        sfc_cut(const std::vector< std::pair<keyT,double> >& subtrees, int nproc, int ndevice) {
+            struct Piece { uint64_t begin, end; Level n; double cost; int part; };
+            std::vector<Piece> p;
+            p.reserve(subtrees.size());
+            for (const auto& [key, cost] : subtrees) {
+                const uint64_t b = SFCCode<NDIM>::code(key);
+                p.push_back({b, b + SFCCode<NDIM>::extent(key), key.level(), cost, 0});
+            }
+            // along the curve, a subtree before the subtrees split off below it
+            std::sort(p.begin(), p.end(), [](const Piece& a, const Piece& b) {
+                return a.begin < b.begin || (a.begin == b.begin && a.n < b.n);
+            });
+
+            // the slot of [0, n) that the cost midpoint falls into
+            auto slot = [](double mid, double width, int n) {
+                return (width > 0.0) ? std::min(n-1, int(mid/width)) : 0;
+            };
+            double total = 0.0;
+            for (const auto& x : p) total += x.cost;
+            std::vector<int> proc(p.size());
+            double prefix = 0.0;
+            for (std::size_t i=0; i<p.size(); ++i) {
+                proc[i] = slot(prefix + 0.5*p[i].cost, total/nproc, nproc);
+                prefix += p[i].cost;
+            }
+            // the subtrees of a process are contiguous: cut them across its devices
+            std::vector<double> part_cost(nproc*ndevice, 0.0);
+            for (std::size_t i0=0; i0<p.size(); ) {
+                std::size_t i1 = i0;
+                double share = 0.0;
+                while (i1 < p.size() && proc[i1] == proc[i0]) share += p[i1++].cost;
+                double local = 0.0;
+                for (std::size_t i=i0; i<i1; ++i) {
+                    p[i].part = proc[i]*ndevice + slot(local + 0.5*p[i].cost, share/ndevice, ndevice);
+                    local += p[i].cost;
+                    part_cost[p[i].part] += p[i].cost;
+                }
+                i0 = i1;
+            }
+
+            // Flatten the nested ranges of the subtrees into pieces: a subtree's range minus the
+            // ranges of the subtrees below it reverts to the part of the enclosing subtree.
+            std::vector<std::pair<uint64_t,int>> bounds;
+            std::vector<std::pair<uint64_t,int>> open;   // (end, part) of the enclosing subtrees
+            auto close = [&](uint64_t pos) {
+                while (!open.empty() && open.back().first <= pos) {
+                    const uint64_t end = open.back().first;
+                    open.pop_back();
+                    if (!open.empty()) bounds.emplace_back(end, open.back().second);
+                }
+            };
+            for (const auto& x : p) {
+                close(x.begin);
+                bounds.emplace_back(x.begin, x.part);
+                open.emplace_back(x.end, x.part);
+            }
+            close(std::numeric_limits<uint64_t>::max());
+
+            // of bounds at the same code the last holds; merge neighbors of the same part
+            std::vector<std::pair<uint64_t,int>> pieces;
+            for (const auto& b : bounds) {
+                if (!pieces.empty() && pieces.back().first == b.first) pieces.back().second = b.second;
+                else pieces.push_back(b);
+            }
+            std::vector<std::pair<uint64_t,int>> merged;
+            for (const auto& b : pieces) {
+                if (merged.empty() || merged.back().second != b.second) merged.push_back(b);
+            }
+            if (merged.empty()) merged.emplace_back(0, 0);
+            merged.front().first = 0;   // the root starts the curve; guard against an absent root
+            return {merged, part_cost};
+        }
+
+        /// Partitions the tree into contiguous pieces of the space-filling curve, two levels deep
+
+        /// Each process gets about an equal share of the cost, cut further into about equal
+        /// shares for its ndevice devices (SFCPmap::device). As in load_balance, the tree is
+        /// first split into subtrees of at most total/(nproc*ndevice*fac); fac > 1 makes them
+        /// finer, so the cuts can balance better. Collective; the tree is consumed.
+        std::shared_ptr< SFCPmap<NDIM> > load_balance_sfc(int ndevice = 1, double fac = 1.0, bool printstuff=false) {
+            MADNESS_CHECK_THROW(ndevice > 0, "load_balance_sfc: need at least one device per process");
+            world.gop.fence();
+            const int nproc = world.size();
+            const double avg = sum()/(nproc*ndevice*fac);
+            world.gop.fence();
+            std::vector< std::pair<keyT,double> > subtrees = partition_subtrees(avg);
+
+            std::pair<std::vector<std::pair<uint64_t,int>>, std::vector<double>> cut;
+            if (world.rank() == 0) {
+                cut = sfc_cut(subtrees, nproc, ndevice);
+                if (printstuff) {
+                    print("load_balance_sfc:", subtrees.size(), "subtrees,", cut.first.size(), "pieces");
+                    for (int i=0; i<nproc*ndevice; ++i) print("  process", i/ndevice, "device", i%ndevice, "cost", cut.second[i]);
+                }
+            }
+            world.gop.broadcast_serializable(cut, 0);
+            world.gop.fence();
+            return std::make_shared< SFCPmap<NDIM> >(cut.first, ndevice, std::move(cut.second));
+        }
+
+        /// Actually does the partitioning of the tree
+        std::shared_ptr< WorldDCPmapInterface<keyT> > load_balance(double fac = 1.0, bool printstuff=false) {
+            world.gop.fence();
+            // Compute full tree of costs
+            double avg = sum()/(world.size()*fac);
+            //if (world.rank() == 0) print_tree();
+            world.gop.fence();
+
+            // Create partitioning and collect entire vector onto node0
+            std::vector< std::pair<keyT,double> > results = partition_subtrees(avg);
 
             std::vector< std::pair<keyT,ProcessID> > map;
 
