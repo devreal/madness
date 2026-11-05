@@ -58,11 +58,11 @@ functionT device_density(World& world, DeviceFunctions& psi, const tensorT& occ,
     for (long i = 0; i < long(N); ++i) w(i, 0) = occ[i];
     NodeEdge psi_e, sq_c_e, rho_e;
     RecEdge sq_e;
-    g.add(fv(psi).make_feed(g.control, psi_e, true, "feed_psi"));
+    g.add(fv(psi).make_feed(g.control, psi_e, true, "feed_psi", device_procmap(), device_devicemap()));
     // squared straight from the compressed orbitals, without reconstructing them
-    g.add(mra::make_square_compressed<T, 3>(db, fns, g.functiondata, g.K, psi_e, sq_e, "psi^2"));
-    g.add(mra::make_compress(fns, g.K, false, g.functiondata, sq_e, sq_c_e, "compress_psi^2"));
-    g.add(mra::make_transform<T, 3>(fns, make_mrattg_functionset(1), g.K, device_matrix(w), sq_c_e, rho_e, "sum_occ"));
+    g.add(mra::make_square_compressed<T, 3>(db, fns, g.functiondata, g.K, psi_e, sq_e, "psi^2", device_procmap(), device_devicemap()));
+    g.add(mra::make_compress(fns, g.K, false, g.functiondata, sq_e, sq_c_e, "compress_psi^2", device_procmap(), device_devicemap()));
+    g.add(mra::make_transform<T, 3>(fns, make_mrattg_functionset(1), g.K, device_matrix(w), sq_c_e, rho_e, "sum_occ", device_procmap(), device_devicemap()));
     vecfuncT rho(1);
     rho[0].set_impl(like, false);
     g.add(mra::vmra::make_vmra_store(rho, rho_e, true /* add_leaves */));

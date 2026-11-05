@@ -63,7 +63,6 @@ vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
     mra::GaussianConvolutionOperator<T, NDIM> op(ops, cache.bsh_tables);
     cache.bsh_tables = op.term_tables();
     auto pmap = mra::make_procmap<NDIM>(N, 1 /* batch */);
-    auto dmap = mra::make_devicemap<NDIM>(pmap);
     auto gaussians = mra::make_functionset<mra::Gaussian<T, NDIM>>(pmap.batch_manager());
 
     /* create the result function vector (new psi, or the residual); share impl for process-map ownership */
@@ -93,17 +92,20 @@ vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
         // Reconstructed nodes: load and compress into nonstandard form
         ttg::Edge<mra::Key<NDIM>, mra::FunctionsReconstructedNode<T, NDIM>> load_vmra;
         tts.push_back(mra::vmra::make_vmra_load(Vpsi, load_control, load_vmra, "load_vmra"));
-        tts.push_back(mra::make_compress(gaussians, K, true, functiondata, load_vmra, conv_input, "compress"));
+        tts.push_back(mra::make_compress(gaussians, K, true, functiondata, load_vmra, conv_input, "compress",
+                                                   device_procmap(), device_devicemap()));
     } else if (Vpsi.front().get_impl()->get_tree_state() == madness::TreeState::compressed) {
         // Compressed nodes: load and convert into nonstandard form in a single top-down pass
         ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>> load_vmra;
         tts.push_back(mra::vmra::make_vmra_load(Vpsi, load_control, load_vmra, "load_vmra"));
-        tts.push_back(mra::make_nonstandard(gaussians, K, functiondata, load_vmra, conv_input, "nonstandard"));
+        tts.push_back(mra::make_nonstandard(gaussians, K, functiondata, load_vmra, conv_input, "nonstandard",
+                                                      device_procmap(), device_devicemap()));
     } else {
         throw std::runtime_error("Vpsi must be in reconstructed or compressed form");
     }
     auto convolve         = mra::make_convolution(gaussians, K, conv_input, convolution_result, op, precision, truncate_mode,
-                                                    FunctionDefaults<NDIM>::get_cell_min_width(), "convolution");
+                                                    FunctionDefaults<NDIM>::get_cell_min_width(), "convolution",
+                                                    device_procmap(), device_devicemap());
     // back to standard form in a single bottom-up pass, truncation folded in (see add_compress_from_ns)
     add_compress_from_ns(tts, gaussians, K, functiondata, convolution_result, recompress_result, precision,
                          "recompress_convolution");
@@ -115,8 +117,8 @@ vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
     if (residual) {
         load_compressed_mrattg(*psi, gaussians, K, functiondata, load_control, psi_compressed, tts, "psi");
         tts.push_back(mra::make_gaxpy(T(1.0), T(-1.0), gaussians, K, psi_compressed, recompress_result,
-                                      residual_result, "residual"));
-        tts.push_back(mra::make_norm(gaussians, K, residual_result, norm_result, "residual_norm"));
+                                      residual_result, "residual", device_procmap(), device_devicemap()));
+        tts.push_back(mra::make_norm(gaussians, K, residual_result, norm_result, "residual_norm", device_procmap(), device_devicemap()));
         // the norms of all N functions arrive at the root of the (single) batch
         tts.push_back(ttg::make_tt([&norms, N](const mra::Key<NDIM>& key, const mra::DenseTensor<T, 1>& n) {
             MADNESS_CHECK_THROW(key.level() == 0 && n.size() == N, "residual norms: expected one batch at the root");

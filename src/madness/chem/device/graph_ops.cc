@@ -59,10 +59,11 @@ DeviceGraph::Functions DeviceGraph::gaxpy(double a, Functions x, double b, Funct
     auto& g = pimpl->g;
     auto fns = make_mrattg_functionset(x.size);
     NodeEdge out_e, trunc_e;
-    g.add(mra::make_gaxpy(a, b, fns, g.K, pimpl->get(x).compressed, pimpl->get(y).compressed, out_e, "gaxpy"));
+    g.add(mra::make_gaxpy(a, b, fns, g.K, pimpl->get(x).compressed, pimpl->get(y).compressed, out_e, "gaxpy",
+                          device_procmap(), device_devicemap()));
     if (tol <= 0.0) return pimpl->add_functions(out_e, x.size);
     g.add(mra::make_truncate(fns, g.K, tol, FunctionDefaults<3>::get_truncate_mode(),
-                             FunctionDefaults<3>::get_cell_min_width(), out_e, trunc_e, "gaxpy-truncate"));
+                             FunctionDefaults<3>::get_cell_min_width(), out_e, trunc_e, "gaxpy-truncate", device_procmap(), device_devicemap()));
     return pimpl->add_functions(trunc_e, x.size);
 }
 
@@ -76,7 +77,7 @@ DeviceGraph::Functions DeviceGraph::apply_local_potential(const functionT& v, Fu
     const NodeEdge v_e = pimpl->get(load(v)).compressed;
     // multiplied in compressed form: psi is not reconstructed for this
     g.add(mra::make_multiply_compressed<T, 3>(pimpl->domain(), make_mrattg_functionset(1), fns, g.functiondata, g.K,
-                                              v_e, pimpl->get(psi).compressed, prod_e, "V*psi"));
+                                              v_e, pimpl->get(psi).compressed, prod_e, "V*psi", device_procmap(), device_devicemap()));
     add_compress(g.tts, fns, g.K, g.functiondata, prod_e, comp_e, tol, "compress_Vpsi");
     return pimpl->add_functions(comp_e, N);
 }
@@ -87,10 +88,11 @@ namespace {
     NodeEdge add_transform(MraGraph& g, NodeEdge in, std::size_t N, std::size_t M, UT&& U, double tol) {
         auto fns_out = make_mrattg_functionset(M);
         NodeEdge out_e, trunc_e;
-        g.add(mra::make_transform<double, 3>(make_mrattg_functionset(N), fns_out, g.K, std::forward<UT>(U), in, out_e));
+        g.add(mra::make_transform<double, 3>(make_mrattg_functionset(N), fns_out, g.K, std::forward<UT>(U), in, out_e,
+                                             "transform", device_procmap(), device_devicemap()));
         if (tol <= 0.0) return out_e;
         g.add(mra::make_truncate(fns_out, g.K, tol, FunctionDefaults<3>::get_truncate_mode(),
-                                 FunctionDefaults<3>::get_cell_min_width(), out_e, trunc_e, "truncate"));
+                                 FunctionDefaults<3>::get_cell_min_width(), out_e, trunc_e, "truncate", device_procmap(), device_devicemap()));
         return trunc_e;
     }
 }
@@ -110,7 +112,7 @@ DeviceGraph::Functions DeviceGraph::concat(Functions a, Functions b) {
     NodeEdge out_e;
     g.add(mra::make_concat<double, 3>(make_mrattg_functionset(a.size), make_mrattg_functionset(b.size), g.K,
                                       pimpl->get(a).compressed, pimpl->get(b).compressed, out_e, "concat",
-                                      ttg::Void{}, ttg::Void{}, pimpl->concat_group));
+                                      device_procmap(), device_devicemap(), pimpl->concat_group));
     return pimpl->add_functions(out_e, a.size + b.size);
 }
 

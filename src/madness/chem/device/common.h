@@ -182,6 +182,19 @@ inline void check_device_tree(DeviceFunctions& d, const char* what) {
     if (bad) report_tree(snap, what);
 }
 
+/// The process map of the MRA-TTG graphs of the SCF: the tasks of a node run on the process
+/// it assigns the node to, and device vectors hold their nodes there between graphs. All
+/// graphs use the same map: a vector fed with another map than it was stored with moves.
+inline auto device_procmap() { return mra::make_procmap<3>(1, 1 /* batch */); }
+
+/// The device map within a process, matching device_procmap. Host builds run every task
+/// on the host and take no device map (TTG would ask it for a device).
+#if defined(MRA_ENABLE_HOST)
+inline ttg::Void device_devicemap() { return {}; }
+#else
+inline auto device_devicemap() { return mra::make_devicemap<3>(device_procmap()); }
+#endif
+
 /// Feed MADNESS functions into an MRA-TTG graph as compressed nodes on `out`.
 
 /// Compressed trees are loaded as-is; reconstructed trees are compressed in the graph.
@@ -197,7 +210,8 @@ void load_compressed_mrattg(const std::vector<Function<T, (std::size_t)NDIM>>& f
     if (state == madness::TreeState::reconstructed) {
         ttg::Edge<mra::Key<NDIM>, mra::FunctionsReconstructedNode<T, NDIM>> reconstructed;
         tts.push_back(mra::vmra::make_vmra_load(f, control, reconstructed, "load_" + name));
-        tts.push_back(mra::make_compress(fns, K, false, functiondata, reconstructed, out, "compress_" + name));
+        tts.push_back(mra::make_compress(fns, K, false, functiondata, reconstructed, out, "compress_" + name,
+                                         device_procmap(), device_devicemap()));
     } else if (state == madness::TreeState::compressed) {
         tts.push_back(mra::vmra::make_vmra_load(f, control, out, "load_" + name));
     } else {
@@ -219,12 +233,14 @@ inline void add_compress(std::vector<std::unique_ptr<ttg::TTBase>>& tts, const s
     const int mode = FunctionDefaults<3>::get_truncate_mode();
     const double min_width = FunctionDefaults<3>::get_cell_min_width();
     if (tol <= 0.0 || !separate) {
-        tts.push_back(mra::make_compress(fns, K, false, functiondata, in, out, name, ttg::Void{}, ttg::Void{},
+        tts.push_back(mra::make_compress(fns, K, false, functiondata, in, out, name, device_procmap(), device_devicemap(),
                                          /*enable_truncate=*/tol > 0.0, tol, mode, min_width));
     } else {
         ttg::Edge<mra::Key<3>, mra::FunctionsCompressedNode<double, 3>> compressed;
-        tts.push_back(mra::make_compress(fns, K, false, functiondata, in, compressed, name));
-        tts.push_back(mra::make_truncate(fns, K, tol, mode, min_width, compressed, out, name + "-truncate"));
+        tts.push_back(mra::make_compress(fns, K, false, functiondata, in, compressed, name,
+                                         device_procmap(), device_devicemap()));
+        tts.push_back(mra::make_truncate(fns, K, tol, mode, min_width, compressed, out, name + "-truncate",
+                                         device_procmap(), device_devicemap()));
     }
 }
 
@@ -241,12 +257,15 @@ inline void add_compress_from_ns(std::vector<std::unique_ptr<ttg::TTBase>>& tts,
     const int mode = FunctionDefaults<3>::get_truncate_mode();
     const double min_width = FunctionDefaults<3>::get_cell_min_width();
     if (tol <= 0.0 || !separate) {
-        tts.push_back(mra::make_compress_from_ns(fns, K, functiondata, in, out, name, ttg::Void{}, ttg::Void{},
-                                                 /*enable_truncate=*/tol > 0.0, tol, mode, min_width));
+        tts.push_back(mra::make_compress_from_ns(fns, K, functiondata, in, out, name, device_procmap(),
+                                                 device_devicemap(), /*enable_truncate=*/tol > 0.0, tol, mode,
+                                                 min_width));
     } else {
         ttg::Edge<mra::Key<3>, mra::FunctionsCompressedNode<double, 3>> compressed;
-        tts.push_back(mra::make_compress_from_ns(fns, K, functiondata, in, compressed, name));
-        tts.push_back(mra::make_truncate(fns, K, tol, mode, min_width, compressed, out, name + "-truncate"));
+        tts.push_back(mra::make_compress_from_ns(fns, K, functiondata, in, compressed, name,
+                                                 device_procmap(), device_devicemap()));
+        tts.push_back(mra::make_truncate(fns, K, tol, mode, min_width, compressed, out, name + "-truncate",
+                                         device_procmap(), device_devicemap()));
     }
 }
 

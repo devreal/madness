@@ -44,13 +44,13 @@ DeviceGraph::~DeviceGraph() = default;
 
 DeviceGraph::Functions DeviceGraph::feed(DeviceFunctions& v, bool keep) {
     NodeEdge e;
-    pimpl->g.add(fv(v).make_feed(pimpl->g.control, e, keep, "feed"));
+    pimpl->g.add(fv(v).make_feed(pimpl->g.control, e, keep, "feed", device_procmap(), device_devicemap()));
     if (keep) pimpl->kept.push_back(&v);
     return pimpl->add_functions(e, v.size());
 }
 
 void DeviceGraph::store(Functions f, DeviceFunctions& v) {
-    pimpl->g.add(fv(v).make_store(pimpl->get(f).compressed, f.size, "store"));
+    pimpl->g.add(fv(v).make_store(pimpl->get(f).compressed, f.size, "store", device_procmap(), device_devicemap()));
     pimpl->stored.push_back(&v);
 }
 

@@ -50,7 +50,7 @@ DeviceGraph::Result DeviceGraph::matrix_inner(Functions a, Functions b) {
     r.matrix.emplace();
     g.add(mra::make_matrix_inner<double, 3>(make_mrattg_functionset(a.size), make_mrattg_functionset(b.size), g.K,
                                             pimpl->get(a).compressed, pimpl->get(b).compressed, *r.matrix,
-                                            "matrix_inner", ttg::Void{}, ttg::Void{}, pimpl->inner_group));
+                                            "matrix_inner", device_procmap(), device_devicemap(), pimpl->inner_group));
     pimpl->add_matrix_sink(*r.matrix, r, 1.0, "matrix_inner_sink");
     return Result{int(pimpl->results.size()) - 1};
 }
@@ -59,7 +59,8 @@ DeviceGraph::Result DeviceGraph::norms(Functions a) {
     auto& g = pimpl->g;
     Impl::Res& r = pimpl->add_result(long(a.size), 0);
     r.vector.emplace();
-    g.add(mra::make_norm(make_mrattg_functionset(a.size), g.K, pimpl->get(a).compressed, *r.vector));
+    g.add(mra::make_norm(make_mrattg_functionset(a.size), g.K, pimpl->get(a).compressed, *r.vector, "norm",
+                         device_procmap(), device_devicemap()));
     g.add(ttg::make_tt([&r](const mra::Key<3>& key, const mra::DenseTensor<double, 1>& n) {
         std::copy(n.current_view().data(), n.current_view().data() + r.value.size(), r.value.ptr());
     }, ttg::edges(*r.vector), ttg::edges(), "norm_sink"));
@@ -76,15 +77,15 @@ DeviceGraph::Result DeviceGraph::kinetic_matrix(Functions psi) {
     // the three derivatives in one descent over the compressed orbitals, which are not reconstructed
     std::array<RecEdge, 3> d_e;
     g.add(mra::make_gradient_compressed<T, 3>(pimpl->domain(), fns, g.functiondata, g.K, pimpl->get(psi).compressed,
-                                              d_e, "gradient"));
+                                              d_e, "gradient", device_procmap(), device_devicemap()));
     for (mra::Dimension axis = 0; axis < 3; ++axis) {
         const std::string name = "d" + std::to_string(axis);
         NodeEdge dc_e;
         MatrixEdge m_e;
         g.add(mra::make_compress(fns, g.K, false, g.functiondata, d_e[axis], dc_e, "compress_" + name,
-                                 ttg::Void{}, ttg::Void{}, false, T{}, 0, T{}, compress_group));
+                                 device_procmap(), device_devicemap(), false, T{}, 0, T{}, compress_group));
         g.add(mra::make_matrix_inner<T, 3>(fns, fns, g.K, dc_e, dc_e, m_e, "inner_" + name,
-                                           ttg::Void{}, ttg::Void{}, pimpl->inner_group));
+                                           device_procmap(), device_devicemap(), pimpl->inner_group));
         pimpl->add_matrix_sink(m_e, r, 0.5, "sink_" + name);
     }
     return Result{int(pimpl->results.size()) - 1};

@@ -59,28 +59,29 @@ DeviceFunctions device_bsh_residual(World& world, DeviceFunctions& psi, DeviceFu
     ttg::Edge<mra::Key<3>, mra::DenseTensor<T, 1>> norm_e;
     DeviceFunctions r;
 
-    g.add(fv(psi).make_feed(g.control, psi_e, true, "feed_psi"));
-    g.add(fv(Vpsi).make_feed(g.control, V_e, false, "feed_Vpsi"));
+    g.add(fv(psi).make_feed(g.control, psi_e, true, "feed_psi", device_procmap(), device_devicemap()));
+    g.add(fv(Vpsi).make_feed(g.control, V_e, false, "feed_Vpsi", device_procmap(), device_devicemap()));
     // Vpsi' = -2 Vpsi + 2 psi fockp
-    g.add(mra::make_transform<T, 3>(fns, fns, g.K, device_matrix(fockp), psi_e, fpsi_e, "fock_psi"));
-    g.add(mra::make_gaxpy(T(-2.0), T(2.0), fns, g.K, V_e, fpsi_e, Vp_e, "Vpsi_shift"));
+    g.add(mra::make_transform<T, 3>(fns, fns, g.K, device_matrix(fockp), psi_e, fpsi_e, "fock_psi", device_procmap(), device_devicemap()));
+    g.add(mra::make_gaxpy(T(-2.0), T(2.0), fns, g.K, V_e, fpsi_e, Vp_e, "Vpsi_shift", device_procmap(), device_devicemap()));
     // BSH apply: non-standard form for the convolution, compressed and truncated result,
     // each conversion in a single pass
-    g.add(mra::make_nonstandard(fns, g.K, g.functiondata, Vp_e, conv_in_e, "nonstandard"));
-    g.add(mra::make_convolution(fns, g.K, conv_in_e, conv_e, op, precision, truncate_mode, cell_min_width, "convolution"));
+    g.add(mra::make_nonstandard(fns, g.K, g.functiondata, Vp_e, conv_in_e, "nonstandard", device_procmap(), device_devicemap()));
+    g.add(mra::make_convolution(fns, g.K, conv_in_e, conv_e, op, precision, truncate_mode, cell_min_width, "convolution",
+                                device_procmap(), device_devicemap()));
     // truncation folded into the recompression (see add_compress_from_ns)
     add_compress_from_ns(g.tts, fns, g.K, g.functiondata, conv_e, trunc_e, precision, "recompress_convolution");
     // -r = new psi - psi, and its norms. Not psi - new psi: gaxpy forwards an operand with
     // scalar 1 unchanged where the other one is empty, which would hand a kept psi node to
     // the store of r (see mra::FunctionVector)
-    g.add(mra::make_gaxpy(T(1.0), T(-1.0), fns, g.K, trunc_e, psi_e, r_e, "residual"));
-    g.add(mra::make_norm(fns, g.K, r_e, norm_e, "residual_norm"));
+    g.add(mra::make_gaxpy(T(1.0), T(-1.0), fns, g.K, trunc_e, psi_e, r_e, "residual", device_procmap(), device_devicemap()));
+    g.add(mra::make_norm(fns, g.K, r_e, norm_e, "residual_norm", device_procmap(), device_devicemap()));
     rnorm.assign(N, 0.0);
     g.add(ttg::make_tt([&rnorm, N](const mra::Key<3>& key, const mra::DenseTensor<T, 1>& n) {
         const T* data = n.current_view().data();
         for (mra::size_type i = 0; i < N; ++i) rnorm[i] = data[i];
     }, ttg::edges(norm_e), ttg::edges(), "residual_norm_sink"));
-    g.add(fv(r).make_store(r_e, N, "store_r"));
+    g.add(fv(r).make_store(r_e, N, "store_r", device_procmap(), device_devicemap()));
     g.execute();
     check_device_tree(r, "device_bsh_residual");
     world.gop.sum(rnorm.data(), rnorm.size());
