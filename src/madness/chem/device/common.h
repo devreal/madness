@@ -182,17 +182,38 @@ inline void check_device_tree(DeviceFunctions& d, const char* what) {
     if (bad) report_tree(snap, what);
 }
 
-/// The process map of the MRA-TTG graphs of the SCF: the tasks of a node run on the process
-/// it assigns the node to, and device vectors hold their nodes there between graphs. All
-/// graphs use the same map: a vector fed with another map than it was stored with moves.
-inline auto device_procmap() { return mra::make_procmap<3>(1, 1 /* batch */); }
+/// The process map of the MRA-TTG graphs of the SCF: MADNESS's (FunctionDefaults<3>), so a
+/// node is on the process that holds it in MADNESS, and loading and storing host functions
+/// stays on the process. Device vectors hold their nodes on the process the map gives them
+/// when stored; fed into a graph after the map changed (SCF::loadbal), they move to it.
+struct DeviceProcMap {
+    std::shared_ptr<WorldDCPmapInterface<Key<3>>> pmap = FunctionDefaults<3>::get_pmap();
+    int operator()(const mra::Key<3>& key) const { return pmap->owner(key.to_madness_key()); }
+};
 
-/// The device map within a process, matching device_procmap. Host builds run every task
-/// on the host and take no device map (TTG would ask it for a device).
+/// The device of a node within its process: as the map assigns it (SFCPmap::device) or,
+/// for a map without devices, by a hash of the node's ancestor at a coarse level, so that
+/// nearby nodes share a device.
+struct DeviceDevMap {
+    std::shared_ptr<const SFCPmap<3>> sfc =
+        std::dynamic_pointer_cast<const SFCPmap<3>>(FunctionDefaults<3>::get_pmap());
+    int ndevice;
+    explicit DeviceDevMap(int ndevice) : ndevice(ndevice) {}
+    int operator()(const mra::Key<3>& key) const {
+        const Key<3> k = key.to_madness_key();
+        if (sfc) return sfc->device(k) % ndevice;
+        constexpr Level coarse = 3;
+        return int((k.level() <= coarse ? k : k.parent(k.level() - coarse)).hash() % ndevice);
+    }
+};
+
+inline DeviceProcMap device_procmap() { return {}; }
+
+/// Host builds run every task on the host and take no device map (TTG would ask it for a device).
 #if defined(MRA_ENABLE_HOST)
 inline ttg::Void device_devicemap() { return {}; }
 #else
-inline auto device_devicemap() { return mra::make_devicemap<3>(device_procmap()); }
+inline DeviceDevMap device_devicemap() { return DeviceDevMap(std::max(1, ttg::device::num_devices())); }
 #endif
 
 /// Feed MADNESS functions into an MRA-TTG graph as compressed nodes on `out`.

@@ -32,6 +32,7 @@
 /// \file device/validate.cc
 /// \brief Validation of the MRA-TTG inner products and transform against MADNESS.
 
+#include <numeric>
 #include "common.h"
 #include "compare.h"
 
@@ -186,6 +187,29 @@ void validate_device_values(World& world, const std::vector<double>& ref, const 
         max = std::max(max, std::abs(ref[i]));
     }
     if (world.rank() == 0) print("mra-ttg", what, ": max |mra-ttg - madness|", diff, " max |madness|", max);
+}
+
+/// compare the load-balancing cost of device vector d (device_add_lb_cost) with that of the
+/// same functions ref on the host, both as the total the balancer partitions
+void validate_device_lb_cost(World& world, const vecfuncT& ref, DeviceFunctions& d) {
+    /// the device's cost: 8 for a node with children, 1 for a leaf (lbcost without its root term)
+    struct NodeCost {
+        double operator()(const Key<3>&, const FunctionNode<double, 3>& node) const {
+            return node.has_children() ? 8.0 : 1.0;
+        }
+    };
+    auto total = [&world](auto&& add) {
+        LoadBalanceDeux<3> lb(world);
+        add(lb);
+        world.gop.fence();
+        const auto map = lb.load_balance_sfc();
+        return std::accumulate(map->costs().begin(), map->costs().end(), 0.0);
+    };
+    const double host = total([&](LoadBalanceDeux<3>& lb) {
+        for (const auto& f : ref) lb.add_tree(f, NodeCost(), false);
+    });
+    const double dev = total([&](LoadBalanceDeux<3>& lb) { device_add_lb_cost(lb, d); });
+    validate_device_values(world, std::vector<double>{host}, std::vector<double>{dev}, "load balance cost");
 }
 
 } // namespace madness

@@ -43,6 +43,7 @@
 #include <memory>
 #include <vector>
 #include <madness/chem/SCF.h>
+#include <madness/mra/lbdeux.h>
 
 namespace madness {
 
@@ -160,6 +161,15 @@ namespace madness {
         DeviceRange& operator=(const DeviceRange&) = delete;
     };
 
+    /// the number of devices MRA-TTG uses per process: the largest of all processes (collective)
+    int device_count(World& world);
+
+    /// Adds the cost of the nodes of a device vector on this process to the load balancer:
+    /// per function, 8 for a node with children and 1 for a leaf (lbcost(1, 8)). A function's
+    /// leafs are not nodes of the vector; they are added as the children marked leaf.
+    /// Not while a graph executes.
+    void device_add_lb_cost(LoadBalanceDeux<3>& lb, DeviceFunctions& v);
+
     /// copy MADNESS functions into a device vector
     DeviceFunctions device_upload(World& world, const vecfuncT& f);
 
@@ -216,6 +226,10 @@ namespace madness {
     /// print max ||ref_i - d_i|| and max ||ref_i||, d downloaded with the process map of `like`; d is kept
     void validate_device_functions(World& world, const vecfuncT& ref, DeviceFunctions& d, const functionT& like,
                                    const std::string& what);
+
+    /// compare the load-balancing cost of device vector d (device_add_lb_cost) with that of the
+    /// same functions ref on the host
+    void validate_device_lb_cost(World& world, const vecfuncT& ref, DeviceFunctions& d);
 
     /// print max |ref - d| and max |ref|
     void validate_device_values(World& world, const Tensor<double>& ref, const Tensor<double>& d,

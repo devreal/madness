@@ -194,6 +194,8 @@ public:
 
 /// MRA-TTG convolution operators kept across iterations (device/scf_device.h)
 struct DeviceOperatorCache;
+/// functions held by MRA-TTG between graphs (device/scf_device.h)
+class DeviceFunctions;
 
 class SCF {
 public:
@@ -537,8 +539,14 @@ public:
                              const tensorT& occ, const double thresh) const;
 
 
+    /// Redistributes the functions (FunctionDefaults<3>::redistribute) to balance their cost.
+    ///
+    /// With MRA-TTG resident orbitals (mrattg_resident) the map cuts the space-filling curve,
+    /// one piece per process and, within it, per device (SFCPmap): the device graphs place
+    /// their tasks with it, and device vectors move to it when they are next fed. The cost
+    /// of the orbitals is then taken from device_mo if given, instead of amo.
     void loadbal(World& world, functionT& arho, functionT& brho, functionT& arho_old,
-                 functionT& brho_old, subspaceT& subspace);
+                 functionT& brho_old, subspaceT& subspace, DeviceFunctions* device_mo = nullptr);
 
 
     void rotate_subspace(World& world, const tensorT& U, subspaceT& subspace,

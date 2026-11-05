@@ -37,6 +37,8 @@
 
 #include "funcdefaults.h"
 #include "tensor_json.hpp"
+#include <algorithm>
+#include <numeric>
 #include <madness/world/worldmem.h>
 #include <madness/world/ranks_and_hosts.h>
 #include <madness.h>
@@ -2137,8 +2139,18 @@ tensorT SCF::diag_fock_matrix(World& world, tensorT& fock, vecfuncT& psi,
 }
 
 void SCF::loadbal(World& world, functionT& arho, functionT& brho,
-                  functionT& arho_old, functionT& brho_old, subspaceT& subspace) {
-    if (world.size() == 1)
+                  functionT& arho_old, functionT& brho_old, subspaceT& subspace,
+                  DeviceFunctions* device_mo) {
+    // with MRA-TTG resident orbitals: a two-level map, processes and their devices
+    int ndevice = 1;
+#ifdef HAVE_MRA_TTG
+    const bool sfc = mrattg_resident;
+    if (sfc) ndevice = device_count(world);
+#else
+    const bool sfc = false;
+    MADNESS_CHECK_THROW(device_mo == nullptr, "SCF::loadbal: device orbitals need MRA-TTG");
+#endif // HAVE_MRA_TTG
+    if (world.size() == 1 && ndevice == 1)
         return;
 
     LoadBalanceDeux<3> lb(world);
@@ -2154,6 +2166,13 @@ void SCF::loadbal(World& world, functionT& arho, functionT& brho,
     lb.add_tree(vnuc, lbcost<double, 3>(param.vnucextra() * 1.0, param.vnucextra() * 8.0),
                 false);
     lb.add_tree(arho, lbcost<double, 3>(1.0, 8.0), false);
+#ifdef HAVE_MRA_TTG
+    if (device_mo) {
+        world.gop.fence();   // MRA-TTG is idle between graphs
+        if (validate_mra_ttg) validate_device_lb_cost(world, amo, *device_mo);
+        device_add_lb_cost(lb, *device_mo);
+    } else
+#endif // HAVE_MRA_TTG
     for (unsigned int i = 0; i < amo.size(); ++i) {
         lb.add_tree(amo[i], lbcost<double, 3>(1.0, 8.0), false);
     }
@@ -2165,8 +2184,20 @@ void SCF::loadbal(World& world, functionT& arho, functionT& brho,
     }
     world.gop.fence();
 
-    FunctionDefaults<3>::redistribute(world, lb.load_balance(
-            param.loadbalparts())); // 6.0 needs retuning after param.vnucextra
+    if (sfc) {
+        std::shared_ptr<SFCPmap<3>> pmap = lb.load_balance_sfc(ndevice, param.loadbalparts());
+        if (world.rank() == 0 and param.print_level() > 2) {
+            const std::vector<double>& cost = pmap->costs();
+            const double mean = std::accumulate(cost.begin(), cost.end(), 0.0)/cost.size();
+            const double max = *std::max_element(cost.begin(), cost.end());
+            print("load balance:", world.size(), "processes,", ndevice, "devices each,", pmap->num_pieces(),
+                  "pieces of the curve, max/mean cost", max/mean);
+        }
+        FunctionDefaults<3>::redistribute(world, pmap);
+    } else {
+        FunctionDefaults<3>::redistribute(world, lb.load_balance(
+                param.loadbalparts())); // 6.0 needs retuning after param.vnucextra
+    }
 
     world.gop.fence();
 }
@@ -2969,7 +3000,13 @@ void SCF::solve_simple(World& world) {
             functionT brho = arho;
             functionT brho_old = arho_old;
             subspaceT nosubspace;
-            loadbal(world, arho, brho, arho_old, brho_old, nosubspace);
+            loadbal(world, arho, brho, arho_old, brho_old, nosubspace,
+#ifdef HAVE_MRA_TTG
+                    device_only ? &amo_d : nullptr
+#else
+                    nullptr
+#endif // HAVE_MRA_TTG
+                    );
             END_TIMER(world, "Load balancing");
         }
 

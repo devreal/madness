@@ -80,6 +80,35 @@ DeviceFunctions::Impl& DeviceFunctions::impl() {
     return *pimpl;
 }
 
+int device_count(World& world) {
+#if defined(MRA_ENABLE_HOST)
+    int n = 1;
+#else
+    int n = std::max(1, ttg::device::num_devices());
+#endif
+    world.gop.max(n);
+    return n;
+}
+
+void device_add_lb_cost(LoadBalanceDeux<3>& lb, DeviceFunctions& v) {
+    constexpr int nchild = mra::Key<3>::num_children();
+    const int N = int(v.size());
+    fv(v).for_each_local_node([&](const mra::Key<3>& key, const auto& node) {
+        // the functions with children here, and per child those of them for which it is a leaf
+        long interior = 0;
+        std::array<long, nchild> leafs{};
+        for (int i = 0; i < N; ++i) {
+            if (node.is_zero(i) && node.is_all_child_leaf(i)) continue;   // its tree ended above
+            ++interior;
+            for (int c = 0; c < nchild; ++c) leafs[c] += node.is_child_leaf(i, c);
+        }
+        lb.add_cost(key.to_madness_key(), 8.0*double(interior), interior > 0);
+        for (int c = 0; c < nchild; ++c) {
+            if (leafs[c] > 0) lb.add_cost(key.child_at(c).to_madness_key(), double(leafs[c]), false);
+        }
+    });
+}
+
 /// copy MADNESS functions into a device vector
 DeviceFunctions device_upload(World& world, const vecfuncT& f) {
     MraGraph g;
@@ -154,7 +183,8 @@ DeviceFunctions device_transformed(World& world, DeviceFunctions& v, const Tenso
                                          "transform", device_procmap(), device_devicemap()));
     if (tol > 0.0) {
         g.add(mra::make_truncate(fns_out, g.K, tol, FunctionDefaults<3>::get_truncate_mode(),
-                                 FunctionDefaults<3>::get_cell_min_width(), out_e, trunc_e, "truncate", device_procmap(), device_devicemap()));
+                                 FunctionDefaults<3>::get_cell_min_width(), out_e, trunc_e, "truncate",
+                                 device_procmap(), device_devicemap()));
     }
     g.add(fv(out).make_store(tol > 0.0 ? trunc_e : out_e, M, "store", device_procmap(), device_devicemap()));
     g.execute();
