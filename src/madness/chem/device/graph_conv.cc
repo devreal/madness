@@ -47,20 +47,18 @@ DeviceGraph::Functions DeviceGraph::convolution(const poperatorT& op, Functions 
     using T = double;
     auto& g = pimpl->g;
     const mra::size_type N = in.size;
-    MADNESS_CHECK_THROW(N == 1, "DeviceGraph::convolution: one operator applies to one function");
     // the convolution tasks refer to the function set's shared_ptr object itself and to the
     // operator (captured by reference): both are held here, at stable addresses, until the graph has run
     auto fns_holder = std::make_shared<decltype(make_mrattg_functionset(N))>(make_mrattg_functionset(N));
     const auto& fns = *fns_holder;
     std::shared_ptr<mra::GaussianConvolutionOperator<T, 3>> dop;
-    if (cache && cache->op == op) {
-        dop = cache->device_op;
-    } else {
+    if (cache) {
+        for (auto& [hop, d] : cache->ops) if (hop == op) dop = d;
+    }
+    if (!dop) {
+        // one operator for all N functions
         dop = std::make_shared<mra::GaussianConvolutionOperator<T, 3>>(op);
-        if (cache) {
-            cache->op = op;
-            cache->device_op = dop;
-        }
+        if (cache) cache->ops.emplace_back(op, dop);
     }
     pimpl->operators.push_back(fns_holder);
     pimpl->operators.push_back(dop);

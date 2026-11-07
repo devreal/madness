@@ -30,6 +30,7 @@ if (HAVE_MRA_TTG)
       device/graph_ops.cc
       device/graph_reduce.cc
       device/graph_conv.cc
+      device/exchange.cc
     )
   if (TARGET mra::cuda OR TARGET mra::hip)
     mra_generate_gpu_wrappers(

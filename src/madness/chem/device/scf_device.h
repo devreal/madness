@@ -41,6 +41,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 #include <madness/chem/SCF.h>
 
@@ -111,6 +112,13 @@ namespace madness {
 
         /// v psi_i for one (host) function v, truncated with tol unless tol == 0
         Functions apply_local_potential(const functionT& v, Functions psi, double tol);
+        /// the same for one function v of this graph
+        Functions apply_local_potential(Functions v, Functions psi, double tol);
+        /// sum_i occ_i psi_i^2 (cf. SCF::make_density): one function
+        Functions density(Functions psi, const tensorT& occ);
+        /// a_i b_i (a and b of the same size) or a_0 b_i (a of size 1), compressed, truncated
+        /// with tol unless tol == 0
+        Functions multiply(Functions a, Functions b, double tol, const std::string& name = "multiply");
         /// op(in_i) for one convolution operator (e.g., Coulomb), compressed and truncated with
         /// tol unless tol == 0. With a cache, the MRA-TTG operator made for op is kept there and
         /// reused, with every level of 1D matrices it generated, while op stays the same.
@@ -118,7 +126,7 @@ namespace madness {
         /// a x_i + b y_i, truncated with tol unless tol == 0
         Functions gaxpy(double a, Functions x, double b, Functions y, double tol);
         /// out_j = sum_i in_i U(i,j), truncated with tol unless tol == 0
-        Functions transform(Functions in, const Tensor<double>& U, double tol);
+        Functions transform(Functions in, const Tensor<double>& U, double tol, const std::string& name = "transform");
         /// the same with U computed in the graph; M is the number of columns of U
         Functions transform(Functions in, Matrix U, std::size_t M, double tol);
         /// [a, b]: the functions of a followed by those of b
@@ -203,6 +211,12 @@ namespace madness {
     /// Vpsi_i = v psi_i for one (host) function v, truncated with tol unless tol == 0; psi is kept
     void device_apply_local_potential(World& world, const functionT& v, DeviceFunctions& psi,
                                       DeviceFunctions& Vpsi, double tol);
+
+    /// the Hartree-Fock exchange K psi_i = sum_j psi_j G(psi_j psi_i) with the Poisson operator G
+    /// (lo, thresh) of the host Exchange, in tiles of `tile` pairs i <= j (0: all in one graph);
+    /// psi is kept. G is kept in the cache.
+    DeviceFunctions device_exchange(World& world, DeviceFunctions& psi, double lo, DeviceOperatorCache& cache,
+                                    std::size_t tile);
 
     /// sum_i occ_i psi_i^2, compressed, with the process map of `like`; psi is kept
     functionT device_density(World& world, DeviceFunctions& psi, const tensorT& occ, const functionT& like);
