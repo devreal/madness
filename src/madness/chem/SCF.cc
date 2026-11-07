@@ -2939,13 +2939,20 @@ void SCF::solve_simple(World& world) {
     // closed shell: rho and the kinetic and nonlocal energies are twice the alpha part
     const double spinfac = 2.0;
 #ifdef HAVE_MRA_TTG
-    // keep the orbitals in device memory. With a local potential (all-electron, no exact
-    // exchange, no meta-GGA tau term) and the abgv derivative the whole iteration runs on
+    // keep the orbitals in device memory. With a potential the device applies (all-electron,
+    // no meta-GGA tau term; exact exchange is applied on the device too, unless
+    // MRA_TTG_HOST_EXCHANGE is set) and the abgv derivative the whole iteration runs on
     // MRA-TTG and only the density and the potential pass through the host; otherwise the
     // orbitals go to the host once per iteration to apply the potential there.
     const bool resident = mrattg_resident;
-    const bool local_potential = molecule.parameters.pure_ae() && xc.hf_exchange_coefficient() == 0.0
-                                 && !xc.is_meta();
+    const double hf_coeff = xc.hf_exchange_coefficient();
+    const bool host_exchange = std::getenv("MRA_TTG_HOST_EXCHANGE") != nullptr;
+    // local_potential: the device applies the potential (the local part and the exchange)
+    const bool local_potential = molecule.parameters.pure_ae() && !xc.is_meta()
+                                 && (hf_coeff == 0.0 || !host_exchange);
+    // pairs of orbitals per exchange graph (0: all in one)
+    const std::size_t exchange_tile = std::getenv("MRA_TTG_EXCHANGE_TILE")
+                                      ? std::stoul(std::getenv("MRA_TTG_EXCHANGE_TILE")) : 0;
     const bool device_only = resident && local_potential && param.deriv() == "abgv";
     DeviceFunctions amo_d;
     // KAIN (maxsub > 1): the history of iterates and residuals as one device vector, pair s
@@ -2955,6 +2962,10 @@ void SCF::solve_simple(World& world) {
     DeviceFunctions hist_d;
     long nhist = 0;
     tensorT kain_Q;
+    // the nuclear potential on the device, uploaded once: vnuc_h is the host function it was
+    // made from (held, so that a new function cannot reuse its impl's address)
+    DeviceFunctions vnuc_d;
+    functionT vnuc_h;
 #endif // HAVE_MRA_TTG
 
     for (int iter = 0; iter < param.maxiter(); ++iter) {
@@ -2975,51 +2986,35 @@ void SCF::solve_simple(World& world) {
         }
 #endif // HAVE_MRA_TTG
 
-        // [ttg: square + compress + transform with the occupations as one column]
-        START_TIMER(world);
-        functionT arho;
-#ifdef HAVE_MRA_TTG
-        if (device_only) {
-            {
-                DeviceRange range("Make density (device)");
-                arho = device_density(world, amo_d, aocc, amo.front());
-            }
-            if (validate_mra_ttg) {
-                functionT ref = make_density(world, aocc, amo);
-                const double d = (ref - arho).norm2(), n = ref.norm2();
-                if (world.rank() == 0) print("mra-ttg density : ||mra-ttg - madness||", d, " ||madness||", n);
-            }
-        } else
-#endif // HAVE_MRA_TTG
-        arho = make_density(world, aocc, amo);
-        END_TIMER(world, "Make densities");
-
-        // [ttg: no equivalent; redistributing invalidates any device-resident copy]
-        if (iter < 2 || (iter % 10) == 0) {
-            START_TIMER(world);
-            functionT brho = arho;
-            functionT brho_old = arho_old;
-            subspaceT nosubspace;
-            loadbal(world, arho, brho, arho_old, brho_old, nosubspace,
-#ifdef HAVE_MRA_TTG
-                    device_only ? &amo_d : nullptr
-#else
-                    nullptr
-#endif // HAVE_MRA_TTG
-                    );
-            END_TIMER(world, "Load balancing");
-        }
-
-        // [ttg: gaxpy + norm]
+        functionT arho, vlocal;
+        // load balancing and the change of the density, once arho is there
         double da = 0.0;
-        if (iter > 0) {
-            da = (arho - arho_old).norm2();
-            if (world.rank() == 0 and (param.print_level() > 2))
-                print("delta rho", da, "residual", bsh_residual);
-        }
-        arho_old = arho;
+        auto balance_and_delta = [&]() {
+            // [ttg: device vectors move to the new process map when they are next fed]
+            if (iter < 2 || (iter % 10) == 0) {
+                START_TIMER(world);
+                functionT brho = arho;
+                functionT brho_old = arho_old;
+                subspaceT nosubspace;
+                loadbal(world, arho, brho, arho_old, brho_old, nosubspace,
+#ifdef HAVE_MRA_TTG
+                        device_only ? &amo_d : nullptr
+#else
+                        nullptr
+#endif // HAVE_MRA_TTG
+                        );
+                END_TIMER(world, "Load balancing");
+            }
+            // [ttg: gaxpy + norm]
+            if (iter > 0) {
+                da = (arho - arho_old).norm2();
+                if (world.rank() == 0 and (param.print_level() > 2))
+                    print("delta rho", da, "residual", bsh_residual);
+            }
+            arho_old = arho;
+        };
 
-        real_function_3d vnuc;            // static per protocol: load once, keep resident
+        real_function_3d vnuc;            // static per protocol: kept resident on the device
         if (molecule.parameters.psp_calc()) {
             vnuc = gthpseudopotential->vlocalpot();
         } else if (molecule.parameters.pure_ae()) {
@@ -3028,9 +3023,9 @@ void SCF::solve_simple(World& world) {
             vnuc = potentialmanager->vnuclear();
             vnuc = vnuc + gthpseudopotential->vlocalpot();
         }
+
         // rho = 2 arho, the nuclear and Coulomb energies, and the local potential vnuc + J[rho]
         double enuclear = 0.0, ecoulomb = 0.0;
-        functionT vlocal;
         auto host_coulomb = [&](functionT& vloc, double& enuc, double& ecoul) {
             functionT rho = spinfac * arho;
             rho.truncate();
@@ -3043,42 +3038,111 @@ void SCF::solve_simple(World& world) {
             vloc.truncate();
         };
 #ifdef HAVE_MRA_TTG
-        if (resident) {
-            // [ttg: transform(scale) + truncate + convolution + gaxpy + truncate + matrix_inner x2, one graph]
+        // with the potential applied on the device, vlocal stays there (vlocal_d) and only the
+        // XC potential is added from the host; vlocal is then set only for validation
+        DeviceFunctions vlocal_d;
+        // the nuclear potential on the device; uploaded before a graph is built, as that runs a graph
+        auto resident_vnuc = [&]() -> DeviceFunctions& {
+            if (vnuc_d.size() == 0 || vnuc_h.get_impl() != vnuc.get_impl()) {
+                DeviceRange range("Nuclear potential to device");
+                vnuc_d = device_upload(world, vecfuncT{vnuc});
+                vnuc_h = vnuc;
+            }
+            return vnuc_d;
+        };
+        // [ttg: transform(scale) + truncate + convolution + gaxpy + truncate + matrix_inner x2]
+        auto device_coulomb = [&](DeviceGraph& g, DeviceGraph::Functions arho_f, DeviceFunctions& vn_d) {
+            const double thresh = FunctionDefaults<3>::get_thresh();
+            tensorT scale(1, 1);
+            scale(0, 0) = spinfac;
+            auto rho = g.transform(arho_f, scale, thresh);
+            // a copy of vn_d made in the graph: gaxpy passes the nodes of vnuc on where J has
+            // none, into its truncation, which modifies them, while the feed with keep also hands
+            // them back to vn_d, and TTG allows a (non-copyable) node only one such consumer
+            tensorT one(1, 1);
+            one(0, 0) = 1.0;
+            auto vn = g.transform(g.feed(vn_d, true), one, 0.0);
+            auto enuc_r = g.matrix_inner(rho, vn);
+            auto vcoul = g.convolution(coulop, rho, 0.0, &device_operator_cache());
+            auto ecoul_r = g.matrix_inner(rho, vcoul);
+            auto vloc = g.gaxpy(1.0, vcoul, 1.0, vn, thresh);
+            if (local_potential) g.store(vloc, vlocal_d);
+            else g.store(vloc, vlocal, arho);
+            return std::make_pair(enuc_r, ecoul_r);
+        };
+        // device_only: the kinetic matrix, made with the density and the Coulomb potential
+        tensorT kin;
+        if (device_only) {
+            // [ttg: square + compress + transform with the occupations as one column, then Coulomb;
+            //  derivative x3 + compress + matrix_inner]
+            // one graph from one feed of psi: arho goes to the host (XC, load balancing, delta rho)
+            // while the Coulomb potential is formed from it on the device. The kinetic matrix does
+            // not depend on the potential: its derivatives fill the device while the convolution
+            // of the single density waits on the levels of its tree.
             START_TIMER(world);
             {
-                DeviceRange range("Coulomb potential (device)");
-                const double thresh = FunctionDefaults<3>::get_thresh();
+                DeviceRange range("Density, Coulomb potential, KE (device)");
+                DeviceFunctions& vn_d = resident_vnuc();
                 DeviceGraph g(world);
-                tensorT scale(1, 1);
-                scale(0, 0) = spinfac;
-                auto rho = g.transform(g.load(arho), scale, thresh);
-                auto vn = g.load(vnuc);
-                auto enuc_r = g.matrix_inner(rho, vn);
-                auto vcoul = g.convolution(coulop, rho, 0.0, &device_operator_cache());
-                auto ecoul_r = g.matrix_inner(rho, vcoul);
-                g.store(g.gaxpy(1.0, vcoul, 1.0, vn, thresh), vlocal, arho);
+                auto psi = g.feed(amo_d, true);
+                auto arho_f = g.density(psi, aocc);
+                g.store(arho_f, arho, amo.front());
+                auto [enuc_r, ecoul_r] = device_coulomb(g, arho_f, vn_d);
+                auto kin_r = g.kinetic_matrix(psi);
                 g.execute();
                 enuclear = g.get(enuc_r)(0, 0);
                 ecoulomb = 0.5 * g.get(ecoul_r)(0, 0);
+                kin = g.get(kin_r);
             }
-            END_TIMER(world, "Coulomb potential (device)");
+            END_TIMER(world, "Density, Coulomb, KE (device)");
             if (validate_mra_ttg) {
-                functionT vloc_ref;
-                double enuc_ref, ecoul_ref;
-                host_coulomb(vloc_ref, enuc_ref, ecoul_ref);
-                const double d = (vloc_ref - vlocal).norm2(), n = vloc_ref.norm2();
-                if (world.rank() == 0) print("mra-ttg local potential : ||mra-ttg - madness||", d, " ||madness||", n);
-                validate_device_values(world, std::vector<double>{enuc_ref, ecoul_ref},
-                                       std::vector<double>{enuclear, ecoulomb}, "nuclear and Coulomb energies");
+                functionT ref = make_density(world, aocc, amo);
+                const double d = (ref - arho).norm2(), n = ref.norm2();
+                if (world.rank() == 0) print("mra-ttg density : ||mra-ttg - madness||", d, " ||madness||", n);
             }
+            // the device holds its own copies of everything the iteration needs
+            balance_and_delta();
         } else
 #endif // HAVE_MRA_TTG
         {
             START_TIMER(world);
-            host_coulomb(vlocal, enuclear, ecoulomb);
-            END_TIMER(world, "Coulomb potential");
+            arho = make_density(world, aocc, amo);
+            END_TIMER(world, "Make densities");
+            balance_and_delta();
+#ifdef HAVE_MRA_TTG
+            if (resident) {
+                START_TIMER(world);
+                {
+                    DeviceRange range("Coulomb potential (device)");
+                    DeviceFunctions& vn_d = resident_vnuc();
+                    DeviceGraph g(world);
+                    auto [enuc_r, ecoul_r] = device_coulomb(g, g.load(arho), vn_d);
+                    g.execute();
+                    enuclear = g.get(enuc_r)(0, 0);
+                    ecoulomb = 0.5 * g.get(ecoul_r)(0, 0);
+                }
+                END_TIMER(world, "Coulomb potential (device)");
+            } else
+#endif // HAVE_MRA_TTG
+            {
+                START_TIMER(world);
+                host_coulomb(vlocal, enuclear, ecoulomb);
+                END_TIMER(world, "Coulomb potential");
+            }
         }
+#ifdef HAVE_MRA_TTG
+        if (resident && validate_mra_ttg) {
+            // the device result is kept in vlocal, for the validation of V*psi
+            if (local_potential) vlocal = device_download(world, vlocal_d, amo.front())[0];
+            functionT vloc_ref;
+            double enuc_ref, ecoul_ref;
+            host_coulomb(vloc_ref, enuc_ref, ecoul_ref);
+            const double d = (vloc_ref - vlocal).norm2(), n = vloc_ref.norm2();
+            if (world.rank() == 0) print("mra-ttg local potential : ||mra-ttg - madness||", d, " ||madness||", n);
+            validate_device_values(world, std::vector<double>{enuc_ref, ecoul_ref},
+                                   std::vector<double>{enuclear, ecoulomb}, "nuclear and Coulomb energies");
+        }
+#endif // HAVE_MRA_TTG
 
         // [ttg: XC potential (pointwise unaryop on rho) -- missing;
         //  HF exchange (pair products, N^2 convolutions, reduction) -- missing]
@@ -3090,40 +3154,87 @@ void SCF::solve_simple(World& world) {
         // a local potential is applied on the device; anything else is applied on the host and
         // the result moved to the device
         if (resident && local_potential) {
+            // vnuc + J[rho] is on the device (vlocal_d): only the XC potential comes from the host
             START_TIMER(world);
-            functionT vloc = copy(vlocal);
-            if (xc.is_dft()) {
+            functionT vxc;
+            // as apply_potential: no DFT part for pure exact exchange
+            if (xc.is_dft() && hf_coeff != 1.0) {
                 // closed shell: the beta density is the alpha density
                 XCOperator<double, 3> xcop(world, this, arho, arho, 0, param.dft_deriv());
                 xcop.set_print_level(param.print_level());
                 exc = xcop.compute_xc_energy();
-                vloc += xcop.make_xc_potential();
+                vxc = xcop.make_xc_potential();
             }
-            vloc.truncate();
             END_TIMER(world, "DFT potential");
 
-            // one graph from one feed and one reconstruction of psi: V*psi, stored for the residual,
-            // the potential-energy matrix <V psi|psi>, and the kinetic matrix
-            // [ttg: multiply_broadcast + compress + matrix_inner; derivative x3 + compress + matrix_inner]
+            // [ttg: transform + multiply + truncate + convolution (all pairs) + multiply + transform]
+            DeviceFunctions Kpsi_d;
+            vecfuncT Kref;   // the host exchange, for validation
+            if (hf_coeff != 0.0) {
+                START_TIMER(world);
+                {
+                    DeviceRange range("HF exchange (device)");
+                    Kpsi_d = device_exchange(world, amo_d, param.lo(), device_operator_cache(), exchange_tile);
+                }
+                END_TIMER(world, "HF exchange (device)");
+                if (validate_mra_ttg) {
+                    // as apply_potential
+                    Exchange<double, 3> K(world, this, 0);
+                    K.set_algorithm(Exchange<double, 3>::string2algorithm(param.hfexalg()));
+                    K.set_symmetric(true).set_printlevel(param.print_level());
+                    K.set_macro_task_info(MacroTaskInfo::preset("default"));
+                    K.set_macro_task_info(param.memory());
+                    K.set_batch_granularity(param.hfex_granularity());
+                    K.set_accumulation_mode(param.hfex_accumulation());
+                    K.set_cost_aware_assignment(param.hfex_cost_aware());
+                    Kref = K(amo);
+                    validate_device_functions(world, Kref, Kpsi_d, amo.front(), "exchange K psi");
+                }
+            }
+
+            // one graph from one feed of psi: V*psi, stored for the residual, and the
+            // potential-energy matrix <V psi|psi> (the kinetic matrix came with the density)
+            // [ttg: multiply_broadcast + compress + matrix_inner]
             START_TIMER(world);
             const long nmo = amo_d.size();
-            tensorT pe, kin;
+            tensorT pe;
             {
-                DeviceRange range("V*psi, PE, KE (device)");
+                DeviceRange range("V*psi, PE (device)");
                 DeviceGraph g(world);
+                const double thresh = FunctionDefaults<3>::get_thresh();
                 auto psi = g.feed(amo_d, true);
-                auto vpsi = g.apply_local_potential(vloc, psi, FunctionDefaults<3>::get_thresh());
+                // [ttg: gaxpy + truncate] vloc = vlocal + vxc, truncated (vlocal_d already is)
+                auto vloc = g.feed(vlocal_d, false);
+                if (vxc.is_initialized()) vloc = g.gaxpy(1.0, vloc, 1.0, g.load(vxc), thresh);
+                // as apply_potential: Vpsi = vloc psi - c K psi, truncated once
+                auto vpsi = g.apply_local_potential(vloc, psi, hf_coeff != 0.0 ? 0.0 : thresh);
+                DeviceGraph::Result kx_r;
+                if (hf_coeff != 0.0) {
+                    auto kpsi = g.feed(Kpsi_d, false);
+                    kx_r = g.matrix_inner(kpsi, psi);
+                    vpsi = g.gaxpy(1.0, vpsi, -hf_coeff, kpsi, thresh);
+                }
                 g.store(vpsi, Vpsi_d);
                 auto pe_r = g.matrix_inner(vpsi, psi);
-                DeviceGraph::Result kin_r;
-                if (device_only) kin_r = g.kinetic_matrix(psi);
                 g.execute();
                 pe = g.get(pe_r);
-                if (device_only) kin = g.get(kin_r);
+                if (hf_coeff != 0.0) {
+                    // the exchange energy, as apply_potential (closed shell: twice the alpha part)
+                    const tensorT kx = g.get(kx_r);
+                    double exchf = 0.0;
+                    for (long i = 0; i < nmo; ++i) exchf -= 0.5 * kx(i, i) * aocc[i];
+                    if (!xc.is_spin_polarized()) exchf *= 2.0;
+                    exc += exchf * hf_coeff;
+                }
             }
-            END_TIMER(world, "V*psi, PE, KE (device)");
+            END_TIMER(world, "V*psi, PE (device)");
             if (validate_mra_ttg) {
+                // vlocal is the device result here (see the validation of the local potential)
+                functionT vloc = copy(vlocal);
+                if (vxc.is_initialized()) vloc += vxc;
+                vloc.truncate();
                 vecfuncT ref = mul(world, vloc, amo);
+                if (hf_coeff != 0.0) gaxpy(world, 1.0, ref, -hf_coeff, Kref);
                 truncate(world, ref);
                 vecfuncT dev = device_download(world, Vpsi_d, amo.front());
                 std::vector<double> dnorm = norm2s(world, sub(world, ref, dev));

@@ -81,6 +81,8 @@ int main(int argc, char **argv) {
 #ifdef HAVE_MRA_TTG
     // MRA initializes TTG and MADNESS, must be first
     mra::initialize(argc, argv, -1);
+    // the device-kernel batch size of MRA-TTG (<= 1 disables batching), read when graphs are built
+    if (const char* bs = std::getenv("MRA_TTG_BATCH_SIZE")) mra::set_batch_size(std::stoul(bs));
 #endif
     //World &world = initialize(argc, argv);
     World& world = madness::World::get_default();

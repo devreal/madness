@@ -32,7 +32,7 @@
 /// \file device/potential.cc
 /// \brief Local potential times the orbitals, and the density, on MRA-TTG.
 
-#include "common.h"
+#include "graph_impl.h"
 #include <mutex>
 
 namespace madness {
@@ -46,29 +46,34 @@ void device_apply_local_potential(World& world, const functionT& v, DeviceFuncti
     g.execute();
 }
 
-/// sum_i occ_i psi_i^2 (cf. SCF::make_density), compressed, with the process map of `like`; psi is kept
-functionT device_density(World& world, DeviceFunctions& psi, const tensorT& occ, const functionT& like) {
+/// sum_i occ_i psi_i^2 (cf. SCF::make_density), compressed: one function
+DeviceGraph::Functions DeviceGraph::density(Functions psi, const tensorT& occ) {
     using T = double;
-    using RecEdge = ttg::Edge<mra::Key<3>, mra::FunctionsReconstructedNode<T, 3>>;
-    MraGraph g;
-    const mra::size_type N = psi.size();
+    auto& g = pimpl->g;
+    const mra::size_type N = psi.size;
+    MADNESS_CHECK_THROW(occ.size() >= long(N), "DeviceGraph::density: an occupation for every function");
     auto fns = make_mrattg_functionset(N);
-    auto db = device_domain();
     Tensor<double> w(static_cast<long>(N), 1L);
     for (long i = 0; i < long(N); ++i) w(i, 0) = occ[i];
-    NodeEdge psi_e, sq_c_e, rho_e;
+    NodeEdge sq_c_e, rho_e;
     RecEdge sq_e;
-    g.add(fv(psi).make_feed(g.control, psi_e, true, "feed_psi", device_procmap(), device_devicemap()));
     // squared straight from the compressed orbitals, without reconstructing them
-    g.add(mra::make_square_compressed<T, 3>(db, fns, g.functiondata, g.K, psi_e, sq_e, "psi^2", device_procmap(), device_devicemap()));
-    g.add(mra::make_compress(fns, g.K, false, g.functiondata, sq_e, sq_c_e, "compress_psi^2", device_procmap(), device_devicemap()));
-    g.add(mra::make_transform<T, 3>(fns, make_mrattg_functionset(1), g.K, device_matrix(w), sq_c_e, rho_e, "sum_occ", device_procmap(), device_devicemap()));
-    vecfuncT rho(1);
-    rho[0].set_impl(like, false);
-    g.add(mra::vmra::make_vmra_store(rho, rho_e, true /* add_leaves */));
+    g.add(mra::make_square_compressed<T, 3>(pimpl->domain(), fns, g.functiondata, g.K, pimpl->get(psi).compressed,
+                                            sq_e, "psi^2", device_procmap(), device_devicemap()));
+    g.add(mra::make_compress(fns, g.K, false, g.functiondata, sq_e, sq_c_e, "compress_psi^2",
+                             device_procmap(), device_devicemap()));
+    g.add(mra::make_transform<T, 3>(fns, make_mrattg_functionset(1), g.K, device_matrix(w), sq_c_e, rho_e, "sum_occ",
+                                    device_procmap(), device_devicemap()));
+    return pimpl->add_functions(rho_e, 1);
+}
+
+/// sum_i occ_i psi_i^2 (cf. SCF::make_density), compressed, with the process map of `like`; psi is kept
+functionT device_density(World& world, DeviceFunctions& psi, const tensorT& occ, const functionT& like) {
+    DeviceGraph g(world);
+    functionT rho;
+    g.store(g.density(g.feed(psi, true), occ), rho, like);
     g.execute();
-    check_device_tree(psi, "device_density feed(keep)");
-    return rho[0];
+    return rho;
 }
 
 } // namespace madness

@@ -70,11 +70,14 @@ struct DeviceFunctions::Impl {
 /// operators change every iteration, but only in their coefficients: their terms lie on a
 /// lattice independent of the orbital energy, so the next iteration's operators find all their
 /// terms in the tables of the previous ones and reuse the matrices generated so far.
+/// The Poisson operator of the exchange (lo, thresh) differs from the Coulomb operator (lo,
+/// 0.001 thresh); it is made here once per protocol, as the host Exchange makes it per call.
 struct DeviceOperatorCache {
     using ConvOp = mra::GaussianConvolutionOperator<double, 3>;
-    /// the last operator of DeviceGraph::convolution (Coulomb), and its MRA-TTG operator
-    poperatorT op;
-    std::shared_ptr<ConvOp> device_op;
+    /// the operators of DeviceGraph::convolution (Coulomb, exchange), with their MRA-TTG operators
+    std::vector<std::pair<poperatorT, std::shared_ptr<ConvOp>>> ops;
+    /// the Poisson operator of the exchange (device_exchange), made on first use
+    poperatorT exchange_op;
     /// the term tables of the last BSH operators
     std::shared_ptr<mra::GaussianTermTables<double, 3>> bsh_tables;
 };
@@ -121,13 +124,25 @@ inline void execute_mra_ttg(auto&& start, const std::vector<ttg::TTBase*>& tts =
     }
     auto connected = make_graph_executable(start.get());
     assert(connected);
-    //ttg::trace_on();
+    // Debugging aid: with MRA_TTG_TRACE set (and TTG configured with TTG_ENABLE_TRACE), every graph
+    // is traced to std::clog, between lines marking its begin and end
+    static const bool trace = std::getenv("MRA_TTG_TRACE") != nullptr;
+    static int graph_id = 0;
+    const int this_graph = graph_id++;
+    if (trace) {
+        std::clog << "=== MRA-TTG graph " << this_graph << " begin" << std::endl;
+        ttg::trace_on();
+    }
     if (ttg::default_execution_context().rank() == 0) {
       // This kicks off the entire computation
       start->invoke();
     }
     ttg::execute();
     ttg::fence();
+    if (trace) {
+        ttg::trace_off();
+        std::clog << "=== MRA-TTG graph " << this_graph << " end" << std::endl;
+    }
     {
         std::lock_guard<std::mutex> lock(m);
         done = true;

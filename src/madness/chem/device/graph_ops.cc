@@ -68,39 +68,51 @@ DeviceGraph::Functions DeviceGraph::gaxpy(double a, Functions x, double b, Funct
 }
 
 DeviceGraph::Functions DeviceGraph::apply_local_potential(const functionT& v, Functions psi, double tol) {
+    return apply_local_potential(load(v), psi, tol);
+}
+
+DeviceGraph::Functions DeviceGraph::apply_local_potential(Functions v, Functions psi, double tol) {
+    MADNESS_CHECK_THROW(v.size == 1, "DeviceGraph::apply_local_potential: one potential applies to all functions");
+    return multiply(v, psi, tol);
+}
+
+DeviceGraph::Functions DeviceGraph::multiply(Functions a, Functions b, double tol, const std::string& name) {
     using T = double;
+    MADNESS_CHECK_THROW(a.size == b.size || a.size == 1, "DeviceGraph::multiply: a must have the size of b, or 1");
     auto& g = pimpl->g;
-    const mra::size_type N = psi.size;
+    const mra::size_type N = b.size;
     auto fns = make_mrattg_functionset(N);
     RecEdge prod_e;
     NodeEdge comp_e;
-    const NodeEdge v_e = pimpl->get(load(v)).compressed;
-    // multiplied in compressed form: psi is not reconstructed for this
-    g.add(mra::make_multiply_compressed<T, 3>(pimpl->domain(), make_mrattg_functionset(1), fns, g.functiondata, g.K,
-                                              v_e, pimpl->get(psi).compressed, prod_e, "V*psi", device_procmap(), device_devicemap()));
-    add_compress(g.tts, fns, g.K, g.functiondata, prod_e, comp_e, tol, "compress_Vpsi");
+    // multiplied in compressed form: the factors are not reconstructed for this
+    g.add(mra::make_multiply_compressed<T, 3>(pimpl->domain(), make_mrattg_functionset(a.size), fns, g.functiondata,
+                                              g.K, pimpl->get(a).compressed, pimpl->get(b).compressed, prod_e,
+                                              name, device_procmap(), device_devicemap()));
+    add_compress(g.tts, fns, g.K, g.functiondata, prod_e, comp_e, tol, name + "-compress");
     return pimpl->add_functions(comp_e, N);
 }
 
 namespace {
     /// out_j = sum_i in_i U(i,j) with U fixed or from an edge, truncated with tol unless tol == 0
     template <typename UT>
-    NodeEdge add_transform(MraGraph& g, NodeEdge in, std::size_t N, std::size_t M, UT&& U, double tol) {
+    NodeEdge add_transform(MraGraph& g, NodeEdge in, std::size_t N, std::size_t M, UT&& U, double tol,
+                           const std::string& name = "transform") {
         auto fns_out = make_mrattg_functionset(M);
         NodeEdge out_e, trunc_e;
         g.add(mra::make_transform<double, 3>(make_mrattg_functionset(N), fns_out, g.K, std::forward<UT>(U), in, out_e,
-                                             "transform", device_procmap(), device_devicemap()));
+                                             name, device_procmap(), device_devicemap()));
         if (tol <= 0.0) return out_e;
         g.add(mra::make_truncate(fns_out, g.K, tol, FunctionDefaults<3>::get_truncate_mode(),
-                                 FunctionDefaults<3>::get_cell_min_width(), out_e, trunc_e, "truncate", device_procmap(), device_devicemap()));
+                                 FunctionDefaults<3>::get_cell_min_width(), out_e, trunc_e, name + "-truncate",
+                                 device_procmap(), device_devicemap()));
         return trunc_e;
     }
 }
 
-DeviceGraph::Functions DeviceGraph::transform(Functions in, const Tensor<double>& U, double tol) {
+DeviceGraph::Functions DeviceGraph::transform(Functions in, const Tensor<double>& U, double tol, const std::string& name) {
     MADNESS_CHECK_THROW(U.dim(0) == long(in.size), "DeviceGraph::transform: U must have in.size rows");
     const std::size_t M = U.dim(1);
-    return pimpl->add_functions(add_transform(pimpl->g, pimpl->get(in).compressed, in.size, M, device_matrix(U), tol), M);
+    return pimpl->add_functions(add_transform(pimpl->g, pimpl->get(in).compressed, in.size, M, device_matrix(U), tol, name), M);
 }
 
 DeviceGraph::Functions DeviceGraph::transform(Functions in, Matrix U, std::size_t M, double tol) {
