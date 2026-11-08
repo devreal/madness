@@ -2950,9 +2950,9 @@ void SCF::solve_simple(World& world) {
     // local_potential: the device applies the potential (the local part and the exchange)
     const bool local_potential = molecule.parameters.pure_ae() && !xc.is_meta()
                                  && (hf_coeff == 0.0 || !host_exchange);
-    // pairs of orbitals per exchange graph (0: all in one)
+    // pairs of orbitals per exchange graph (0: all in one); by default estimated to fit device memory
     const std::size_t exchange_tile = std::getenv("MRA_TTG_EXCHANGE_TILE")
-                                      ? std::stoul(std::getenv("MRA_TTG_EXCHANGE_TILE")) : 0;
+                                      ? std::stoul(std::getenv("MRA_TTG_EXCHANGE_TILE")) : device_exchange_auto_tile;
     const bool device_only = resident && local_potential && param.deriv() == "abgv";
     DeviceFunctions amo_d;
     // KAIN (maxsub > 1): the history of iterates and residuals as one device vector, pair s
