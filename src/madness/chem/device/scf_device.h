@@ -212,11 +212,19 @@ namespace madness {
     void device_apply_local_potential(World& world, const functionT& v, DeviceFunctions& psi,
                                       DeviceFunctions& Vpsi, double tol);
 
+    /// tile of device_exchange: chosen by device_exchange_tile
+    inline constexpr std::size_t device_exchange_auto_tile = std::size_t(-1);
+
+    /// the number of orbital pairs per exchange graph whose data fits in device memory (0: all of
+    /// them), estimated from the size of the orbitals (their nonzero nodes), k and the device memory
+    /// pools of all processes. Collective.
+    std::size_t device_exchange_tile(World& world, DeviceFunctions& psi);
+
     /// the Hartree-Fock exchange K psi_i = sum_j psi_j G(psi_j psi_i) with the Poisson operator G
-    /// (lo, thresh) of the host Exchange, in tiles of `tile` pairs i <= j (0: all in one graph);
-    /// psi is kept. G is kept in the cache.
+    /// (lo, thresh) of the host Exchange, in tiles of `tile` pairs i <= j (0: all in one graph;
+    /// device_exchange_auto_tile: see device_exchange_tile); psi is kept. G is kept in the cache.
     DeviceFunctions device_exchange(World& world, DeviceFunctions& psi, double lo, DeviceOperatorCache& cache,
-                                    std::size_t tile);
+                                    std::size_t tile = device_exchange_auto_tile);
 
     /// sum_i occ_i psi_i^2, compressed, with the process map of `like`; psi is kept
     functionT device_density(World& world, DeviceFunctions& psi, const tensorT& occ, const functionT& like);
