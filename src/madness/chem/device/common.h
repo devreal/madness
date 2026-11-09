@@ -230,12 +230,32 @@ inline auto make_batch_vector_sink(ttg::Edge<mra::Key<3>, mra::DenseTensor<doubl
     }, ttg::edges(in), ttg::edges(), name);
 }
 
+/// The number of batches the orbitals are split into in the device graphs (and every set of
+/// their size, uploaded with device_upload): each batch on its own group of processes
+/// (device_batch_groups). Process-wide, like FunctionDefaults; set it before orbitals are
+/// uploaded, with set_device_orbital_batches or MRA_TTG_ORBITAL_BATCHES (default 1).
+inline mra::Batch& device_orbital_batches_ref() {
+    static mra::Batch nb = [] {
+        const char* v = std::getenv("MRA_TTG_ORBITAL_BATCHES");
+        return mra::Batch(v ? std::max(1, std::atoi(v)) : 1);
+    }();
+    return nb;
+}
+
 /// The process groups of the batches of the SCF's function sets (mra::BatchGroups): the
-/// functions of a batch are spread over its group only. One batch on all processes until the
-/// orbitals are batched; process-wide, like FunctionDefaults.
-inline mra::BatchGroups& device_batch_groups() {
-    static mra::BatchGroups groups(1, ttg::default_execution_context().size());
-    return groups;
+/// functions of a batch are spread over its group only.
+inline mra::BatchGroups device_batch_groups() {
+    return mra::BatchGroups(device_orbital_batches_ref(), ttg::default_execution_context().size());
+}
+
+/// N orbitals (or functions of the orbitals, such as V psi) in the orbitals' batches
+inline DeviceLayout device_orbital_layout(mra::size_type N) {
+    const mra::Batch nb = device_orbital_batches_ref();
+    if (nb == 1) return one_batch(N);
+    MADNESS_CHECK_THROW(N >= mra::size_type(nb), "device_orbital_layout: fewer orbitals than batches");
+    std::vector<mra::size_type> sizes(nb);
+    for (mra::Batch b = 0; b < nb; ++b) sizes[b] = N/nb + (mra::size_type(b) < N % nb ? 1 : 0);
+    return std::make_shared<const mra::BatchLayout>(sizes, device_batch_groups());
 }
 
 /// The process map of the MRA-TTG graphs of the SCF: a node goes to the group of its batch,

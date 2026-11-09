@@ -59,8 +59,31 @@ void DeviceGraph::store(Functions f, DeviceFunctions& v) {
 DeviceGraph::Matrix DeviceGraph::decide(Result r, Decision f) {
     MADNESS_CHECK_THROW(r.id >= 0 && r.id < int(pimpl->results.size()), "DeviceGraph: invalid result handle");
     Impl::Res& res = *pimpl->results[r.id];
-    MADNESS_CHECK_THROW(res.batches == 1, "DeviceGraph::decide: a reduction in several batches is not supported yet");
     if (res.matrix) return pimpl->add_decision(*res.matrix, res.value.dim(0), res.value.dim(1), std::move(f));
+    if (res.vector && res.layout && res.layout->num_batches() > 1) {
+        // the batches' parts, gathered at the root of batch 0: each widened to the whole vector,
+        // the widened vectors summed by the input reducer of the gather task
+        const DeviceLayout layout = res.layout;
+        const long n = res.value.dim(0);
+        ttg::Edge<mra::Key<3>, std::vector<double>> wide;
+        VectorEdge gathered;
+        pimpl->g.add(ttg::make_tt([layout, n](const mra::Key<3>& key, const mra::DenseTensor<double, 1>& part) {
+            std::vector<double> w(n, 0.0);
+            const double* p = part.current_view().data();
+            std::copy(p, p + layout->batch_size(key.batch()), w.begin() + layout->offset(key.batch()));
+            ttg::send<0>(mra::Key<3>(mra::Batch(0), mra::Level(0)), std::move(w));
+        }, ttg::edges(*res.vector), ttg::edges(wide), "gather-widen"));
+        auto gather = ttg::make_tt([n](const mra::Key<3>& key, std::vector<double>&& w) {
+            mra::DenseTensor<double, 1> v{mra::size_type(n)};
+            std::copy(w.begin(), w.end(), v.buffer().host_ptr());
+            ttg::send<0>(key, std::move(v));
+        }, ttg::edges(wide), ttg::edges(gathered), "gather");
+        gather->template set_input_reducer<0>([](std::vector<double>& a, const std::vector<double>& b) {
+            for (std::size_t i = 0; i < a.size(); ++i) a[i] += b[i];
+        }, layout->num_batches());
+        pimpl->g.add(std::move(gather));
+        return pimpl->add_decision(gathered, n, 0, std::move(f));
+    }
     if (res.vector) return pimpl->add_decision(*res.vector, res.value.dim(0), 0, std::move(f));
     MADNESS_EXCEPTION("DeviceGraph::decide: this result is not a single reduction", r.id);
 }

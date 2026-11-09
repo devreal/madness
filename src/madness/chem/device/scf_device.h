@@ -177,6 +177,13 @@ namespace madness {
     /// the number of devices MRA-TTG uses per process: the largest of all processes (collective)
     int device_count(World& world);
 
+    /// The number of batches the orbitals are split into on the device (device_upload of a set of
+    /// orbitals or of functions of them): each batch is held and processed by its own group of
+    /// processes. Process-wide; set it on all processes before uploading orbitals. Default 1, or
+    /// MRA_TTG_ORBITAL_BATCHES.
+    void set_device_orbital_batches(int nbatch);
+    int device_orbital_batches();
+
     /// Adds the cost of the nodes of a device vector on this process to the load balancer:
     /// per function, 8 for a node with children and 1 for a leaf (lbcost(1, 8)). A function's
     /// leafs are not nodes of the vector; they are added as the children marked leaf.

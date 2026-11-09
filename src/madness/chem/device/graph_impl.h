@@ -73,8 +73,8 @@ struct DeviceGraph::Impl {
         std::mutex m;
         std::optional<MatrixEdge> matrix;
         std::optional<VectorEdge> vector;
-        /// the number of batches the reduction arrives in, at the root of each
-        int batches = 1;
+        /// the batches the reduction arrives in, at the root of each (vectors: norms, inner)
+        DeviceLayout layout;
     };
     std::vector<std::unique_ptr<Res>> results;
 

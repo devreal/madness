@@ -46,11 +46,14 @@ DeviceFunctions device_bsh_residual(World& world, DeviceFunctions& psi, DeviceFu
     using T = double;
     MraGraph g;
     const mra::size_type N = psi.size();
-    require_one_batch(*layout_of(psi), "device_bsh_residual");   // transforms psi with the Fock matrix
+    // in the orbitals' batches: each batch is computed by its process group; the Fock matrix must
+    // be block-diagonal in the batches (canonical orbitals: diagonal), as MRA-TTG checks
+    const DeviceLayout layout = layout_of(psi);
+    MADNESS_CHECK_THROW(same_batches(*layout, *layout_of(Vpsi)), "device_bsh_residual: psi and Vpsi in different batches");
     const T precision = FunctionDefaults<3>::get_thresh();
     const int truncate_mode = FunctionDefaults<3>::get_truncate_mode();
     const T cell_min_width = FunctionDefaults<3>::get_cell_min_width();
-    auto fns = make_mrattg_functionset(N);
+    auto fns = make_mrattg_functionset(layout);
     std::vector<poperatorT> ops = SCF::make_bsh_operators(world, eps, param);
     // the matrices of the 1D terms the previous BSH operators generated are reused
     mra::GaussianConvolutionOperator<T, 3> op(ops, cache ? cache->bsh_tables : nullptr);
@@ -77,15 +80,13 @@ DeviceFunctions device_bsh_residual(World& world, DeviceFunctions& psi, DeviceFu
     // the store of r (see mra::FunctionVector)
     g.add(mra::make_gaxpy(T(1.0), T(-1.0), fns, g.K, trunc_e, psi_e, r_e, "residual", device_procmap(), device_devicemap()));
     g.add(mra::make_norm(fns, g.K, r_e, norm_e, "residual_norm", device_procmap(), device_devicemap()));
-    rnorm.assign(N, 0.0);
-    g.add(ttg::make_tt([&rnorm, N](const mra::Key<3>& key, const mra::DenseTensor<T, 1>& n) {
-        const T* data = n.current_view().data();
-        for (mra::size_type i = 0; i < N; ++i) rnorm[i] = data[i];
-    }, ttg::edges(norm_e), ttg::edges(), "residual_norm_sink"));
-    g.add(fv(r).make_store(r_e, N, "store_r", device_procmap(), device_devicemap()));
+    Tensor<double> norms{long(N)};   // per batch, at its offset
+    g.add(make_batch_vector_sink(norm_e, norms, layout, "residual_norm_sink"));
+    g.add(fv(r).make_store(r_e, N, "store_r", device_procmap(), device_devicemap(), layout));
     g.execute();
     check_device_tree(r, "device_bsh_residual");
-    world.gop.sum(rnorm.data(), rnorm.size());
+    world.gop.sum(norms.ptr(), norms.size());
+    rnorm.assign(norms.ptr(), norms.ptr() + norms.size());
     return r;
 }
 
