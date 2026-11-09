@@ -103,6 +103,39 @@ int test_curve(World& world) {
     return t.end();
 }
 
+/// A cut shared by a group of processes (SFCPmap::group_part): the group's members and their
+/// devices take the parts in contiguous blocks; a group of all processes gets (owner, device).
+/// On a map made up here of 6 processes with 2 devices each, 12 parts tiling the curve.
+int test_group_part(World& world) {
+    test_output t("SFCPmap::group_part");
+    const int nproc = 6, ndevice = 2, nparts = nproc*ndevice;
+    std::vector<std::pair<uint64_t,int>> pieces;
+    const uint64_t extent = SFCCode<D>::extent(Key<D>(0));
+    for (int q = 0; q < nparts; ++q) pieces.emplace_back(q*(extent/nparts), q);
+    const SFCPmap<D> map(pieces, nproc, ndevice);
+
+    bool identity = true, ranges = true, blocks = true;
+    const Translation m = 16;
+    for (Translation x = 0; x < m; ++x)
+        for (Translation y = 0; y < m; ++y)
+            for (Translation z = 0; z < m; ++z) {
+                const Key<D> key(4, Vector<Translation,D>{x, y, z});
+                const int q = map.part_of(key);
+                const auto [p, d] = map.group_part(key, nproc);
+                identity = identity && p == map.owner(key) && d == map.device(key);
+                for (int size : {1, 2, 3, 4, 5}) {
+                    const auto [member, dev] = map.group_part(key, size);
+                    ranges = ranges && member >= 0 && member < size && dev >= 0 && dev < ndevice;
+                    // a divisor of nproc: each slot of the group takes nproc/size consecutive parts
+                    if (nproc % size == 0) blocks = blocks && member*ndevice + dev == q/(nproc/size);
+                }
+            }
+    t.checkpoint(identity, "a group of all processes: owner and device");
+    t.checkpoint(ranges, "members and devices in range");
+    t.checkpoint(blocks, "contiguous blocks of parts per member and device");
+    return t.end();
+}
+
 /// Every process builds the same map, every key maps to a valid process and device, and
 /// the cost is balanced across processes and devices.
 int test_map(World& world, const std::vector<Function<double,D>>& v, int ndevice, double fac) {
@@ -205,6 +238,7 @@ int main(int argc, char** argv) {
     {
         std::vector<Function<double,D>> v = make_functions(world);
         success += test_curve(world);
+        success += test_group_part(world);
         success += test_map(world, v, 1, 4.0);
         success += test_map(world, v, 3, 4.0);
         success += test_redistribute(world, v);

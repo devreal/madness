@@ -143,6 +143,7 @@ namespace madness {
     class SFCPmap : public WorldDCPmapInterface< Key<NDIM> > {
         std::vector<uint64_t> start;    ///< first code of each piece, ascending, start[0] == 0
         std::vector<int> part;          ///< the piece's part, process*ndevice + device
+        int nproc;
         int ndevice;
         std::vector<double> part_cost;  ///< cost assigned to each part by the load balancer
 
@@ -152,14 +153,16 @@ namespace madness {
         }
 
     public:
-        /// pieces: (first code, part) in ascending order of codes, the first at code 0
-        SFCPmap(const std::vector<std::pair<uint64_t,int>>& pieces, int ndevice,
+        /// pieces: (first code, part) in ascending order of codes, the first at code 0, with parts
+        /// in [0, nproc*ndevice)
+        SFCPmap(const std::vector<std::pair<uint64_t,int>>& pieces, int nproc, int ndevice,
                 std::vector<double> part_cost = {})
-            : ndevice(ndevice), part_cost(std::move(part_cost)) {
-            MADNESS_CHECK_THROW(ndevice > 0, "SFCPmap: need at least one device per process");
+            : nproc(nproc), ndevice(ndevice), part_cost(std::move(part_cost)) {
+            MADNESS_CHECK_THROW(nproc > 0 && ndevice > 0, "SFCPmap: need at least one process and device");
             MADNESS_CHECK_THROW(!pieces.empty() && pieces.front().first == 0, "SFCPmap: the first piece must start at 0");
             for (const auto& [c, p] : pieces) {
                 MADNESS_CHECK_THROW(start.empty() || c > start.back(), "SFCPmap: pieces must ascend");
+                MADNESS_CHECK_THROW(p >= 0 && p < nproc*ndevice, "SFCPmap: part out of range");
                 start.push_back(c);
                 part.push_back(p);
             }
@@ -171,6 +174,22 @@ namespace madness {
         int device(const Key<NDIM>& key) const { return find(key)%ndevice; }
 
         int num_devices() const { return ndevice; }
+
+        int num_processes() const { return nproc; }
+
+        /// the part, process*num_devices() + device, that key belongs to
+        int part_of(const Key<NDIM>& key) const { return find(key); }
+
+        /// The part of key when the cut is shared by a group of `size` processes (and their
+        /// devices), as (member of the group in [0, size), device): the group's members and
+        /// devices take the parts in contiguous blocks, in order, so they get about equal shares
+        /// of the cost, exactly when size divides the number of processes. A group of all
+        /// processes gets (owner, device).
+        std::pair<int,int> group_part(const Key<NDIM>& key, int size) const {
+            MADNESS_ASSERT(size > 0 && size <= nproc);
+            const long s = long(find(key)) * size / nproc;   // in [0, size*ndevice)
+            return {int(s / ndevice), int(s % ndevice)};
+        }
 
         /// number of contiguous pieces of the curve
         std::size_t num_pieces() const { return start.size(); }
@@ -615,7 +634,7 @@ namespace madness {
             }
             world.gop.broadcast_serializable(cut, 0);
             world.gop.fence();
-            return std::make_shared< SFCPmap<NDIM> >(cut.first, ndevice, std::move(cut.second));
+            return std::make_shared< SFCPmap<NDIM> >(cut.first, nproc, ndevice, std::move(cut.second));
         }
 
         /// Actually does the partitioning of the tree

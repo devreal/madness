@@ -197,26 +197,50 @@ inline void check_device_tree(DeviceFunctions& d, const char* what) {
     if (bad) report_tree(snap, what);
 }
 
-/// The process map of the MRA-TTG graphs of the SCF: MADNESS's (FunctionDefaults<3>), so a
-/// node is on the process that holds it in MADNESS, and loading and storing host functions
-/// stays on the process. Device vectors hold their nodes on the process the map gives them
-/// when stored; fed into a graph after the map changed (SCF::loadbal), they move to it.
+/// The process groups of the batches of the SCF's function sets (mra::BatchGroups): the
+/// functions of a batch are spread over its group only. One batch on all processes until the
+/// orbitals are batched; process-wide, like FunctionDefaults.
+inline mra::BatchGroups& device_batch_groups() {
+    static mra::BatchGroups groups(1, ttg::default_execution_context().size());
+    return groups;
+}
+
+/// The process map of the MRA-TTG graphs of the SCF: a node goes to the group of its batch,
+/// and within it where MADNESS's process map (FunctionDefaults<3>) puts it, shared by the
+/// group: with an SFCPmap the group's members take its parts in contiguous blocks
+/// (SFCPmap::group_part). A group of all processes uses MADNESS's map as it is, so a node
+/// is on the process that holds it in MADNESS and loading and storing host functions stays
+/// on the process. Device vectors hold their nodes on the process the map gives them when
+/// stored; fed into a graph after the map changed (SCF::loadbal), they move to it.
 struct DeviceProcMap {
     std::shared_ptr<WorldDCPmapInterface<Key<3>>> pmap = FunctionDefaults<3>::get_pmap();
-    int operator()(const mra::Key<3>& key) const { return pmap->owner(key.to_madness_key()); }
+    std::shared_ptr<const SFCPmap<3>> sfc = std::dynamic_pointer_cast<const SFCPmap<3>>(pmap);
+    mra::BatchGroups groups = device_batch_groups();
+    int operator()(const mra::Key<3>& key) const {
+        const Key<3> k = key.to_madness_key();
+        const auto [first, last] = groups.batch_pes(key.batch());
+        const int size = last - first;
+        if (size == groups.num_pes()) return pmap->owner(k);
+        if (sfc) return first + sfc->group_part(k, size).first;
+        return first + pmap->owner(k) % size;
+    }
 };
 
-/// The device of a node within its process: as the map assigns it (SFCPmap::device) or,
-/// for a map without devices, by a hash of the node's ancestor at a coarse level, so that
-/// nearby nodes share a device.
+/// The device of a node within its process: as the map assigns it (SFCPmap::device, within
+/// the batch's group as SFCPmap::group_part) or, for a map without devices, by a hash of the
+/// node's ancestor at a coarse level, so that nearby nodes share a device.
 struct DeviceDevMap {
     std::shared_ptr<const SFCPmap<3>> sfc =
         std::dynamic_pointer_cast<const SFCPmap<3>>(FunctionDefaults<3>::get_pmap());
+    mra::BatchGroups groups = device_batch_groups();
     int ndevice;
     explicit DeviceDevMap(int ndevice) : ndevice(ndevice) {}
     int operator()(const mra::Key<3>& key) const {
         const Key<3> k = key.to_madness_key();
-        if (sfc) return sfc->device(k) % ndevice;
+        if (sfc) {
+            const auto [first, last] = groups.batch_pes(key.batch());
+            return sfc->group_part(k, last - first).second % ndevice;
+        }
         constexpr Level coarse = 3;
         return int((k.level() <= coarse ? k : k.parent(k.level() - coarse)).hash() % ndevice);
     }
