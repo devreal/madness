@@ -28,7 +28,9 @@
 /// transform block-diagonal in the batches, normalization (a decision from the norms of all
 /// batches), the update psi_i - c_i r_i, a linear combination of sets, and the density (partial
 /// densities of the batches summed into one function on all processes) with its Coulomb
-/// potential. Operations that combine batches (matrix_inner) must refuse several.
+/// potential, matrices of inner products across the batches (<psi_i|V psi_j>, <psi_i|psi_j>, the
+/// kinetic matrix against one batch) and a decision from such a matrix. Operations that combine
+/// batches otherwise (concat) must refuse several.
 ///
 /// Options (key=value): n (orbitals, 5), k (6), thresh (1e-5), L (20), seed (1), tol (relative
 /// tolerance, 1e-10), ctol (of the Coulomb potential, 1e-6). Exit code 0 if every check passes.
@@ -135,6 +137,7 @@ int run(World& world, const std::map<std::string, std::string>& args) {
     const functionT like = psi.front();
     poperatorT coulop(CoulombOperatorPtr(world, 1e-6, thresh));
 
+    Tensor<double> kin_one;   // the kinetic matrix with one batch
     for (int nb : {1, 2, 3}) {
         if (nb > N) continue;
         set_device_orbital_batches(nb);
@@ -254,17 +257,63 @@ int run(World& world, const std::map<std::string, std::string>& args) {
             check(world, dv < ctol, tag + "Coulomb potential of the density", dv, ctol);
         }
 
-        // matrices of inner products combine batches: not supported yet
+        // matrices of inner products across the batches: <psi_i|V psi_j>, and <psi_i|psi_j> (one set)
+        {
+            Tensor<double> pv, pp;
+            {
+                DeviceGraph g(world);
+                auto f = g.feed(psi_d, true);
+                auto rpv = g.matrix_inner(f, g.feed(Vpsi_d, true));
+                auto rpp = g.matrix_inner(f, f);
+                g.execute();
+                pv = g.get(rpv);
+                pp = g.get(rpp);
+            }
+            const Tensor<double> pv_ref = matrix_inner(world, psi, Vpsi), pp_ref = matrix_inner(world, psi, psi);
+            check(world, (pv - pv_ref).absmax() < tol * pv_ref.absmax(), tag + "<psi_i|V psi_j>",
+                  (pv - pv_ref).absmax(), tol * pv_ref.absmax());
+            check(world, (pp - pp_ref).absmax() < tol, tag + "<psi_i|psi_j>", (pp - pp_ref).absmax(), tol);
+        }
+
+        // the kinetic matrix (derivatives per batch, the matrix across them), against one batch
+        {
+            const Tensor<double> kin = device_kinetic_matrix(world, psi_d);
+            if (nb == 1) kin_one = copy(kin);
+            const double dk = (kin - kin_one).absmax();
+            check(world, dk < tol * kin_one.absmax(), tag + "kinetic matrix, against one batch", dk, tol * kin_one.absmax());
+        }
+
+        // a decision from a matrix of all batches (the overlap): psi_i / sqrt(S_ii)
+        {
+            vecfuncT ref = copy(world, psi);
+            normalize(world, ref);
+            DeviceFunctions n_d;
+            {
+                DeviceGraph g(world);
+                auto f = g.feed(psi_d, true);
+                auto D = g.decide(g.matrix_inner(f, f), [](const Tensor<double>& S) {
+                    Tensor<double> d(S.dim(0), S.dim(0));
+                    for (long i = 0; i < S.dim(0); ++i) d(i, i) = 1.0 / std::sqrt(S(i, i));
+                    return d;
+                });
+                g.store(g.transform(f, D, N, 0.0), n_d);
+                g.execute();
+            }
+            check(world, rel_diff(world, ref, n_d, like) < tol, tag + "decision from the overlap of all batches",
+                  rel_diff(world, ref, n_d, like), tol);
+        }
+
+        // concatenation combines batches: not supported yet
         if (nb > 1) {
             bool refused = false;
             try {
                 DeviceGraph g(world);
                 auto f = g.feed(psi_d, true);
-                g.matrix_inner(f, f);
+                g.concat(f, g.feed(Vpsi_d, true));
             } catch (const std::exception&) {
                 refused = true;
             }
-            check(world, refused, tag + "matrix_inner refuses several batches", refused ? 0 : 1, 0);
+            check(world, refused, tag + "concat refuses several batches", refused ? 0 : 1, 0);
         }
     }
     set_device_orbital_batches(1);

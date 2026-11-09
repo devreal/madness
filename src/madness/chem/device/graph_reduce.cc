@@ -38,22 +38,76 @@ namespace madness {
 
 void DeviceGraph::Impl::add_matrix_sink(MatrixEdge e, Res& r, double fac, const std::string& name) {
     g.add(ttg::make_tt([&r, fac](const mra::Key<3>& key, const mra::DenseTensor<double, 2>& m) {
-        const double* data = m.current_view().data();
         std::lock_guard<std::mutex> lock(r.m);
-        for (long i = 0; i < r.value.size(); ++i) r.value.ptr()[i] += fac * data[i];
+        r.place(key, m.current_view().data(), r.value, fac);
     }, ttg::edges(e), ttg::edges(), name));
 }
 
+MatrixEdge DeviceGraph::Impl::add_matrix_inner(NodeEdge a, const DeviceLayout& la, NodeEdge b, const DeviceLayout& lb,
+                                                bool same, Res& r, double fac, const std::string& name) {
+    MatrixEdge m_e;
+    if (la->num_batches() == 1 && lb->num_batches() == 1) {
+        g.add(mra::make_matrix_inner<double, 3>(make_mrattg_functionset(la), make_mrattg_functionset(lb), g.K, a,
+                                                same ? a : b, m_e, name, device_procmap(la), device_devicemap(la),
+                                                inner_group));
+        r.arrivals += 1;
+        r.place = [](const mra::Key<3>&, const double* d, Tensor<double>& into, double f) {
+            for (long i = 0; i < into.size(); ++i) into.ptr()[i] += f * d[i];
+        };
+        add_matrix_sink(m_e, r, fac, name + "-sink");
+        return m_e;
+    }
+    // The pairs of batches (ba, bb), for a set with itself ba <= bb (the other half mirrored). A
+    // pair is computed under its own key (batch p) by the group of its home batch, one of ba and
+    // bb: the nodes of the home batch stay on their processes, those of the other are sent there.
+    // For a set with itself the home alternates, so that each batch is home to about half its pairs.
+    std::vector<std::pair<mra::Batch, mra::Batch>> pairs;
+    std::vector<std::pair<int, int>> ranges;
+    std::vector<mra::size_type> sizes_a, sizes_b;
+    auto ta = std::make_shared<std::vector<std::vector<mra::Batch>>>(la->num_batches());
+    auto tb = std::make_shared<std::vector<std::vector<mra::Batch>>>(lb->num_batches());
+    for (mra::Batch ba = 0; ba < la->num_batches(); ++ba) {
+        for (mra::Batch bb = same ? ba : 0; bb < lb->num_batches(); ++bb) {
+            const mra::Batch p = mra::Batch(pairs.size());
+            MADNESS_CHECK_THROW(pairs.size() < 32767, "DeviceGraph: too many pairs of batches for a matrix");
+            pairs.emplace_back(ba, bb);
+            const bool home_b = same && ((ba + bb) % 2 == 1);
+            ranges.push_back(home_b ? lb->groups().batch_pes(bb) : la->groups().batch_pes(ba));
+            sizes_a.push_back(la->batch_size(ba));
+            sizes_b.push_back(lb->batch_size(bb));
+            (*ta)[ba].push_back(p);
+            (*tb)[bb].push_back(p);
+        }
+    }
+    const mra::BatchGroups pg(ranges, la->num_pes());
+    const DeviceLayout pa = std::make_shared<const mra::BatchLayout>(sizes_a, pg);
+    const DeviceLayout pb = std::make_shared<const mra::BatchLayout>(sizes_b, pg);
+    NodeEdge a_p, b_p;
+    g.add(mra::make_rebatch<double, 3>(a, a_p, [ta](mra::Batch x) { return (*ta)[x]; }, name + "-pairs-a",
+                                       device_procmap(la), device_devicemap(la)));
+    g.add(mra::make_rebatch<double, 3>(b, b_p, [tb](mra::Batch x) { return (*tb)[x]; }, name + "-pairs-b",
+                                       device_procmap(lb), device_devicemap(lb)));
+    g.add(mra::make_matrix_inner<double, 3>(make_mrattg_functionset(pa), make_mrattg_functionset(pb), g.K, a_p, b_p,
+                                            m_e, name, device_procmap(pa), device_devicemap(pa), inner_group));
+    r.arrivals += int(pairs.size());
+    r.place = [pairs, la, lb, same](const mra::Key<3>& key, const double* d, Tensor<double>& into, double f) {
+        const auto [ba, bb] = pairs[key.batch()];
+        const long oa = la->offset(ba), na = la->batch_size(ba), ob = lb->offset(bb), nb = lb->batch_size(bb);
+        for (long i = 0; i < na; ++i) {
+            for (long j = 0; j < nb; ++j) {
+                into(oa + i, ob + j) += f * d[i*nb + j];
+                if (same && ba != bb) into(ob + j, oa + i) += f * d[i*nb + j];
+            }
+        }
+    };
+    add_matrix_sink(m_e, r, fac, name + "-sink");
+    return m_e;
+}
+
 DeviceGraph::Result DeviceGraph::matrix_inner(Functions a, Functions b) {
-    require_one_batch(*pimpl->get(a).layout, "DeviceGraph::matrix_inner");
-    require_one_batch(*pimpl->get(b).layout, "DeviceGraph::matrix_inner");
-    auto& g = pimpl->g;
     Impl::Res& r = pimpl->add_result(long(a.size), long(b.size));
-    r.matrix.emplace();
-    g.add(mra::make_matrix_inner<double, 3>(make_mrattg_functionset(a.size), make_mrattg_functionset(b.size), g.K,
-                                            pimpl->get(a).compressed, pimpl->get(b).compressed, *r.matrix,
-                                            "matrix_inner", device_procmap(), device_devicemap(), pimpl->inner_group));
-    pimpl->add_matrix_sink(*r.matrix, r, 1.0, "matrix_inner_sink");
+    r.matrix = pimpl->add_matrix_inner(pimpl->get(a).compressed, pimpl->get(a).layout, pimpl->get(b).compressed,
+                                       pimpl->get(b).layout, a.id == b.id, r, 1.0, "matrix_inner");
     return Result{int(pimpl->results.size()) - 1};
 }
 
@@ -88,23 +142,21 @@ DeviceGraph::Result DeviceGraph::kinetic_matrix(Functions psi) {
     using T = double;
     auto& g = pimpl->g;
     const mra::size_type N = psi.size;
-    require_one_batch(*pimpl->get(psi).layout, "DeviceGraph::kinetic_matrix");
-    auto fns = make_mrattg_functionset(N);
+    // per batch: the derivatives and their compression; then the matrix across the batches
+    const DeviceLayout layout = pimpl->get(psi).layout;
+    auto fns = make_mrattg_functionset(layout);
     Impl::Res& r = pimpl->add_result(long(N), long(N));
     mra::BatchGroup compress_group;   // the three axes batch together
     // the three derivatives in one descent over the compressed orbitals, which are not reconstructed
     std::array<RecEdge, 3> d_e;
     g.add(mra::make_gradient_compressed<T, 3>(pimpl->domain(), fns, g.functiondata, g.K, pimpl->get(psi).compressed,
-                                              d_e, "gradient", device_procmap(), device_devicemap()));
+                                              d_e, "gradient", device_procmap(layout), device_devicemap(layout)));
     for (mra::Dimension axis = 0; axis < 3; ++axis) {
         const std::string name = "d" + std::to_string(axis);
         NodeEdge dc_e;
-        MatrixEdge m_e;
         g.add(mra::make_compress(fns, g.K, false, g.functiondata, d_e[axis], dc_e, "compress_" + name,
-                                 device_procmap(), device_devicemap(), false, T{}, 0, T{}, compress_group));
-        g.add(mra::make_matrix_inner<T, 3>(fns, fns, g.K, dc_e, dc_e, m_e, "inner_" + name,
-                                           device_procmap(), device_devicemap(), pimpl->inner_group));
-        pimpl->add_matrix_sink(m_e, r, 0.5, "sink_" + name);
+                                 device_procmap(layout), device_devicemap(layout), false, T{}, 0, T{}, compress_group));
+        pimpl->add_matrix_inner(dc_e, layout, dc_e, layout, true, r, 0.5, "inner_" + name);
     }
     return Result{int(pimpl->results.size()) - 1};
 }

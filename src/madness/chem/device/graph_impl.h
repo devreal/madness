@@ -75,6 +75,10 @@ struct DeviceGraph::Impl {
         std::optional<VectorEdge> vector;
         /// the batches the reduction arrives in, at the root of each (vectors: norms, inner)
         DeviceLayout layout;
+        /// matrices: the number of blocks that arrive (one per pair of batches, and reduction),
+        /// and where a block arriving at the root of a pair goes in the whole matrix
+        int arrivals = 0;
+        std::function<void(const mra::Key<3>&, const double*, Tensor<double>&, double)> place;
     };
     std::vector<std::unique_ptr<Res>> results;
 
@@ -114,8 +118,15 @@ struct DeviceGraph::Impl {
         return r;
     }
 
-    /// sink a matrix arriving at the root into r.value, scaled by fac and accumulated (graph_reduce.cc)
+    /// sink the blocks of a matrix arriving at the roots into r.value (r.place), scaled by fac
+    /// and accumulated (graph_reduce.cc)
     void add_matrix_sink(MatrixEdge e, Res& r, double fac, const std::string& name);
+
+    /// <a_i|b_j> into r (scaled by fac and accumulated; same: a and b are the same set). With
+    /// sets in several batches, block (ba, bb) is computed by the group of one of the batches,
+    /// to which the other one's nodes are sent (graph_reduce.cc). Returns the edge of the blocks.
+    MatrixEdge add_matrix_inner(NodeEdge a, const DeviceLayout& la, NodeEdge b, const DeviceLayout& lb, bool same,
+                                Res& r, double fac, const std::string& name);
 
     /// a task at the root computing a matrix on the host from the reduction arriving on `in`
     template <typename InT>

@@ -60,6 +60,29 @@ void DeviceGraph::store(Functions f, DeviceFunctions& v) {
 DeviceGraph::Matrix DeviceGraph::decide(Result r, Decision f) {
     MADNESS_CHECK_THROW(r.id >= 0 && r.id < int(pimpl->results.size()), "DeviceGraph: invalid result handle");
     Impl::Res& res = *pimpl->results[r.id];
+    if (res.matrix && res.arrivals > 1) {
+        // the blocks of the pairs of batches, gathered at the root of batch 0: each widened to the
+        // whole matrix, the widened matrices summed by the input reducer of the gather task
+        const long rows = res.value.dim(0), cols = res.value.dim(1);
+        auto place = res.place;
+        ttg::Edge<mra::Key<3>, std::vector<double>> wide;
+        MatrixEdge gathered;
+        pimpl->g.add(ttg::make_tt([place, rows, cols](const mra::Key<3>& key, const mra::DenseTensor<double, 2>& block) {
+            Tensor<double> w(rows, cols);
+            place(key, block.current_view().data(), w, 1.0);
+            ttg::send<0>(mra::Key<3>(mra::Batch(0), mra::Level(0)), std::vector<double>(w.ptr(), w.ptr() + w.size()));
+        }, ttg::edges(*res.matrix), ttg::edges(wide), "gather-widen"));
+        auto gather = ttg::make_tt([rows, cols](const mra::Key<3>& key, std::vector<double>&& w) {
+            mra::DenseTensor<double, 2> m(std::array<mra::size_type, 2>{mra::size_type(rows), mra::size_type(cols)});
+            std::copy(w.begin(), w.end(), m.buffer().host_ptr());
+            ttg::send<0>(key, std::move(m));
+        }, ttg::edges(wide), ttg::edges(gathered), "gather");
+        gather->template set_input_reducer<0>([](std::vector<double>& a, const std::vector<double>& b) {
+            for (std::size_t i = 0; i < a.size(); ++i) a[i] += b[i];
+        }, res.arrivals);
+        pimpl->g.add(std::move(gather));
+        return pimpl->add_decision(gathered, rows, cols, std::move(f));
+    }
     if (res.matrix) return pimpl->add_decision(*res.matrix, res.value.dim(0), res.value.dim(1), std::move(f));
     if (res.vector && res.layout && res.layout->num_batches() > 1) {
         // the batches' parts, gathered at the root of batch 0: each widened to the whole vector,
