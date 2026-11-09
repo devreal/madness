@@ -59,10 +59,11 @@ struct DeviceGraph::Impl {
     /// the instances of an operation in this graph batch their device tasks together
     mra::BatchGroup concat_group, inner_group;
 
-    /// a set of functions: compressed nodes
+    /// a set of functions: compressed nodes, in the batches of layout
     struct Fn {
         NodeEdge compressed;
         std::size_t N;
+        DeviceLayout layout;
     };
     std::vector<Fn> fns;
 
@@ -72,6 +73,8 @@ struct DeviceGraph::Impl {
         std::mutex m;
         std::optional<MatrixEdge> matrix;
         std::optional<VectorEdge> vector;
+        /// the number of batches the reduction arrives in, at the root of each
+        int batches = 1;
     };
     std::vector<std::unique_ptr<Res>> results;
 
@@ -91,10 +94,13 @@ struct DeviceGraph::Impl {
         return *db;
     }
 
-    Functions add_functions(NodeEdge e, std::size_t N) {
-        fns.push_back(Fn{e, N});
-        return Functions{int(fns.size()) - 1, N};
+    Functions add_functions(NodeEdge e, const DeviceLayout& layout) {
+        fns.push_back(Fn{e, layout->num_functions(), layout});
+        return Functions{int(fns.size()) - 1, layout->num_functions()};
     }
+
+    /// N functions in one batch
+    Functions add_functions(NodeEdge e, std::size_t N) { return add_functions(e, one_batch(N)); }
 
     Fn& get(Functions f) {
         MADNESS_CHECK_THROW(f.id >= 0 && f.id < int(fns.size()), "DeviceGraph: invalid functions handle");

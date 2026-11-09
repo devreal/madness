@@ -46,6 +46,7 @@ DeviceFunctions device_bsh_residual(World& world, DeviceFunctions& psi, DeviceFu
     using T = double;
     MraGraph g;
     const mra::size_type N = psi.size();
+    require_one_batch(*layout_of(psi), "device_bsh_residual");   // transforms psi with the Fock matrix
     const T precision = FunctionDefaults<3>::get_thresh();
     const int truncate_mode = FunctionDefaults<3>::get_truncate_mode();
     const T cell_min_width = FunctionDefaults<3>::get_cell_min_width();

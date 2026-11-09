@@ -52,6 +52,7 @@ DeviceGraph::Functions DeviceGraph::density(Functions psi, const tensorT& occ) {
     auto& g = pimpl->g;
     const mra::size_type N = psi.size;
     MADNESS_CHECK_THROW(occ.size() >= long(N), "DeviceGraph::density: an occupation for every function");
+    require_one_batch(*pimpl->get(psi).layout, "DeviceGraph::density");   // sums over all functions
     auto fns = make_mrattg_functionset(N);
     Tensor<double> w(static_cast<long>(N), 1L);
     for (long i = 0; i < long(N); ++i) w(i, 0) = occ[i];

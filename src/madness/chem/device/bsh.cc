@@ -62,8 +62,7 @@ vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
     DeviceOperatorCache& cache = device_operator_cache();
     mra::GaussianConvolutionOperator<T, NDIM> op(ops, cache.bsh_tables);
     cache.bsh_tables = op.term_tables();
-    auto pmap = mra::make_procmap<NDIM>(N, 1 /* batch */);
-    auto gaussians = mra::make_functionset<mra::Gaussian<T, NDIM>>(pmap.batch_manager());
+    auto gaussians = make_mrattg_functionset(N);
 
     /* create the result function vector (new psi, or the residual); share impl for process-map ownership */
     vecfuncT result(N);

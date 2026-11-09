@@ -114,8 +114,9 @@ DeviceFunctions device_upload(World& world, const vecfuncT& f) {
     MraGraph g;
     NodeEdge e;
     DeviceFunctions d;
-    load_compressed_mrattg(f, make_mrattg_functionset(f.size()), g.K, g.functiondata, g.control, e, g.tts, "upload");
-    g.add(fv(d).make_store(e, f.size(), "upload_store", device_procmap(), device_devicemap()));
+    const DeviceLayout layout = one_batch(f.size());
+    load_compressed_mrattg(f, make_mrattg_functionset(layout), g.K, g.functiondata, g.control, e, g.tts, "upload");
+    g.add(fv(d).make_store(e, f.size(), "upload_store", device_procmap(), device_devicemap(), layout));
     g.execute();
     check_device_tree(d, "device_upload");
     return d;
@@ -127,8 +128,10 @@ vecfuncT device_download(World& world, DeviceFunctions& d, const functionT& like
     NodeEdge e;
     vecfuncT out(d.size());
     for (auto& f : out) f.set_impl(like, false);
+    const DeviceLayout layout = layout_of(d);
     g.add(fv(d).make_feed(g.control, e, true /* keep */, "download", device_procmap(), device_devicemap()));
-    g.add(mra::vmra::make_vmra_store(out, e, true /* add_leaves */));
+    g.add(mra::vmra::make_vmra_store(out, e, true /* add_leaves */, madness::TreeState::compressed, "download_store",
+                                     layout));
     g.execute();
     return out;
 }
@@ -175,6 +178,7 @@ DeviceFunctions device_transformed(World& world, DeviceFunctions& v, const Tenso
     MraGraph g;
     const mra::size_type N = v.size(), M = U.dim(1);
     MADNESS_CHECK_THROW(U.dim(0) == long(N), "device_transformed: U must have v.size() rows");
+    require_one_batch(*layout_of(v), "device_transformed");
     auto fns_out = make_mrattg_functionset(M);
     NodeEdge in_e, out_e, trunc_e;
     DeviceFunctions out;
@@ -198,6 +202,7 @@ std::vector<double> device_transform_norms(World& world, DeviceFunctions& v, con
     MraGraph g;
     const mra::size_type N = v.size(), M = U.dim(1);
     MADNESS_CHECK_THROW(U.dim(0) == long(N), "device_transform_norms: U must have v.size() rows");
+    require_one_batch(*layout_of(v), "device_transform_norms");
     auto fns_out = make_mrattg_functionset(M);
     NodeEdge in_e, out_e;
     ttg::Edge<mra::Key<3>, mra::DenseTensor<T, 1>> norm_e;
@@ -239,6 +244,7 @@ void device_normalize(World& world, DeviceFunctions& v) {
 void device_update(World& world, DeviceFunctions& a, DeviceFunctions& r, const std::vector<double>& c) {
     MraGraph g;
     const mra::size_type N = a.size();
+    require_one_batch(*layout_of(a), "device_update");   // a diagonal transform, of a single batch for now
     auto fns = make_mrattg_functionset(N);
     Tensor<double> D(static_cast<long>(N), static_cast<long>(N));
     for (mra::size_type i = 0; i < N; ++i) D(i, i) = c[i];

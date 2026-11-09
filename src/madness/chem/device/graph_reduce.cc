@@ -45,6 +45,8 @@ void DeviceGraph::Impl::add_matrix_sink(MatrixEdge e, Res& r, double fac, const 
 }
 
 DeviceGraph::Result DeviceGraph::matrix_inner(Functions a, Functions b) {
+    require_one_batch(*pimpl->get(a).layout, "DeviceGraph::matrix_inner");
+    require_one_batch(*pimpl->get(b).layout, "DeviceGraph::matrix_inner");
     auto& g = pimpl->g;
     Impl::Res& r = pimpl->add_result(long(a.size), long(b.size));
     r.matrix.emplace();
@@ -57,27 +59,28 @@ DeviceGraph::Result DeviceGraph::matrix_inner(Functions a, Functions b) {
 
 DeviceGraph::Result DeviceGraph::inner(Functions a, Functions b) {
     MADNESS_CHECK_THROW(a.size == b.size, "DeviceGraph::inner: a and b must have the same size");
+    const DeviceLayout layout = pimpl->get(a).layout;
+    MADNESS_CHECK_THROW(same_batches(*layout, *pimpl->get(b).layout), "DeviceGraph::inner: a and b in different batches");
     auto& g = pimpl->g;
     Impl::Res& r = pimpl->add_result(long(a.size), 0);
     r.vector.emplace();
-    g.add(mra::make_inner<double, 3>(make_mrattg_functionset(a.size), g.K, pimpl->get(a).compressed,
+    r.batches = layout->num_batches();
+    g.add(mra::make_inner<double, 3>(make_mrattg_functionset(layout), g.K, pimpl->get(a).compressed,
                                      pimpl->get(b).compressed, *r.vector, "inner", device_procmap(),
                                      device_devicemap(), pimpl->inner_group));
-    g.add(ttg::make_tt([&r](const mra::Key<3>& key, const mra::DenseTensor<double, 1>& v) {
-        std::copy(v.current_view().data(), v.current_view().data() + r.value.size(), r.value.ptr());
-    }, ttg::edges(*r.vector), ttg::edges(), "inner_sink"));
+    g.add(make_batch_vector_sink(*r.vector, r.value, layout, "inner_sink"));
     return Result{int(pimpl->results.size()) - 1};
 }
 
 DeviceGraph::Result DeviceGraph::norms(Functions a) {
     auto& g = pimpl->g;
+    const DeviceLayout layout = pimpl->get(a).layout;
     Impl::Res& r = pimpl->add_result(long(a.size), 0);
     r.vector.emplace();
-    g.add(mra::make_norm(make_mrattg_functionset(a.size), g.K, pimpl->get(a).compressed, *r.vector, "norm",
+    r.batches = layout->num_batches();
+    g.add(mra::make_norm(make_mrattg_functionset(layout), g.K, pimpl->get(a).compressed, *r.vector, "norm",
                          device_procmap(), device_devicemap()));
-    g.add(ttg::make_tt([&r](const mra::Key<3>& key, const mra::DenseTensor<double, 1>& n) {
-        std::copy(n.current_view().data(), n.current_view().data() + r.value.size(), r.value.ptr());
-    }, ttg::edges(*r.vector), ttg::edges(), "norm_sink"));
+    g.add(make_batch_vector_sink(*r.vector, r.value, layout, "norm_sink"));
     return Result{int(pimpl->results.size()) - 1};
 }
 
@@ -85,6 +88,7 @@ DeviceGraph::Result DeviceGraph::kinetic_matrix(Functions psi) {
     using T = double;
     auto& g = pimpl->g;
     const mra::size_type N = psi.size;
+    require_one_batch(*pimpl->get(psi).layout, "DeviceGraph::kinetic_matrix");
     auto fns = make_mrattg_functionset(N);
     Impl::Res& r = pimpl->add_result(long(N), long(N));
     mra::BatchGroup compress_group;   // the three axes batch together

@@ -44,19 +44,22 @@ DeviceGraph::~DeviceGraph() = default;
 
 DeviceGraph::Functions DeviceGraph::feed(DeviceFunctions& v, bool keep) {
     NodeEdge e;
+    const DeviceLayout layout = layout_of(v);   // read before the feed takes the nodes out
     pimpl->g.add(fv(v).make_feed(pimpl->g.control, e, keep, "feed", device_procmap(), device_devicemap()));
     if (keep) pimpl->kept.push_back(&v);
-    return pimpl->add_functions(e, v.size());
+    return pimpl->add_functions(e, layout);
 }
 
 void DeviceGraph::store(Functions f, DeviceFunctions& v) {
-    pimpl->g.add(fv(v).make_store(pimpl->get(f).compressed, f.size, "store", device_procmap(), device_devicemap()));
+    pimpl->g.add(fv(v).make_store(pimpl->get(f).compressed, f.size, "store", device_procmap(), device_devicemap(),
+                                  pimpl->get(f).layout));
     pimpl->stored.push_back(&v);
 }
 
 DeviceGraph::Matrix DeviceGraph::decide(Result r, Decision f) {
     MADNESS_CHECK_THROW(r.id >= 0 && r.id < int(pimpl->results.size()), "DeviceGraph: invalid result handle");
     Impl::Res& res = *pimpl->results[r.id];
+    MADNESS_CHECK_THROW(res.batches == 1, "DeviceGraph::decide: a reduction in several batches is not supported yet");
     if (res.matrix) return pimpl->add_decision(*res.matrix, res.value.dim(0), res.value.dim(1), std::move(f));
     if (res.vector) return pimpl->add_decision(*res.vector, res.value.dim(0), 0, std::move(f));
     MADNESS_EXCEPTION("DeviceGraph::decide: this result is not a single reduction", r.id);

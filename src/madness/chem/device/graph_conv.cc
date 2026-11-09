@@ -46,10 +46,10 @@ DeviceGraph::Functions DeviceGraph::convolution(const poperatorT& op, Functions 
                                                 DeviceOperatorCache* cache) {
     using T = double;
     auto& g = pimpl->g;
-    const mra::size_type N = in.size;
+    const DeviceLayout layout = pimpl->get(in).layout;   // per batch: one operator for every function
     // the convolution tasks refer to the function set's shared_ptr object itself and to the
     // operator (captured by reference): both are held here, at stable addresses, until the graph has run
-    auto fns_holder = std::make_shared<decltype(make_mrattg_functionset(N))>(make_mrattg_functionset(N));
+    auto fns_holder = std::make_shared<decltype(make_mrattg_functionset(layout))>(make_mrattg_functionset(layout));
     const auto& fns = *fns_holder;
     std::shared_ptr<mra::GaussianConvolutionOperator<T, 3>> dop;
     if (cache) {
@@ -70,7 +70,7 @@ DeviceGraph::Functions DeviceGraph::convolution(const poperatorT& op, Functions 
                                 FunctionDefaults<3>::get_truncate_mode(), FunctionDefaults<3>::get_cell_min_width(),
                                 "convolution", device_procmap(), device_devicemap()));
     add_compress_from_ns(g.tts, fns, g.K, g.functiondata, conv_e, out_e, tol, "recompress_convolution");
-    return pimpl->add_functions(out_e, N);
+    return pimpl->add_functions(out_e, layout);
 }
 
 } // namespace madness

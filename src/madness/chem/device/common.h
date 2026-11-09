@@ -197,6 +197,39 @@ inline void check_device_tree(DeviceFunctions& d, const char* what) {
     if (bad) report_tree(snap, what);
 }
 
+/// The batches of a set of functions in the graphs of the SCF (mra::BatchLayout)
+using DeviceLayout = std::shared_ptr<const mra::BatchLayout>;
+
+/// N functions in a single batch on all processes
+inline DeviceLayout one_batch(mra::size_type N) {
+    return std::make_shared<const mra::BatchLayout>(mra::BatchLayout::even(N, 1));
+}
+
+/// whether two layouts have the same batches (sizes), as operations on pairs of functions need
+inline bool same_batches(const mra::BatchLayout& a, const mra::BatchLayout& b) {
+    if (a.num_batches() != b.num_batches()) return false;
+    for (mra::Batch i = 0; i < a.num_batches(); ++i)
+        if (a.batch_size(i) != b.batch_size(i)) return false;
+    return true;
+}
+
+/// Operations that combine functions of different batches (transforms, concatenation, matrices
+/// of inner products) do not support several batches yet: check that a set has one.
+inline void require_one_batch(const mra::BatchLayout& layout, const std::string& what) {
+    MADNESS_CHECK_THROW(layout.num_batches() == 1, (what + ": functions in several batches are not supported yet").c_str());
+}
+
+/// a sink for per-function values arriving per batch (norms, <a_i|b_i>), at the root of each
+/// batch: writes them into `value` at the batch's offset
+inline auto make_batch_vector_sink(ttg::Edge<mra::Key<3>, mra::DenseTensor<double, 1>> in, Tensor<double>& value,
+                                   const DeviceLayout& layout, const std::string& name) {
+    return ttg::make_tt([&value, layout](const mra::Key<3>& key, const mra::DenseTensor<double, 1>& v) {
+        const mra::Batch b = key.batch();
+        std::copy(v.current_view().data(), v.current_view().data() + layout->batch_size(b),
+                  value.ptr() + layout->offset(b));
+    }, ttg::edges(in), ttg::edges(), name);
+}
+
 /// The process groups of the batches of the SCF's function sets (mra::BatchGroups): the
 /// functions of a batch are spread over its group only. One batch on all processes until the
 /// orbitals are batched; process-wide, like FunctionDefaults.
@@ -269,11 +302,13 @@ void load_compressed_mrattg(const std::vector<Function<T, (std::size_t)NDIM>>& f
     const auto state = f.front().get_impl()->get_tree_state();
     if (state == madness::TreeState::reconstructed) {
         ttg::Edge<mra::Key<NDIM>, mra::FunctionsReconstructedNode<T, NDIM>> reconstructed;
-        tts.push_back(mra::vmra::make_vmra_load(f, control, reconstructed, "load_" + name));
+        tts.push_back(mra::vmra::make_vmra_load(f, control, reconstructed, "load_" + name,
+                                                std::shared_ptr<const mra::BatchLayout>(fns->batchman())));
         tts.push_back(mra::make_compress(fns, K, false, functiondata, reconstructed, out, "compress_" + name,
                                          device_procmap(), device_devicemap()));
     } else if (state == madness::TreeState::compressed) {
-        tts.push_back(mra::vmra::make_vmra_load(f, control, out, "load_" + name));
+        tts.push_back(mra::vmra::make_vmra_load(f, control, out, "load_" + name,
+                                                std::shared_ptr<const mra::BatchLayout>(fns->batchman())));
     } else {
         throw std::runtime_error(name + " must be in reconstructed or compressed form");
     }
@@ -329,11 +364,16 @@ inline void add_compress_from_ns(std::vector<std::unique_ptr<ttg::TTBase>>& tts,
     }
 }
 
-/// function set of N functions in a single batch
-inline auto make_mrattg_functionset(mra::size_type N) {
-    auto pmap = mra::make_procmap<3>(N, 1 /* batch */);
-    return mra::make_functionset<mra::Gaussian<double, 3>>(pmap.batch_manager());
+/// the batches a device vector was stored in (one batch if it never was)
+inline DeviceLayout layout_of(DeviceFunctions& d) { return fv(d).layout() ? fv(d).layout() : one_batch(d.size()); }
+
+/// the function set of a layout: its batches (the functions themselves are not used)
+inline auto make_mrattg_functionset(const DeviceLayout& layout) {
+    return mra::make_functionset<mra::Gaussian<double, 3>>(std::const_pointer_cast<mra::BatchLayout>(layout));
 }
+
+/// function set of N functions in a single batch
+inline auto make_mrattg_functionset(mra::size_type N) { return make_mrattg_functionset(one_batch(N)); }
 
 // ---------------------------------------------------------------------------------------
 // Orbitals held in device memory between MRA-TTG graphs (mra::FunctionVector). Each device_*
