@@ -213,12 +213,10 @@ int run(World& world, const std::map<std::string, std::string>& args) {
             if (nb == 1) K_one = device_download(world, K_d, like);
             check(world, rel_diff(world, K_one, K_d, like) < tol, tag + "exchange, against one batch",
                   rel_diff(world, K_one, K_d, like), tol);
-            // tiles of one pair with one batch, of one round of blocks with several. The tiles of
-            // one batch agree only to the truncation threshold (a known difference of that path)
+            // tiles of one pair with one batch, of one round of blocks with several
             DeviceFunctions K_t = device_exchange(world, psi_d, 1e-4, cache, 1);
-            const double ttol = (nb == 1) ? 10 * thresh : tol;
-            check(world, rel_diff(world, K_one, K_t, like) < ttol, tag + "exchange in tiles, against one batch",
-                  rel_diff(world, K_one, K_t, like), ttol);
+            check(world, rel_diff(world, K_one, K_t, like) < tol, tag + "exchange in tiles, against one batch",
+                  rel_diff(world, K_one, K_t, like), tol);
         }
 
         // a transform block-diagonal in the batches
