@@ -63,10 +63,10 @@ DeviceGraph::Functions DeviceGraph::gaxpy(double a, Functions x, double b, Funct
     auto fns = make_mrattg_functionset(layout);
     NodeEdge out_e, trunc_e;
     g.add(mra::make_gaxpy(a, b, fns, g.K, pimpl->get(x).compressed, pimpl->get(y).compressed, out_e, "gaxpy",
-                          device_procmap(), device_devicemap()));
+                          device_procmap(layout), device_devicemap(layout)));
     if (tol <= 0.0) return pimpl->add_functions(out_e, layout);
     g.add(mra::make_truncate(fns, g.K, tol, FunctionDefaults<3>::get_truncate_mode(),
-                             FunctionDefaults<3>::get_cell_min_width(), out_e, trunc_e, "gaxpy-truncate", device_procmap(), device_devicemap()));
+                             FunctionDefaults<3>::get_cell_min_width(), out_e, trunc_e, "gaxpy-truncate", device_procmap(layout), device_devicemap(layout)));
     return pimpl->add_functions(trunc_e, layout);
 }
 
@@ -86,7 +86,7 @@ DeviceGraph::Functions DeviceGraph::combine(const std::vector<double>& c, const 
     for (std::size_t k = 1; k < f.size(); ++k) {
         NodeEdge out_e;
         g.add(mra::make_gaxpy(ca, c[k], fns, g.K, acc, pimpl->get(f[k]).compressed, out_e, "combine",
-                              device_procmap(), device_devicemap(), /*forward=*/false));
+                              device_procmap(layout), device_devicemap(layout), /*forward=*/false));
         acc = out_e;
         ca = 1.0;
     }
@@ -116,7 +116,7 @@ DeviceGraph::Functions DeviceGraph::multiply(Functions a, Functions b, double to
         MADNESS_CHECK_THROW(a_layout->num_batches() == 1, "DeviceGraph::multiply: a single factor must be in one batch");
         NodeEdge rep_e;
         g.add(mra::make_replicate<double, 3>(a_e, rep_e, layout->num_batches(), name + "-replicate",
-                                             device_procmap(), device_devicemap()));
+                                             device_procmap(a_layout), device_devicemap(a_layout)));
         a_e = rep_e;
         a_layout = std::make_shared<const mra::BatchLayout>(
                      std::vector<mra::size_type>(layout->num_batches(), 1), layout->groups());
@@ -128,7 +128,7 @@ DeviceGraph::Functions DeviceGraph::multiply(Functions a, Functions b, double to
     // multiplied in compressed form: the factors are not reconstructed for this
     g.add(mra::make_multiply_compressed<T, 3>(pimpl->domain(), make_mrattg_functionset(a_layout), fns, g.functiondata,
                                               g.K, a_e, pimpl->get(b).compressed, prod_e,
-                                              name, device_procmap(), device_devicemap()));
+                                              name, device_procmap(layout), device_devicemap(layout)));
     add_compress(g.tts, fns, g.K, g.functiondata, prod_e, comp_e, tol, name + "-compress");
     return pimpl->add_functions(comp_e, layout);
 }
@@ -142,11 +142,11 @@ namespace {
         auto fns_out = make_mrattg_functionset(out_layout);
         NodeEdge out_e, trunc_e;
         g.add(mra::make_transform<double, 3>(make_mrattg_functionset(in_layout), fns_out, g.K, std::forward<UT>(U), in,
-                                             out_e, name, device_procmap(), device_devicemap()));
+                                             out_e, name, device_procmap(out_layout), device_devicemap(out_layout)));
         if (tol <= 0.0) return out_e;
         g.add(mra::make_truncate(fns_out, g.K, tol, FunctionDefaults<3>::get_truncate_mode(),
                                  FunctionDefaults<3>::get_cell_min_width(), out_e, trunc_e, name + "-truncate",
-                                 device_procmap(), device_devicemap()));
+                                 device_procmap(out_layout), device_devicemap(out_layout)));
         return trunc_e;
     }
 

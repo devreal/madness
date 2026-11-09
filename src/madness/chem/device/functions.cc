@@ -123,7 +123,7 @@ DeviceFunctions device_upload(World& world, const vecfuncT& f) {
     DeviceFunctions d;
     const DeviceLayout layout = device_orbital_layout(f.size());
     load_compressed_mrattg(f, make_mrattg_functionset(layout), g.K, g.functiondata, g.control, e, g.tts, "upload");
-    g.add(fv(d).make_store(e, f.size(), "upload_store", device_procmap(), device_devicemap(), layout));
+    g.add(fv(d).make_store(e, f.size(), "upload_store", device_procmap(layout), device_devicemap(layout), layout));
     g.execute();
     check_device_tree(d, "device_upload");
     return d;
@@ -136,7 +136,7 @@ vecfuncT device_download(World& world, DeviceFunctions& d, const functionT& like
     vecfuncT out(d.size());
     for (auto& f : out) f.set_impl(like, false);
     const DeviceLayout layout = layout_of(d);
-    g.add(fv(d).make_feed(g.control, e, true /* keep */, "download", device_procmap(), device_devicemap()));
+    g.add(fv(d).make_feed(g.control, e, true /* keep */, "download", device_procmap(layout), device_devicemap(layout)));
     g.add(mra::vmra::make_vmra_store(out, e, true /* add_leaves */, madness::TreeState::compressed, "download_store",
                                      layout));
     g.execute();
@@ -257,11 +257,11 @@ void device_update(World& world, DeviceFunctions& a, DeviceFunctions& r, const s
     Tensor<double> D(static_cast<long>(N), static_cast<long>(N));
     for (mra::size_type i = 0; i < N; ++i) D(i, i) = c[i];
     NodeEdge a_e, r_e, cr_e, out_e;
-    g.add(fv(r).make_feed(g.control, r_e, false, "feed_r", device_procmap(), device_devicemap()));
-    g.add(fv(a).make_feed(g.control, a_e, false, "feed_a", device_procmap(), device_devicemap()));
-    g.add(mra::make_transform<double, 3>(fns, fns, g.K, device_matrix(D), r_e, cr_e, "scale_r", device_procmap(), device_devicemap()));
-    g.add(mra::make_gaxpy(1.0, -1.0, fns, g.K, a_e, cr_e, out_e, "update", device_procmap(), device_devicemap()));
-    g.add(fv(a).make_store(out_e, N, "store", device_procmap(), device_devicemap(), layout));
+    g.add(fv(r).make_feed(g.control, r_e, false, "feed_r", device_procmap(layout), device_devicemap(layout)));
+    g.add(fv(a).make_feed(g.control, a_e, false, "feed_a", device_procmap(layout), device_devicemap(layout)));
+    g.add(mra::make_transform<double, 3>(fns, fns, g.K, device_matrix(D), r_e, cr_e, "scale_r", device_procmap(layout), device_devicemap(layout)));
+    g.add(mra::make_gaxpy(1.0, -1.0, fns, g.K, a_e, cr_e, out_e, "update", device_procmap(layout), device_devicemap(layout)));
+    g.add(fv(a).make_store(out_e, N, "store", device_procmap(layout), device_devicemap(layout), layout));
     g.execute();
     check_device_tree(a, "device_update");
 }

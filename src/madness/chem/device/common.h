@@ -268,7 +268,8 @@ inline DeviceLayout device_orbital_layout(mra::size_type N) {
 struct DeviceProcMap {
     std::shared_ptr<WorldDCPmapInterface<Key<3>>> pmap = FunctionDefaults<3>::get_pmap();
     std::shared_ptr<const SFCPmap<3>> sfc = std::dynamic_pointer_cast<const SFCPmap<3>>(pmap);
-    mra::BatchGroups groups = device_batch_groups();
+    mra::BatchGroups groups;   // of the set's batches (its layout's)
+    explicit DeviceProcMap(const mra::BatchGroups& groups) : groups(groups) {}
     int operator()(const mra::Key<3>& key) const {
         const Key<3> k = key.to_madness_key();
         const auto [first, last] = groups.batch_pes(key.batch());
@@ -285,9 +286,9 @@ struct DeviceProcMap {
 struct DeviceDevMap {
     std::shared_ptr<const SFCPmap<3>> sfc =
         std::dynamic_pointer_cast<const SFCPmap<3>>(FunctionDefaults<3>::get_pmap());
-    mra::BatchGroups groups = device_batch_groups();
+    mra::BatchGroups groups;   // of the set's batches (its layout's)
     int ndevice;
-    explicit DeviceDevMap(int ndevice) : ndevice(ndevice) {}
+    DeviceDevMap(const mra::BatchGroups& groups, int ndevice) : groups(groups), ndevice(ndevice) {}
     int operator()(const mra::Key<3>& key) const {
         const Key<3> k = key.to_madness_key();
         if (sfc) {
@@ -299,14 +300,38 @@ struct DeviceDevMap {
     }
 };
 
-inline DeviceProcMap device_procmap() { return {}; }
+/// The maps of the tasks of a set of functions: by the groups of its batches (its layout's, or
+/// that of the function set's layout). The orbitals' batches are on their groups; a set in one
+/// batch (the density, potentials) is on all processes, as MADNESS holds such functions.
+/// Without an argument: a set in one batch.
+inline DeviceProcMap device_procmap(const mra::BatchGroups& groups) { return DeviceProcMap(groups); }
+inline DeviceProcMap device_procmap(const DeviceLayout& layout) { return device_procmap(layout->groups()); }
+template <typename FunctionSetT>
+    requires requires(const FunctionSetT& f) { f.batchman()->groups(); }
+inline DeviceProcMap device_procmap(const std::shared_ptr<FunctionSetT>& fns) {
+    return device_procmap(fns->batchman()->groups());
+}
+inline DeviceProcMap device_procmap() {
+    return device_procmap(mra::BatchGroups(1, ttg::default_execution_context().size()));
+}
 
 /// Host builds run every task on the host and take no device map (TTG would ask it for a device).
 #if defined(MRA_ENABLE_HOST)
-inline ttg::Void device_devicemap() { return {}; }
+inline ttg::Void device_devicemap(const mra::BatchGroups&) { return {}; }
 #else
-inline DeviceDevMap device_devicemap() { return DeviceDevMap(std::max(1, ttg::device::num_devices())); }
+inline DeviceDevMap device_devicemap(const mra::BatchGroups& groups) {
+    return DeviceDevMap(groups, std::max(1, ttg::device::num_devices()));
+}
 #endif
+inline auto device_devicemap(const DeviceLayout& layout) { return device_devicemap(layout->groups()); }
+template <typename FunctionSetT>
+    requires requires(const FunctionSetT& f) { f.batchman()->groups(); }
+inline auto device_devicemap(const std::shared_ptr<FunctionSetT>& fns) {
+    return device_devicemap(fns->batchman()->groups());
+}
+inline auto device_devicemap() {
+    return device_devicemap(mra::BatchGroups(1, ttg::default_execution_context().size()));
+}
 
 /// Feed MADNESS functions into an MRA-TTG graph as compressed nodes on `out`.
 
@@ -325,7 +350,7 @@ void load_compressed_mrattg(const std::vector<Function<T, (std::size_t)NDIM>>& f
         tts.push_back(mra::vmra::make_vmra_load(f, control, reconstructed, "load_" + name,
                                                 std::shared_ptr<const mra::BatchLayout>(fns->batchman())));
         tts.push_back(mra::make_compress(fns, K, false, functiondata, reconstructed, out, "compress_" + name,
-                                         device_procmap(), device_devicemap()));
+                                         device_procmap(fns), device_devicemap(fns)));
     } else if (state == madness::TreeState::compressed) {
         tts.push_back(mra::vmra::make_vmra_load(f, control, out, "load_" + name,
                                                 std::shared_ptr<const mra::BatchLayout>(fns->batchman())));
@@ -348,14 +373,14 @@ inline void add_compress(std::vector<std::unique_ptr<ttg::TTBase>>& tts, const s
     const int mode = FunctionDefaults<3>::get_truncate_mode();
     const double min_width = FunctionDefaults<3>::get_cell_min_width();
     if (tol <= 0.0 || !separate) {
-        tts.push_back(mra::make_compress(fns, K, false, functiondata, in, out, name, device_procmap(), device_devicemap(),
+        tts.push_back(mra::make_compress(fns, K, false, functiondata, in, out, name, device_procmap(fns), device_devicemap(fns),
                                          /*enable_truncate=*/tol > 0.0, tol, mode, min_width));
     } else {
         ttg::Edge<mra::Key<3>, mra::FunctionsCompressedNode<double, 3>> compressed;
         tts.push_back(mra::make_compress(fns, K, false, functiondata, in, compressed, name,
-                                         device_procmap(), device_devicemap()));
+                                         device_procmap(fns), device_devicemap(fns)));
         tts.push_back(mra::make_truncate(fns, K, tol, mode, min_width, compressed, out, name + "-truncate",
-                                         device_procmap(), device_devicemap()));
+                                         device_procmap(fns), device_devicemap(fns)));
     }
 }
 
@@ -372,15 +397,15 @@ inline void add_compress_from_ns(std::vector<std::unique_ptr<ttg::TTBase>>& tts,
     const int mode = FunctionDefaults<3>::get_truncate_mode();
     const double min_width = FunctionDefaults<3>::get_cell_min_width();
     if (tol <= 0.0 || !separate) {
-        tts.push_back(mra::make_compress_from_ns(fns, K, functiondata, in, out, name, device_procmap(),
-                                                 device_devicemap(), /*enable_truncate=*/tol > 0.0, tol, mode,
+        tts.push_back(mra::make_compress_from_ns(fns, K, functiondata, in, out, name, device_procmap(fns),
+                                                 device_devicemap(fns), /*enable_truncate=*/tol > 0.0, tol, mode,
                                                  min_width));
     } else {
         ttg::Edge<mra::Key<3>, mra::FunctionsCompressedNode<double, 3>> compressed;
         tts.push_back(mra::make_compress_from_ns(fns, K, functiondata, in, compressed, name,
-                                                 device_procmap(), device_devicemap()));
+                                                 device_procmap(fns), device_devicemap(fns)));
         tts.push_back(mra::make_truncate(fns, K, tol, mode, min_width, compressed, out, name + "-truncate",
-                                         device_procmap(), device_devicemap()));
+                                         device_procmap(fns), device_devicemap(fns)));
     }
 }
 

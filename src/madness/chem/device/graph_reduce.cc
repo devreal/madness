@@ -66,8 +66,8 @@ DeviceGraph::Result DeviceGraph::inner(Functions a, Functions b) {
     r.vector.emplace();
     r.layout = layout;
     g.add(mra::make_inner<double, 3>(make_mrattg_functionset(layout), g.K, pimpl->get(a).compressed,
-                                     pimpl->get(b).compressed, *r.vector, "inner", device_procmap(),
-                                     device_devicemap(), pimpl->inner_group));
+                                     pimpl->get(b).compressed, *r.vector, "inner", device_procmap(layout),
+                                     device_devicemap(layout), pimpl->inner_group));
     g.add(make_batch_vector_sink(*r.vector, r.value, layout, "inner_sink"));
     return Result{int(pimpl->results.size()) - 1};
 }
@@ -79,7 +79,7 @@ DeviceGraph::Result DeviceGraph::norms(Functions a) {
     r.vector.emplace();
     r.layout = layout;
     g.add(mra::make_norm(make_mrattg_functionset(layout), g.K, pimpl->get(a).compressed, *r.vector, "norm",
-                         device_procmap(), device_devicemap()));
+                         device_procmap(layout), device_devicemap(layout)));
     g.add(make_batch_vector_sink(*r.vector, r.value, layout, "norm_sink"));
     return Result{int(pimpl->results.size()) - 1};
 }

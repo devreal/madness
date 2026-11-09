@@ -46,26 +46,52 @@ void device_apply_local_potential(World& world, const functionT& v, DeviceFuncti
     g.execute();
 }
 
-/// sum_i occ_i psi_i^2 (cf. SCF::make_density), compressed: one function
+/// sum_i occ_i psi_i^2 (cf. SCF::make_density), compressed: one function, on all processes.
+/// With the orbitals in several batches, each batch's group forms its partial density
+/// sum_{i in b} occ_i psi_i^2, and the partial densities are summed into one function (one
+/// function's worth of nodes moving from each group).
 DeviceGraph::Functions DeviceGraph::density(Functions psi, const tensorT& occ) {
     using T = double;
     auto& g = pimpl->g;
     const mra::size_type N = psi.size;
     MADNESS_CHECK_THROW(occ.size() >= long(N), "DeviceGraph::density: an occupation for every function");
-    require_one_batch(*pimpl->get(psi).layout, "DeviceGraph::density");   // sums over all functions
-    auto fns = make_mrattg_functionset(N);
-    Tensor<double> w(static_cast<long>(N), 1L);
-    for (long i = 0; i < long(N); ++i) w(i, 0) = occ[i];
+    const DeviceLayout layout = pimpl->get(psi).layout;
+    const mra::Batch nb = layout->num_batches();
+    auto fns = make_mrattg_functionset(layout);
     NodeEdge sq_c_e, rho_e;
     RecEdge sq_e;
     // squared straight from the compressed orbitals, without reconstructing them
     g.add(mra::make_square_compressed<T, 3>(pimpl->domain(), fns, g.functiondata, g.K, pimpl->get(psi).compressed,
-                                            sq_e, "psi^2", device_procmap(), device_devicemap()));
+                                            sq_e, "psi^2", device_procmap(fns), device_devicemap(fns)));
     g.add(mra::make_compress(fns, g.K, false, g.functiondata, sq_e, sq_c_e, "compress_psi^2",
-                             device_procmap(), device_devicemap()));
-    g.add(mra::make_transform<T, 3>(fns, make_mrattg_functionset(1), g.K, device_matrix(w), sq_c_e, rho_e, "sum_occ",
-                                    device_procmap(), device_devicemap()));
-    return pimpl->add_functions(rho_e, 1);
+                             device_procmap(fns), device_devicemap(fns)));
+    // the occupations as one column per batch: block-diagonal in the batches, one function each
+    Tensor<double> w(static_cast<long>(N), static_cast<long>(nb));
+    for (mra::Batch b = 0; b < nb; ++b)
+        for (mra::size_type l = 0; l < layout->batch_size(b); ++l) w(layout->global_index(b, l), b) = occ[layout->global_index(b, l)];
+    const DeviceLayout parts = std::make_shared<const mra::BatchLayout>(
+                                 std::vector<mra::size_type>(nb, 1), layout->groups());
+    auto fns_parts = make_mrattg_functionset(parts);
+    g.add(mra::make_transform<T, 3>(fns, fns_parts, g.K, device_matrix(w), sq_c_e, rho_e, "sum_occ",
+                                    device_procmap(fns), device_devicemap(fns)));
+    if (nb == 1) return pimpl->add_functions(rho_e, one_batch(1));
+    // the partial densities summed into one function on all processes
+    const DeviceLayout one = one_batch(1);
+    auto fns_one = make_mrattg_functionset(one);
+    auto take = [&](mra::Batch b) {
+        NodeEdge e;
+        g.add(mra::make_take_batch<T, 3>(rho_e, e, b, 0, "rho-take-" + std::to_string(b),
+                                         device_procmap(parts), device_devicemap(parts)));
+        return e;
+    };
+    NodeEdge sum = take(0);
+    for (mra::Batch b = 1; b < nb; ++b) {
+        NodeEdge next;
+        g.add(mra::make_gaxpy(T(1.0), T(1.0), fns_one, g.K, sum, take(b), next, "rho-sum",
+                              device_procmap(one), device_devicemap(one)));
+        sum = next;
+    }
+    return pimpl->add_functions(sum, one);
 }
 
 /// sum_i occ_i psi_i^2 (cf. SCF::make_density), compressed, with the process map of `like`; psi is kept

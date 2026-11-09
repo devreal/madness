@@ -26,13 +26,15 @@
 /// operations that stay within the batches are compared with MADNESS: upload and download, norms
 /// and <psi_i|psi_i>, a potential applied to all orbitals (replicated into every batch), a
 /// transform block-diagonal in the batches, normalization (a decision from the norms of all
-/// batches), the update psi_i - c_i r_i, and a linear combination of sets. Operations that
-/// combine batches (matrix_inner) must refuse several.
+/// batches), the update psi_i - c_i r_i, a linear combination of sets, and the density (partial
+/// densities of the batches summed into one function on all processes) with its Coulomb
+/// potential. Operations that combine batches (matrix_inner) must refuse several.
 ///
 /// Options (key=value): n (orbitals, 5), k (6), thresh (1e-5), L (20), seed (1), tol (relative
-/// tolerance, 1e-10). Exit code 0 if every check passes.
+/// tolerance, 1e-10), ctol (of the Coulomb potential, 1e-6). Exit code 0 if every check passes.
 
 #include <madness/mra/mra.h>
+#include <madness/mra/operator.h>
 #include <madness/chem/SCF.h>
 #include <madness/chem/device/scf_device.h>
 #include <madness/chem/device/common.h>
@@ -99,6 +101,8 @@ int run(World& world, const std::map<std::string, std::string>& args) {
     const double L = std::stod(get("L", "20"));
     const unsigned seed = std::stoul(get("seed", "1"));
     const double tol = std::stod(get("tol", "1e-10"));
+    // the Coulomb potential: two convolutions that screen at the threshold
+    const double ctol = std::stod(get("ctol", "1e-6"));
 
     FunctionDefaults<3>::set_cubic_cell(-L, L);
     FunctionDefaults<3>::set_k(k);
@@ -129,10 +133,12 @@ int run(World& world, const std::map<std::string, std::string>& args) {
     compress(world, psi);
     V.compress();
     const functionT like = psi.front();
+    poperatorT coulop(CoulombOperatorPtr(world, 1e-6, thresh));
 
     for (int nb : {1, 2, 3}) {
         if (nb > N) continue;
         set_device_orbital_batches(nb);
+        compress(world, psi);   // the references of the previous batches change its form
         const std::string tag = std::to_string(nb) + " batches: ";
         const DeviceLayout layout = device_orbital_layout(N);
 
@@ -218,6 +224,34 @@ int run(World& world, const std::map<std::string, std::string>& args) {
             g.store(g.combine({0.5, -1.5}, {g.feed(psi_d, true), g.feed(Vpsi_d, true)}), c_d);
             g.execute();
             check(world, rel_diff(world, ref, c_d, like) < tol, tag + "combine", rel_diff(world, ref, c_d, like), tol);
+        }
+
+        // the density sum_i occ_i psi_i^2 (partial densities of the batches, summed into one function
+        // on all processes) and its Coulomb potential, in one graph
+        {
+            tensorT occ(N);
+            for (long i = 0; i < N; ++i) occ[i] = 2.0 - 0.25 * double(i);
+            vecfuncT sq = mul(world, psi, psi);
+            functionT rho_ref = FunctionFactory<double, 3>(world);
+            rho_ref.compress();
+            for (long i = 0; i < N; ++i) {
+                sq[i].compress();
+                rho_ref.gaxpy(1.0, sq[i], occ[i], false);
+            }
+            world.gop.fence();
+            functionT v_ref = apply(*coulop, rho_ref);
+            functionT rho, v;
+            {
+                DeviceGraph g(world);
+                auto r = g.density(g.feed(psi_d, true), occ);
+                g.store(r, rho, like);
+                g.store(g.convolution(coulop, r, 0.0), v, like);
+                g.execute();
+            }
+            const double drho = (rho_ref - rho).norm2() / rho_ref.norm2();
+            const double dv = (v_ref - v).norm2() / v_ref.norm2();
+            check(world, drho < tol, tag + "density", drho, tol);
+            check(world, dv < ctol, tag + "Coulomb potential of the density", dv, ctol);
         }
 
         // matrices of inner products combine batches: not supported yet
