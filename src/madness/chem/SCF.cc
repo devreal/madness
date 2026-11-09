@@ -3347,7 +3347,7 @@ void SCF::solve_simple(World& world) {
                     for (long i = 0; i < norms.dim(0); ++i) D(i, i) = 1.0 / norms(i);
                     return D;
                 });
-                g.store(g.transform(psi_rot, scale, n, 0.0), amo_d);
+                g.store(g.transform(psi_rot, scale, n, 0.0, /*block_diagonal=*/true), amo_d);
                 if (kain) {   // rotate the KAIN history along (cf. rotate_subspace), each entry as psi
                     for (auto* hist : {&hist_psi, &hist_rneg}) {
                         for (auto& h : *hist) g.store(g.transform(g.feed(h, false), U, n, 0.0), h);
@@ -3612,7 +3612,8 @@ void SCF::solve_simple(World& world) {
                         return S;
                     });
                     // the history is kept: combine, as it never passes on a node of psi^(m-1)
-                    g.store(g.combine({1.0, 1.0}, {f[2 * (m - 1)], g.transform(D, step, n, 0.0)}), amo_d);
+                    g.store(g.combine({1.0, 1.0}, {f[2 * (m - 1)], g.transform(D, step, n, 0.0, /*block_diagonal=*/true)}),
+                            amo_d);
                     g.execute();
                     const Tensor<double> dn = g.get(Dnorm);
                     dnorm.assign(dn.ptr(), dn.ptr() + dn.size());

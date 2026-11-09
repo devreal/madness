@@ -29,8 +29,8 @@
 /// batches), the update psi_i - c_i r_i, a linear combination of sets, and the density (partial
 /// densities of the batches summed into one function on all processes) with its Coulomb
 /// potential, matrices of inner products across the batches (<psi_i|V psi_j>, <psi_i|psi_j>, the
-/// kinetic matrix against one batch) and a decision from such a matrix. Operations that combine
-/// batches otherwise (concat) must refuse several.
+/// kinetic matrix against one batch), a decision from such a matrix, and transforms that couple
+/// the batches (by a fixed U and by one decided in the graph). Concatenation must refuse several.
 ///
 /// Options (key=value): n (orbitals, 5), k (6), thresh (1e-5), L (20), seed (1), tol (relative
 /// tolerance, 1e-10), ctol (of the Coulomb potential, 1e-6). Exit code 0 if every check passes.
@@ -138,6 +138,8 @@ int run(World& world, const std::map<std::string, std::string>& args) {
     poperatorT coulop(CoulombOperatorPtr(world, 1e-6, thresh));
 
     Tensor<double> kin_one;   // the kinetic matrix with one batch
+    vecfuncT rneg_one;        // the BSH residual with one batch, and its norms
+    std::vector<double> rnorm_one;
     for (int nb : {1, 2, 3}) {
         if (nb > N) continue;
         set_device_orbital_batches(nb);
@@ -178,6 +180,29 @@ int run(World& world, const std::map<std::string, std::string>& args) {
         V.compress();
         check(world, rel_diff(world, Vpsi, Vpsi_d, like) < tol, tag + "V psi_i, V replicated",
               rel_diff(world, Vpsi, Vpsi_d, like), tol);
+
+        // the BSH residual: one operator per orbital (its own eps), each batch applying those of
+        // its orbitals; against one batch
+        {
+            tensorT eps(N), fockp(N, N);
+            for (long i = 0; i < N; ++i) {
+                eps(i) = -0.4 - 0.3 * i;
+                fockp(i, i) = 0.05 * i;
+            }
+            CalculationParameters param;
+            DeviceFunctions Vpsi_u = device_upload(world, Vpsi);
+            std::vector<double> rnorm;
+            DeviceFunctions r_d = device_bsh_residual(world, psi_d, Vpsi_u, fockp, eps, param, rnorm);
+            if (nb == 1) {
+                rneg_one = device_download(world, r_d, like);
+                rnorm_one = rnorm;
+            }
+            double dn = 0.0;
+            for (long i = 0; i < N; ++i) dn = std::max(dn, std::abs(rnorm[i] - rnorm_one[i]));
+            check(world, rel_diff(world, rneg_one, r_d, like) < tol, tag + "BSH residual, against one batch",
+                  rel_diff(world, rneg_one, r_d, like), tol);
+            check(world, dn < tol, tag + "BSH residual norms, against one batch", dn, tol);
+        }
 
         // a transform block-diagonal in the batches
         {
@@ -301,6 +326,27 @@ int run(World& world, const std::map<std::string, std::string>& args) {
             }
             check(world, rel_diff(world, ref, n_d, like) < tol, tag + "decision from the overlap of all batches",
                   rel_diff(world, ref, n_d, like), tol);
+        }
+
+        // transforms that couple the batches: a fixed U, and U decided in the graph (the overlap S)
+        {
+            Tensor<double> U(N, N);
+            for (long i = 0; i < N; ++i)
+                for (long j = 0; j < N; ++j) U(i, j) = (i == j ? 1.0 : 0.0) + 0.3 * coef(gen);
+            DeviceFunctions t_d, s_d;
+            {
+                DeviceGraph g(world);
+                auto f = g.feed(psi_d, true);
+                g.store(g.transform(f, U, 0.0, "dense"), t_d);
+                auto S = g.decide(g.matrix_inner(f, f), [](const Tensor<double>& S) { return copy(S); });
+                g.store(g.transform(f, S, N, 0.0), s_d);
+                g.execute();
+            }
+            check(world, rel_diff(world, transform(world, psi, U), t_d, like) < tol, tag + "transform coupling the batches",
+                  rel_diff(world, transform(world, psi, U), t_d, like), tol);
+            const Tensor<double> S = matrix_inner(world, psi, psi);
+            check(world, rel_diff(world, transform(world, psi, S), s_d, like) < tol,
+                  tag + "transform by a U decided from all batches", rel_diff(world, transform(world, psi, S), s_d, like), tol);
         }
 
         // concatenation combines batches: not supported yet

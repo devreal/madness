@@ -99,8 +99,9 @@ int device_orbital_batches() { return device_orbital_batches_ref(); }
 
 void device_add_lb_cost(LoadBalanceDeux<3>& lb, DeviceFunctions& v) {
     constexpr int nchild = mra::Key<3>::num_children();
-    const int N = int(v.size());
+    const DeviceLayout layout = layout_of(v);
     fv(v).for_each_local_node([&](const mra::Key<3>& key, const auto& node) {
+        const int N = int(layout->batch_size(key.batch()));   // the functions of the node's batch
         // the functions with children here, and per child those of them for which it is a leaf
         long interior = 0;
         std::array<long, nchild> leafs{};
@@ -121,7 +122,8 @@ DeviceFunctions device_upload(World& world, const vecfuncT& f) {
     MraGraph g;
     NodeEdge e;
     DeviceFunctions d;
-    const DeviceLayout layout = device_orbital_layout(f.size());
+    // orbitals (or functions of them) in the orbitals' batches; a single function (a potential) on all processes
+    const DeviceLayout layout = (f.size() == 1) ? one_batch(1) : device_orbital_layout(f.size());
     load_compressed_mrattg(f, make_mrattg_functionset(layout), g.K, g.functiondata, g.control, e, g.tts, "upload");
     g.add(fv(d).make_store(e, f.size(), "upload_store", device_procmap(layout), device_devicemap(layout), layout));
     g.execute();
@@ -243,7 +245,7 @@ void device_normalize(World& world, DeviceFunctions& v) {
         for (long i = 0; i < n.dim(0); ++i) D(i, i) = 1.0 / n(i);
         return D;
     });
-    g.store(g.transform(f, scale, v.size(), 0.0), v);
+    g.store(g.transform(f, scale, v.size(), 0.0, /*block_diagonal=*/true), v);
     g.execute();
 }
 

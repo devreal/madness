@@ -131,8 +131,10 @@ namespace madness {
         Functions combine(const std::vector<double>& c, const std::vector<Functions>& f);
         /// out_j = sum_i in_i U(i,j), truncated with tol unless tol == 0
         Functions transform(Functions in, const Tensor<double>& U, double tol, const std::string& name = "transform");
-        /// the same with U computed in the graph; M is the number of columns of U
-        Functions transform(Functions in, Matrix U, std::size_t M, double tol);
+        /// the same with U computed in the graph; M is the number of columns of U. With the
+        /// functions in several batches, block_diagonal declares that U does not couple them
+        /// (e.g., a scaling): each batch then transforms its own, without communication.
+        Functions transform(Functions in, Matrix U, std::size_t M, double tol, bool block_diagonal = false);
         /// [a, b]: the functions of a followed by those of b
         Functions concat(Functions a, Functions b);
 
@@ -190,7 +192,8 @@ namespace madness {
     /// Not while a graph executes.
     void device_add_lb_cost(LoadBalanceDeux<3>& lb, DeviceFunctions& v);
 
-    /// copy MADNESS functions into a device vector
+    /// copy MADNESS functions into a device vector: a set of orbitals (or of functions of them) in
+    /// the orbitals' batches (set_device_orbital_batches), a single function on all processes
     DeviceFunctions device_upload(World& world, const vecfuncT& f);
 
     /// copy a device vector into (compressed) MADNESS functions with the process map of `like`
