@@ -306,6 +306,51 @@ DeviceGraph::Functions DeviceGraph::transform(Functions in, Matrix U, std::size_
                                               "transform"), out_layout);
 }
 
+DeviceGraph::Layout DeviceGraph::layout(Functions f) {
+    return pimpl->get(f).layout;
+}
+
+DeviceGraph::Functions DeviceGraph::rebatch(Functions in, Layout out, std::function<std::vector<int>(int)> targets,
+                                            const std::string& name) {
+    const DeviceLayout in_layout = pimpl->get(in).layout;
+    auto to = [out, in_layout, targets, name](mra::Batch b) {
+        std::vector<mra::Batch> t;
+        for (int x : targets(b)) {
+            MADNESS_CHECK_THROW(x >= 0 && x < out->num_batches() && out->batch_size(mra::Batch(x)) == in_layout->batch_size(b),
+                                (name + ": a target batch of another size").c_str());
+            t.push_back(mra::Batch(x));
+        }
+        return t;
+    };
+    NodeEdge out_e;
+    pimpl->g.add(mra::make_rebatch<double, 3>(pimpl->get(in).compressed, out_e, std::move(to), name,
+                                              device_procmap(in_layout), device_devicemap(in_layout)));
+    return pimpl->add_functions(out_e, out);
+}
+
+DeviceGraph::Functions DeviceGraph::transform(Functions in, const std::vector<Tensor<double>>& blocks, Layout out,
+                                              double tol, const std::string& name) {
+    const DeviceLayout in_layout = pimpl->get(in).layout;
+    const mra::Batch nb = in_layout->num_batches();
+    MADNESS_CHECK_THROW(out->num_batches() == nb && long(blocks.size()) == nb,
+                        (name + ": one block per batch, as many batches in and out").c_str());
+    auto bh = std::make_shared<std::vector<mra::DenseTensor<double, 2>>>();
+    for (mra::Batch b = 0; b < nb; ++b) {
+        MADNESS_CHECK_THROW(blocks[b].dim(0) == long(in_layout->batch_size(b)) && blocks[b].dim(1) == long(out->batch_size(b)),
+                            (name + ": a block of the wrong size").c_str());
+        bh->push_back(std::move(*device_matrix(blocks[b])));
+    }
+    // each batch's block, sent once into the graph to the root of the batch
+    auto& g = pimpl->g;
+    MatrixEdge U_e;
+    g.add(ttg::make_tt([bh](const mra::Key<3>& key) {
+        if (key.batch() != 0) return;
+        for (std::size_t b = 0; b < bh->size(); ++b)
+            ttg::send<0>(mra::Key<3>(mra::Batch(b), mra::Level(0)), std::move((*bh)[b]));
+    }, ttg::edges(g.control), ttg::edges(U_e), name + "-U"));
+    return pimpl->add_functions(add_transform(g, pimpl->get(in).compressed, in_layout, out, U_e, tol, name), out);
+}
+
 DeviceGraph::Functions DeviceGraph::concat(Functions a, Functions b) {
     require_one_batch(*pimpl->get(a).layout, "DeviceGraph::concat");
     require_one_batch(*pimpl->get(b).layout, "DeviceGraph::concat");

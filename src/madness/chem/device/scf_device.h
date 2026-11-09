@@ -46,6 +46,8 @@
 #include <madness/chem/SCF.h>
 #include <madness/mra/lbdeux.h>
 
+namespace mra { class BatchLayout; }
+
 namespace madness {
 
     /// Functions held by MRA-TTG between graphs (an mra::FunctionVector), with their
@@ -137,6 +139,20 @@ namespace madness {
         Functions transform(Functions in, Matrix U, std::size_t M, double tol, bool block_diagonal = false);
         /// [a, b]: the functions of a followed by those of b
         Functions concat(Functions a, Functions b);
+
+        /// the batches of a set: their sizes and process groups
+        using Layout = std::shared_ptr<const mra::BatchLayout>;
+        /// the batches of f
+        Layout layout(Functions f);
+        /// a set in the batches of `out`, batch t holding the functions of the batch b of in with
+        /// t in targets(b) (each t in the targets of one b, of b's size): b's nodes are sent to the
+        /// group of t. in is only read (it may be used again).
+        Functions rebatch(Functions in, Layout out, std::function<std::vector<int>(int)> targets,
+                          const std::string& name = "rebatch");
+        /// out_j = sum_i in_i U_b(i,j) within each batch b, from the batches of in to those of
+        /// `out` (as many): blocks[b] has b's sizes in in and out, truncated with tol unless tol == 0
+        Functions transform(Functions in, const std::vector<Tensor<double>>& blocks, Layout out, double tol,
+                            const std::string& name = "transform");
 
         /// <a_i|b_j>; a and b may be the same
         Result matrix_inner(Functions a, Functions b);

@@ -139,6 +139,7 @@ int run(World& world, const std::map<std::string, std::string>& args) {
 
     Tensor<double> kin_one;   // the kinetic matrix with one batch
     vecfuncT rneg_one;        // the BSH residual with one batch, and its norms
+    vecfuncT K_one;           // the exchange with one batch
     std::vector<double> rnorm_one;
     for (int nb : {1, 2, 3}) {
         if (nb > N) continue;
@@ -202,6 +203,22 @@ int run(World& world, const std::map<std::string, std::string>& args) {
             check(world, rel_diff(world, rneg_one, r_d, like) < tol, tag + "BSH residual, against one batch",
                   rel_diff(world, rneg_one, r_d, like), tol);
             check(world, dn < tol, tag + "BSH residual norms, against one batch", dn, tol);
+        }
+
+        // the exchange K psi_i = sum_j psi_j G(psi_j psi_i): blocks of two batches each on one
+        // group, in one graph and in tiles of one round; against one batch (and its tiles)
+        {
+            DeviceOperatorCache cache;
+            DeviceFunctions K_d = device_exchange(world, psi_d, 1e-4, cache, 0);
+            if (nb == 1) K_one = device_download(world, K_d, like);
+            check(world, rel_diff(world, K_one, K_d, like) < tol, tag + "exchange, against one batch",
+                  rel_diff(world, K_one, K_d, like), tol);
+            // tiles of one pair with one batch, of one round of blocks with several. The tiles of
+            // one batch agree only to the truncation threshold (a known difference of that path)
+            DeviceFunctions K_t = device_exchange(world, psi_d, 1e-4, cache, 1);
+            const double ttol = (nb == 1) ? 10 * thresh : tol;
+            check(world, rel_diff(world, K_one, K_t, like) < ttol, tag + "exchange in tiles, against one batch",
+                  rel_diff(world, K_one, K_t, like), ttol);
         }
 
         // a transform block-diagonal in the batches
