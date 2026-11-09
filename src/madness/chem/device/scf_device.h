@@ -149,6 +149,11 @@ namespace madness {
         /// group of t. in is only read (it may be used again).
         Functions rebatch(Functions in, Layout out, std::function<std::vector<int>(int)> targets,
                           const std::string& name = "rebatch");
+        /// batch c of a set in the batches of `out`: the sum of the batches b of the sets
+        /// sources[k].first with sources[k].second(b) == c (-1: not summed); every batch of out
+        /// receives at least one, of its size. The sets are only read.
+        Functions sum_into(const std::vector<std::pair<Functions, std::function<int(int)>>>& sources, Layout out,
+                           const std::string& name = "sum");
         /// out_j = sum_i in_i U_b(i,j) within each batch b, from the batches of in to those of
         /// `out` (as many): blocks[b] has b's sizes in in and out, truncated with tol unless tol == 0
         Functions transform(Functions in, const std::vector<Tensor<double>>& blocks, Layout out, double tol,

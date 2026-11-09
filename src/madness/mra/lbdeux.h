@@ -186,7 +186,7 @@ namespace madness {
         /// of the cost, exactly when size divides the number of processes. A group of all
         /// processes gets (owner, device).
         std::pair<int,int> group_part(const Key<NDIM>& key, int size) const {
-            MADNESS_ASSERT(size > 0 && size <= nproc);
+            MADNESS_CHECK(size > 0 && size <= nproc);
             const long s = long(find(key)) * size / nproc;   // in [0, size*ndevice)
             return {int(s / ndevice), int(s % ndevice)};
         }

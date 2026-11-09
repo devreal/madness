@@ -57,55 +57,73 @@ void DeviceGraph::store(Functions f, DeviceFunctions& v) {
     pimpl->stored.push_back(&v);
 }
 
+namespace {
+    /// The parts of a reduction arriving at the roots of the batches of a set, or of its pairs
+    /// of batches (`arrivals` in all), gathered at the root of batch 0. Each part travels as it
+    /// is, tagged with its batch ([batch, size, values...]); the input reducer of the gather task
+    /// concatenates them, and `assemble` builds the whole result from the list.
+    template <std::size_t R>
+    ttg::Edge<mra::Key<3>, mra::DenseTensor<double, R>>
+    add_gather(MraGraph& g, ttg::Edge<mra::Key<3>, mra::DenseTensor<double, R>> in, int arrivals,
+               std::function<mra::DenseTensor<double, R>(const std::vector<double>&)> assemble) {
+        ttg::Edge<mra::Key<3>, std::vector<double>> tagged;
+        ttg::Edge<mra::Key<3>, mra::DenseTensor<double, R>> out;
+        g.add(ttg::make_tt([](const mra::Key<3>& key, const mra::DenseTensor<double, R>& part) {
+            const double* p = part.current_view().data();
+            std::vector<double> t{double(key.batch()), double(part.size())};
+            t.insert(t.end(), p, p + part.size());
+            ttg::send<0>(mra::Key<3>(mra::Batch(0), mra::Level(0)), std::move(t));
+        }, ttg::edges(in), ttg::edges(tagged), "gather-tag"));
+        auto gather = ttg::make_tt([assemble](const mra::Key<3>& key, std::vector<double>&& parts) {
+            ttg::send<0>(key, assemble(parts));
+        }, ttg::edges(tagged), ttg::edges(out), "gather");
+        gather->template set_input_reducer<0>([](std::vector<double>& a, const std::vector<double>& b) {
+            a.insert(a.end(), b.begin(), b.end());
+        }, arrivals);
+        g.add(std::move(gather));
+        return out;
+    }
+
+    /// f(batch, values) for each part of a list gathered by add_gather
+    void for_each_part(const std::vector<double>& parts, auto&& f) {
+        for (std::size_t i = 0; i + 1 < parts.size();) {
+            const std::size_t n = std::size_t(parts[i + 1]);
+            f(mra::Batch(parts[i]), parts.data() + i + 2);
+            i += 2 + n;
+        }
+    }
+}
+
 DeviceGraph::Matrix DeviceGraph::decide(Result r, Decision f) {
     MADNESS_CHECK_THROW(r.id >= 0 && r.id < int(pimpl->results.size()), "DeviceGraph: invalid result handle");
     Impl::Res& res = *pimpl->results[r.id];
     if (res.matrix && res.arrivals > 1) {
-        // the blocks of the pairs of batches, gathered at the root of batch 0: each widened to the
-        // whole matrix, the widened matrices summed by the input reducer of the gather task
+        // the blocks of the pairs of batches, placed into the whole matrix at the root of batch 0
         const long rows = res.value.dim(0), cols = res.value.dim(1);
         auto place = res.place;
-        ttg::Edge<mra::Key<3>, std::vector<double>> wide;
-        MatrixEdge gathered;
-        pimpl->g.add(ttg::make_tt([place, rows, cols](const mra::Key<3>& key, const mra::DenseTensor<double, 2>& block) {
+        auto gathered = add_gather<2>(pimpl->g, *res.matrix, res.arrivals, [place, rows, cols](const std::vector<double>& parts) {
             Tensor<double> w(rows, cols);
-            place(key, block.current_view().data(), w, 1.0);
-            ttg::send<0>(mra::Key<3>(mra::Batch(0), mra::Level(0)), std::vector<double>(w.ptr(), w.ptr() + w.size()));
-        }, ttg::edges(*res.matrix), ttg::edges(wide), "gather-widen"));
-        auto gather = ttg::make_tt([rows, cols](const mra::Key<3>& key, std::vector<double>&& w) {
+            for_each_part(parts, [&](mra::Batch b, const double* d) { place(mra::Key<3>(b, mra::Level(0)), d, w, 1.0); });
             mra::DenseTensor<double, 2> m(std::array<mra::size_type, 2>{mra::size_type(rows), mra::size_type(cols)});
-            std::copy(w.begin(), w.end(), m.buffer().host_ptr());
-            ttg::send<0>(key, std::move(m));
-        }, ttg::edges(wide), ttg::edges(gathered), "gather");
-        gather->template set_input_reducer<0>([](std::vector<double>& a, const std::vector<double>& b) {
-            for (std::size_t i = 0; i < a.size(); ++i) a[i] += b[i];
-        }, res.arrivals);
-        pimpl->g.add(std::move(gather));
+            std::copy(w.ptr(), w.ptr() + w.size(), m.buffer().host_ptr());
+            return m;
+        });
         return pimpl->add_decision(gathered, rows, cols, std::move(f));
     }
     if (res.matrix) return pimpl->add_decision(*res.matrix, res.value.dim(0), res.value.dim(1), std::move(f));
     if (res.vector && res.layout && res.layout->num_batches() > 1) {
-        // the batches' parts, gathered at the root of batch 0: each widened to the whole vector,
-        // the widened vectors summed by the input reducer of the gather task
+        // the batches' parts, placed into the whole vector at the root of batch 0
         const DeviceLayout layout = res.layout;
         const long n = res.value.dim(0);
-        ttg::Edge<mra::Key<3>, std::vector<double>> wide;
-        VectorEdge gathered;
-        pimpl->g.add(ttg::make_tt([layout, n](const mra::Key<3>& key, const mra::DenseTensor<double, 1>& part) {
-            std::vector<double> w(n, 0.0);
-            const double* p = part.current_view().data();
-            std::copy(p, p + layout->batch_size(key.batch()), w.begin() + layout->offset(key.batch()));
-            ttg::send<0>(mra::Key<3>(mra::Batch(0), mra::Level(0)), std::move(w));
-        }, ttg::edges(*res.vector), ttg::edges(wide), "gather-widen"));
-        auto gather = ttg::make_tt([n](const mra::Key<3>& key, std::vector<double>&& w) {
+        auto gathered = add_gather<1>(pimpl->g, *res.vector, layout->num_batches(), [layout, n](const std::vector<double>& parts) {
             mra::DenseTensor<double, 1> v{mra::size_type(n)};
-            std::copy(w.begin(), w.end(), v.buffer().host_ptr());
-            ttg::send<0>(key, std::move(v));
-        }, ttg::edges(wide), ttg::edges(gathered), "gather");
-        gather->template set_input_reducer<0>([](std::vector<double>& a, const std::vector<double>& b) {
-            for (std::size_t i = 0; i < a.size(); ++i) a[i] += b[i];
-        }, layout->num_batches());
-        pimpl->g.add(std::move(gather));
+            double* p = v.buffer().host_ptr();
+            std::fill(p, p + n, 0.0);
+            for_each_part(parts, [&](mra::Batch b, const double* d) {
+                std::copy(d, d + layout->batch_size(b), p + layout->offset(b));
+            });
+            return v;
+        });
         return pimpl->add_decision(gathered, n, 0, std::move(f));
     }
     if (res.vector) return pimpl->add_decision(*res.vector, res.value.dim(0), 0, std::move(f));

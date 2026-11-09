@@ -128,6 +128,17 @@ struct DeviceGraph::Impl {
     MatrixEdge add_matrix_inner(NodeEdge a, const DeviceLayout& la, NodeEdge b, const DeviceLayout& lb, bool same,
                                 Res& r, double fac, const std::string& name);
 
+    /// a set whose batches are summed into batches of another (add_sum_into): batch b of the set
+    /// goes to batch target(b) (-1: dropped)
+    struct SumSource {
+        NodeEdge e;
+        DeviceLayout layout;
+        std::function<int(mra::Batch)> target;
+    };
+    /// batch c of `out` = the sum of the batches of the sources whose target is c (each batch of
+    /// out at least one): summed in pairs, level by level, on the group of c (graph_ops.cc)
+    NodeEdge add_sum_into(const std::vector<SumSource>& sources, const DeviceLayout& out, const std::string& name);
+
     /// a task at the root computing a matrix on the host from the reduction arriving on `in`
     template <typename InT>
     Matrix add_decision(ttg::Edge<mra::Key<3>, InT> in, long rows, long cols, Decision f) {

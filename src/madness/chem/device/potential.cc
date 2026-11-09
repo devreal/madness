@@ -77,20 +77,7 @@ DeviceGraph::Functions DeviceGraph::density(Functions psi, const tensorT& occ) {
     if (nb == 1) return pimpl->add_functions(rho_e, one_batch(1));
     // the partial densities summed into one function on all processes
     const DeviceLayout one = one_batch(1);
-    auto fns_one = make_mrattg_functionset(one);
-    auto take = [&](mra::Batch b) {
-        NodeEdge e;
-        g.add(mra::make_take_batch<T, 3>(rho_e, e, b, 0, "rho-take-" + std::to_string(b),
-                                         device_procmap(parts), device_devicemap(parts)));
-        return e;
-    };
-    NodeEdge sum = take(0);
-    for (mra::Batch b = 1; b < nb; ++b) {
-        NodeEdge next;
-        g.add(mra::make_gaxpy(T(1.0), T(1.0), fns_one, g.K, sum, take(b), next, "rho-sum",
-                              device_procmap(one), device_devicemap(one)));
-        sum = next;
-    }
+    NodeEdge sum = pimpl->add_sum_into({{rho_e, parts, [](mra::Batch) { return 0; }}}, one, "rho-sum");
     return pimpl->add_functions(sum, one);
 }
 

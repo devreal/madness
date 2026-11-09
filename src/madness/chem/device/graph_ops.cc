@@ -155,8 +155,7 @@ namespace {
     /// batch of M otherwise.
     DeviceLayout transform_layout(const DeviceLayout& in, std::size_t M, const std::string& name) {
         if (in->num_batches() == 1) return one_batch(M);
-        MADNESS_CHECK_THROW(M == in->num_functions(),
-                            (name + ": with several batches, U must be square (block-diagonal in the batches)").c_str());
+        device_check(M == in->num_functions(), name + ": with several batches, U must be square (block-diagonal in the batches)");
         return in;
     }
 }
@@ -179,23 +178,15 @@ namespace {
     /// roots of `blocks`, block p being U's rows of batch rows(p) and columns of batch cols(p)
     template <typename Rows, typename Cols>
     MatrixEdge distribute_blocks(MraGraph& g, MatrixEdge U_full, const DeviceLayout& layout, std::size_t nblocks,
-                                 Rows rows, Cols cols, bool check_others_zero, const std::string& name) {
+                                 Rows rows, Cols cols, const std::string& name) {
         MatrixEdge blocks;
-        g.add(ttg::make_tt([layout, nblocks, rows, cols, check_others_zero](const mra::Key<3>& key,
-                                                                            const mra::DenseTensor<double, 2>& u) {
+        g.add(ttg::make_tt([layout, nblocks, rows, cols](const mra::Key<3>& key, const mra::DenseTensor<double, 2>& u) {
             const mra::size_type N = u.dim(0);
             const double* p = u.current_view().data();
             for (std::size_t q = 0; q < nblocks; ++q) {
                 const mra::Batch bi = rows(q), bo = cols(q);
                 const mra::size_type oi = layout->offset(bi), ni = layout->batch_size(bi);
                 const mra::size_type oo = layout->offset(bo), no = layout->batch_size(bo);
-                if (check_others_zero) {   // block-diagonal: nothing from other batches into bo
-                    for (mra::size_type i = 0; i < N; ++i) {
-                        if (i >= oi && i < oi + ni) continue;
-                        for (mra::size_type j = oo; j < oo + no; ++j)
-                            MADNESS_CHECK_THROW(p[i*N + j] == 0.0, "DeviceGraph::transform: U couples the functions of different batches");
-                    }
-                }
                 mra::DenseTensor<double, 2> blk(std::array<mra::size_type, 2>{ni, no});
                 double* b = blk.buffer().host_ptr();
                 for (mra::size_type i = 0; i < ni; ++i)
@@ -206,16 +197,32 @@ namespace {
         return blocks;
     }
 
+    /// U, arriving once at the root of batch 0 on U_full (N x N) and declared block-diagonal in
+    /// the batches of `layout`, cut into the batches' blocks, each sent to its batch's root. U is
+    /// computed in the graph, so a U that couples the batches is found only here, when it
+    /// arrives, and ends the run (mra::detail::batch_block, as make_transform checks a fixed U).
+    MatrixEdge distribute_diagonal_blocks(MraGraph& g, MatrixEdge U_full, const DeviceLayout& layout,
+                                          const std::string& name) {
+        MatrixEdge blocks;
+        auto fns = make_mrattg_functionset(layout);
+        g.add(ttg::make_tt([fns, name](const mra::Key<3>& key, const mra::DenseTensor<double, 2>& u) {
+            for (mra::Batch b = 0; b < mra::Batch(fns->num_batches()); ++b)
+                ttg::send<0>(mra::Key<3>(b, mra::Level(0)), mra::detail::batch_block<double>(u, *fns, *fns, b, name));
+        }, ttg::edges(U_full), ttg::edges(blocks), name + "-distribute"));
+        return blocks;
+    }
+
     /**
      * out_j = sum_i in_i U(i,j) for a set in several batches and a U that couples them (N x N,
      * arriving once at the root of batch 0). Each pair of batches (bi, bo) transforms the
      * functions of bi by U's block of bi's rows and bo's columns, under the key of the pair on
      * the group of bi, where bi's nodes are; the partial results of the pairs (k, bo) of each
-     * input batch k are then moved to bo, and those of all k summed (gaxpys, which reconcile
-     * their trees): this is where the batches' groups exchange functions.
+     * input batch k are then moved to bo and summed there (Impl::add_sum_into, whose gaxpys
+     * reconcile their trees): this is where the batches' groups exchange functions.
      */
-    NodeEdge add_dense_transform(MraGraph& g, NodeEdge in, const DeviceLayout& layout, MatrixEdge U_full,
+    NodeEdge add_dense_transform(DeviceGraph::Impl& impl, NodeEdge in, const DeviceLayout& layout, MatrixEdge U_full,
                                  double tol, const std::string& name) {
+        auto& g = impl.g;
         const mra::Batch nb = layout->num_batches();
         MADNESS_CHECK_THROW(long(nb) * nb < 32767, "DeviceGraph::transform: too many pairs of batches");
         std::vector<mra::Batch> homes;
@@ -239,25 +246,13 @@ namespace {
         }, name + "-pairs", device_procmap(layout), device_devicemap(layout)));
         MatrixEdge U_p = distribute_blocks(g, U_full, layout, std::size_t(nb) * nb,
                                            [nb](std::size_t q) { return mra::Batch(q / nb); },
-                                           [nb](std::size_t q) { return mra::Batch(q % nb); }, false, name);
+                                           [nb](std::size_t q) { return mra::Batch(q % nb); }, name);
         g.add(mra::make_transform<double, 3>(make_mrattg_functionset(pin), make_mrattg_functionset(pout), g.K, U_p,
                                              in_p, part, name, device_procmap(pout), device_devicemap(pout)));
-        // the partial results of input batch k, moved to their output batches, summed over k
-        auto stage = [&](mra::Batch k) {
-            NodeEdge e;
-            g.add(mra::make_rebatch<double, 3>(part, e, [nb, k](mra::Batch q) {
-                return (q / nb == k) ? std::vector<mra::Batch>{mra::Batch(q % nb)} : std::vector<mra::Batch>{};
-            }, name + "-stage-" + std::to_string(k), device_procmap(pout), device_devicemap(pout)));
-            return e;
-        };
+        // the partial results of all input batches, moved to their output batches and summed
+        NodeEdge sum = impl.add_sum_into({{part, pout, [nb](mra::Batch q) { return int(q % nb); }}}, layout,
+                                         name + "-sum");
         auto fns = make_mrattg_functionset(layout);
-        NodeEdge sum = stage(0);
-        for (mra::Batch k = 1; k < nb; ++k) {
-            NodeEdge next;
-            g.add(mra::make_gaxpy(1.0, 1.0, fns, g.K, sum, stage(k), next, "transform-sum",
-                                  device_procmap(layout), device_devicemap(layout)));
-            sum = next;
-        }
         if (tol <= 0.0) return sum;
         NodeEdge trunc_e;
         g.add(mra::make_truncate(fns, g.K, tol, FunctionDefaults<3>::get_truncate_mode(),
@@ -280,7 +275,7 @@ DeviceGraph::Functions DeviceGraph::transform(Functions in, const Tensor<double>
             if (key.batch() != 0) return;
             ttg::send<0>(key, std::move(*device_matrix(*Uh)));
         }, ttg::edges(g.control), ttg::edges(U_full), name + "-U"));
-        return pimpl->add_functions(add_dense_transform(g, pimpl->get(in).compressed, in_layout, U_full, tol, name),
+        return pimpl->add_functions(add_dense_transform(*pimpl, pimpl->get(in).compressed, in_layout, U_full, tol, name),
                                     out_layout);
     }
     // MRA-TTG cuts U to each batch's block (one batch: all of it)
@@ -293,17 +288,129 @@ DeviceGraph::Functions DeviceGraph::transform(Functions in, Matrix U, std::size_
     const DeviceLayout out_layout = transform_layout(in_layout, M, "DeviceGraph::transform");
     MatrixEdge U_e = pimpl->matrix(U);
     if (in_layout->num_batches() > 1 && !block_diagonal) {
-        return pimpl->add_functions(add_dense_transform(pimpl->g, pimpl->get(in).compressed, in_layout, U_e, tol,
+        return pimpl->add_functions(add_dense_transform(*pimpl, pimpl->get(in).compressed, in_layout, U_e, tol,
                                                         "transform"), out_layout);
     }
     if (in_layout->num_batches() > 1) {
         // block-diagonal: each batch's root gets its block (checked when it arrives)
-        U_e = distribute_blocks(pimpl->g, U_e, in_layout, in_layout->num_batches(),
-                                [](std::size_t b) { return mra::Batch(b); }, [](std::size_t b) { return mra::Batch(b); },
-                                true, "transform");
+        U_e = distribute_diagonal_blocks(pimpl->g, U_e, in_layout, "transform");
     }
     return pimpl->add_functions(add_transform(pimpl->g, pimpl->get(in).compressed, in_layout, out_layout, U_e, tol,
                                               "transform"), out_layout);
+}
+
+NodeEdge DeviceGraph::Impl::add_sum_into(const std::vector<SumSource>& sources, const DeviceLayout& out,
+                                         const std::string& name) {
+    using T = double;
+    const mra::Batch nc = out->num_batches();
+    // the elements summed into each batch c of out, (source, batch), and their counts
+    std::vector<std::vector<std::pair<int, mra::Batch>>> elems(nc);
+    for (int s = 0; s < int(sources.size()); ++s) {
+        for (mra::Batch b = 0; b < sources[s].layout->num_batches(); ++b) {
+            const int c = sources[s].target(b);
+            if (c < 0) continue;
+            device_check(c < nc && out->batch_size(mra::Batch(c)) == sources[s].layout->batch_size(b),
+                         name + ": a target batch that does not exist or has another size");
+            elems[c].emplace_back(s, b);
+        }
+    }
+    std::vector<int> cnt(nc);
+    for (mra::Batch c = 0; c < nc; ++c) {
+        cnt[c] = int(elems[c].size());
+        device_check(cnt[c] >= 1, name + ": a batch with nothing summed into it");
+    }
+
+    // The elements (c, j), j < count[c], of a level as the batches of a set, c by c, each on
+    // the group of c; with one element per c, the set is out itself. Each level halves the
+    // counts: element j goes to the operand x (j even) or y (j odd) of the gaxpy of (c, j/2) at
+    // the next level, or past it (the last of an odd count), so a node is sent once per level.
+    struct Level { std::vector<int> first; DeviceLayout layout; };
+    auto level_of = [&](const std::vector<int>& count) {
+        Level l{std::vector<int>(nc), out};
+        std::vector<mra::size_type> sizes;
+        std::vector<mra::Batch> homes;
+        bool single = true;
+        for (mra::Batch c = 0; c < nc; ++c) {
+            l.first[c] = int(sizes.size());
+            single = single && count[c] == 1;
+            for (int j = 0; j < count[c]; ++j) {
+                sizes.push_back(out->batch_size(c));
+                homes.push_back(c);
+            }
+        }
+        device_check(sizes.size() < 32767, name + ": too many batches to sum");
+        if (!single) l.layout = std::make_shared<const mra::BatchLayout>(sizes, out->groups().placed_as(homes));
+        return l;
+    };
+    constexpr int X = 0, Y = 1, PASS = 2;
+    using Routes = std::vector<std::pair<int, std::vector<mra::Batch>>>;
+    // the routes of the elements of an input set (by its batches) to the next level
+    auto route = [&](NodeEdge in, const DeviceLayout& in_layout, std::shared_ptr<const Routes> routes,
+                     std::array<NodeEdge, 3> outs, const std::string& what) {
+        g.add(mra::make_route<3, T, 3>(in, outs, [routes](mra::Batch b) { return (*routes)[b]; }, what,
+                                       device_procmap(in_layout), device_devicemap(in_layout)));
+    };
+
+    // element j of c at the current level: where it is (the first level: in the sources)
+    std::vector<int> count = cnt;
+    if (*std::max_element(count.begin(), count.end()) == 1) {
+        // one element per batch: moved to it
+        NodeEdge sum;
+        for (int s = 0; s < int(sources.size()); ++s) {
+            auto routes = std::make_shared<Routes>(sources[s].layout->num_batches(), Routes::value_type{-1, {}});
+            for (mra::Batch c = 0; c < nc; ++c)
+                if (elems[c][0].first == s) (*routes)[elems[c][0].second] = {0, {c}};
+            g.add(mra::make_route<1, T, 3>(sources[s].e, {sum}, [routes](mra::Batch b) { return (*routes)[b]; },
+                                           name + "-move", device_procmap(sources[s].layout),
+                                           device_devicemap(sources[s].layout)));
+        }
+        return sum;
+    }
+    NodeEdge cur;
+    DeviceLayout cur_layout;
+    std::vector<std::pair<mra::Batch, int>> cur_elem;   // (c, j) of each batch of the current level
+    for (int step = 0; *std::max_element(count.begin(), count.end()) > 1; ++step) {
+        std::vector<int> next(nc);
+        for (mra::Batch c = 0; c < nc; ++c) next[c] = (count[c] + 1) / 2;
+        const Level nl = level_of(next);
+        auto to = [&](mra::Batch c, int j) -> Routes::value_type {
+            const int o = (j % 2) ? Y : (j + 1 < count[c] ? X : PASS);
+            return {o, {mra::Batch(nl.first[c] + j / 2)}};
+        };
+        NodeEdge x, y, pass, sum;
+        const std::string lvl = name + "-" + std::to_string(step);
+        if (step == 0) {
+            for (int s = 0; s < int(sources.size()); ++s) {
+                auto routes = std::make_shared<Routes>(sources[s].layout->num_batches(), Routes::value_type{-1, {}});
+                for (mra::Batch c = 0; c < nc; ++c)
+                    for (int j = 0; j < count[c]; ++j)
+                        if (elems[c][j].first == s) (*routes)[elems[c][j].second] = to(c, j);
+                route(sources[s].e, sources[s].layout, routes, {x, y, pass}, lvl + "-route");
+            }
+        } else {
+            auto routes = std::make_shared<Routes>();
+            for (const auto& [c, j] : cur_elem) routes->push_back(to(c, j));
+            route(cur, cur_layout, routes, {x, y, pass}, lvl + "-route");
+        }
+        // (a literal name: make_gaxpy keeps the pointer)
+        g.add(mra::make_gaxpy(T(1.0), T(1.0), make_mrattg_functionset(nl.layout), g.K, x, y, sum, "sum-gaxpy",
+                              device_procmap(nl.layout), device_devicemap(nl.layout)));
+        cur = ttg::fuse(sum, pass);   // (pass connected even when nothing passes at this level)
+        cur_layout = nl.layout;
+        cur_elem.clear();
+        for (mra::Batch c = 0; c < nc; ++c)
+            for (int j = 0; j < next[c]; ++j) cur_elem.emplace_back(c, j);
+        count = next;
+    }
+    return cur;
+}
+
+DeviceGraph::Functions DeviceGraph::sum_into(const std::vector<std::pair<Functions, std::function<int(int)>>>& sources,
+                                             Layout out, const std::string& name) {
+    std::vector<Impl::SumSource> src;
+    for (const auto& [f, target] : sources)
+        src.push_back({pimpl->get(f).compressed, pimpl->get(f).layout, [target](mra::Batch b) { return target(b); }});
+    return pimpl->add_functions(pimpl->add_sum_into(src, out, name), out);
 }
 
 DeviceGraph::Layout DeviceGraph::layout(Functions f) {
@@ -313,15 +420,16 @@ DeviceGraph::Layout DeviceGraph::layout(Functions f) {
 DeviceGraph::Functions DeviceGraph::rebatch(Functions in, Layout out, std::function<std::vector<int>(int)> targets,
                                             const std::string& name) {
     const DeviceLayout in_layout = pimpl->get(in).layout;
-    auto to = [out, in_layout, targets, name](mra::Batch b) {
-        std::vector<mra::Batch> t;
+    // the targets of every input batch, checked now rather than in the graph's tasks
+    auto to_all = std::make_shared<std::vector<std::vector<mra::Batch>>>(in_layout->num_batches());
+    for (mra::Batch b = 0; b < in_layout->num_batches(); ++b) {
         for (int x : targets(b)) {
-            MADNESS_CHECK_THROW(x >= 0 && x < out->num_batches() && out->batch_size(mra::Batch(x)) == in_layout->batch_size(b),
-                                (name + ": a target batch of another size").c_str());
-            t.push_back(mra::Batch(x));
+            device_check(x >= 0 && x < out->num_batches() && out->batch_size(mra::Batch(x)) == in_layout->batch_size(b),
+                         name + ": a target batch that does not exist or has another size");
+            (*to_all)[b].push_back(mra::Batch(x));
         }
-        return t;
-    };
+    }
+    auto to = [to_all](mra::Batch b) { return (*to_all)[b]; };
     NodeEdge out_e;
     pimpl->g.add(mra::make_rebatch<double, 3>(pimpl->get(in).compressed, out_e, std::move(to), name,
                                               device_procmap(in_layout), device_devicemap(in_layout)));
@@ -332,12 +440,11 @@ DeviceGraph::Functions DeviceGraph::transform(Functions in, const std::vector<Te
                                               double tol, const std::string& name) {
     const DeviceLayout in_layout = pimpl->get(in).layout;
     const mra::Batch nb = in_layout->num_batches();
-    MADNESS_CHECK_THROW(out->num_batches() == nb && long(blocks.size()) == nb,
-                        (name + ": one block per batch, as many batches in and out").c_str());
+    device_check(out->num_batches() == nb && long(blocks.size()) == nb, name + ": one block per batch, as many batches in and out");
     auto bh = std::make_shared<std::vector<mra::DenseTensor<double, 2>>>();
     for (mra::Batch b = 0; b < nb; ++b) {
-        MADNESS_CHECK_THROW(blocks[b].dim(0) == long(in_layout->batch_size(b)) && blocks[b].dim(1) == long(out->batch_size(b)),
-                            (name + ": a block of the wrong size").c_str());
+        device_check(blocks[b].dim(0) == long(in_layout->batch_size(b)) && blocks[b].dim(1) == long(out->batch_size(b)),
+                     name + ": a block of the wrong size");
         bh->push_back(std::move(*device_matrix(blocks[b])));
     }
     // each batch's block, sent once into the graph to the root of the batch

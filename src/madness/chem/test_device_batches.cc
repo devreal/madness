@@ -153,7 +153,7 @@ int run(World& world, const std::map<std::string, std::string>& args) {
         DeviceFunctions psi_d = device_upload(world, psi);
         check(world, rel_diff(world, psi, psi_d, like) < tol, tag + "upload and download", rel_diff(world, psi, psi_d, like), tol);
         long misplaced = 0;
-        const mra::BatchGroups groups = device_batch_groups();
+        const mra::BatchGroups groups = layout->groups();
         fv(psi_d).for_each_local_node([&](const auto& key, const auto&) {
             misplaced += !groups.is_member(key.batch(), world.rank());
         });
@@ -244,10 +244,14 @@ int run(World& world, const std::map<std::string, std::string>& args) {
             if (nb == 1) K_one = device_download(world, K_d, like);
             check(world, rel_diff(world, K_one, K_d, like) < tol, tag + "exchange, against one batch",
                   rel_diff(world, K_one, K_d, like), tol);
-            // tiles of one pair with one batch, of one round of blocks with several
-            DeviceFunctions K_t = device_exchange(world, psi_d, 1e-4, cache, 1);
-            check(world, rel_diff(world, K_one, K_t, like) < tol, tag + "exchange in tiles, against one batch",
-                  rel_diff(world, K_one, K_t, like), tol);
+            // tiles of one pair with one batch, of parts of rounds with several (one pair of
+            // each block), and of two and four pairs (rounds cut, parts joined)
+            for (std::size_t tile : {1, 2, 4}) {
+                DeviceFunctions K_t = device_exchange(world, psi_d, 1e-4, cache, tile);
+                check(world, rel_diff(world, K_one, K_t, like) < tol,
+                      tag + "exchange in tiles of " + std::to_string(tile) + ", against one batch",
+                      rel_diff(world, K_one, K_t, like), tol);
+            }
         }
 
         // a transform block-diagonal in the batches
@@ -402,11 +406,32 @@ int run(World& world, const std::map<std::string, std::string>& args) {
                 DeviceGraph g(world);
                 auto f = g.feed(psi_d, true);
                 g.concat(f, g.feed(Vpsi_d, true));
-            } catch (const std::exception&) {
-                refused = true;
+            } catch (const std::exception& e) {
+                // and says why (the message must outlive the throw)
+                refused = std::string(e.what()).find("several batches") != std::string::npos;
             }
-            check(world, refused, tag + "concat refuses several batches", refused ? 0 : 1, 0);
+            check(world, refused, tag + "concat refuses several batches, and says why", refused ? 0 : 1, 0);
+            // a rebatch into batches of another size: refused when the graph is built
+            refused = false;
+            try {
+                DeviceGraph g(world);
+                g.rebatch(g.feed(psi_d, true), one_batch(N + 1), [](int) { return std::vector<int>{0}; });
+            } catch (const std::exception& e) {
+                refused = std::string(e.what()).find("another size") != std::string::npos;
+            }
+            check(world, refused, tag + "rebatch refuses a target of another size", refused ? 0 : 1, 0);
         }
+    }
+    // more batches than orbitals: one batch per orbital
+    {
+        set_device_orbital_batches(mra::Batch(N + 2));
+        const DeviceLayout layout = device_orbital_layout(N);
+        check(world, layout->num_batches() == N, "more batches than orbitals: one per orbital",
+              double(layout->num_batches()) - double(N), 0);
+        compress(world, psi);
+        DeviceFunctions psi_d = device_upload(world, psi);
+        check(world, rel_diff(world, psi, psi_d, like) < tol, "more batches than orbitals: upload and download",
+              rel_diff(world, psi, psi_d, like), tol);
     }
     set_device_orbital_batches(1);
     if (world.rank() == 0) print(failures ? "device batches test FAILED" : "device batches test passed");

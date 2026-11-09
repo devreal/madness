@@ -123,7 +123,7 @@ DeviceFunctions device_upload(World& world, const vecfuncT& f) {
     NodeEdge e;
     DeviceFunctions d;
     // orbitals (or functions of them) in the orbitals' batches; a single function (a potential) on all processes
-    const DeviceLayout layout = (f.size() == 1) ? one_batch(1) : device_orbital_layout(f.size());
+    const DeviceLayout layout = device_orbital_layout(f.size());
     load_compressed_mrattg(f, make_mrattg_functionset(layout), g.K, g.functiondata, g.control, e, g.tts, "upload");
     g.add(fv(d).make_store(e, f.size(), "upload_store", device_procmap(layout), device_devicemap(layout), layout));
     g.execute();

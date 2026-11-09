@@ -51,8 +51,9 @@
 /// other one's orbitals are sent: the steps above run per block, the transforms within each
 /// block. A block's contributions to K psi_i of batch a and to K psi_j of batch b are sent to
 /// their batches and summed there. The blocks are scheduled in rounds (a round-robin
-/// tournament of the batches) in which every batch is in one block, and so receives one
-/// contribution; a tile is a number of rounds.
+/// tournament of the batches) in which every batch is in one block. A tile is a number of
+/// rounds or, if a round has more pairs than a tile, a part of one: a chunk of the pairs of
+/// each of its blocks.
 
 #include <algorithm>
 #include "graph_impl.h"
@@ -144,27 +145,23 @@ std::vector<std::vector<std::pair<int, int>>> exchange_rounds(int nb) {
     return rounds;
 }
 
-/// one tile of the exchange with the orbitals in several batches: the blocks of `rounds`, their
-/// contributions added to K (empty: K is their sum)
+/// pairs (i, j) of the orbitals (global indices) of the block of batches a <= b
+struct PairChunk { int a, b; std::vector<std::pair<long, long>> pairs; };
+
+/// one tile of the exchange with the orbitals in several batches: the pairs of `chunks`, their
+/// contributions added to K (empty: K is their sum, and every batch must be in a chunk)
 void exchange_tile_batched(World& world, DeviceFunctions& psi, DeviceOperatorCache& cache,
-                           const std::vector<std::vector<std::pair<int, int>>>& rounds, DeviceFunctions& K) {
+                           const std::vector<PairChunk>& chunks, DeviceFunctions& K) {
     const double thresh = FunctionDefaults<3>::get_thresh();
     const DeviceLayout L = layout_of(psi);
     const auto off = [&](int b) { return long(L->offset(mra::Batch(b))); };
     const auto size = [&](int b) { return long(L->batch_size(mra::Batch(b))); };
 
-    // the blocks: the pairs (i, j) of a and b (global indices), computed by the group of `home`,
-    // which alternates between a and b (as for matrix_inner)
-    struct Block { int a, b, home, round; std::vector<std::pair<long, long>> pairs; };
+    // the blocks: the pairs (i, j) of a and b, computed by the group of `home`, which
+    // alternates between a and b (as for matrix_inner)
+    struct Block { int a, b, home; std::vector<std::pair<long, long>> pairs; };
     std::vector<Block> blocks;
-    for (std::size_t k = 0; k < rounds.size(); ++k) {
-        for (const auto& [a, b] : rounds[k]) {
-            Block q{a, b, ((a + b) % 2 == 1) ? b : a, int(k), {}};
-            for (long i = off(a); i < off(a) + size(a); ++i)
-                for (long j = (a == b ? i : off(b)); j < off(b) + size(b); ++j) q.pairs.emplace_back(i, j);
-            blocks.push_back(std::move(q));
-        }
-    }
+    for (const PairChunk& c : chunks) blocks.push_back({c.a, c.b, ((c.a + c.b) % 2 == 1) ? c.b : c.a, c.pairs});
     // the directed products of each block by the batch of their targets: (target, source, pair
     // in the block). A block of one batch has one set of them, a block of two one per batch.
     struct Directed { int block, t, s; std::vector<std::array<long, 3>> d; };
@@ -230,7 +227,6 @@ void exchange_tile_batched(World& world, DeviceFunctions& psi, DeviceOperatorCac
     // where the nodes of a batch go: the blocks and directed sets that use it
     std::vector<std::vector<int>> to_a(L->num_batches()), to_b(L->num_batches()), to_s(L->num_batches()),
         v_to(blocks.size());
-    std::vector<std::vector<std::vector<int>>> to_t(rounds.size(), std::vector<std::vector<int>>(dirs.size()));
     for (int q = 0; q < int(blocks.size()); ++q) {
         to_a[blocks[q].a].push_back(q);
         to_b[blocks[q].b].push_back(q);
@@ -238,7 +234,6 @@ void exchange_tile_batched(World& world, DeviceFunctions& psi, DeviceOperatorCac
     for (int r = 0; r < int(dirs.size()); ++r) {
         to_s[dirs[r].s].push_back(r);
         v_to[dirs[r].block].push_back(r);
-        to_t[blocks[dirs[r].block].round][r].push_back(dirs[r].t);
     }
     const auto targets = [](std::vector<std::vector<int>> to) {
         return [to = std::move(to)](int b) { return to[b]; };
@@ -256,14 +251,15 @@ void exchange_tile_batched(World& world, DeviceFunctions& psi, DeviceOperatorCac
     auto C = g.transform(g.rebatch(f, LS, targets(to_s), "x-to-C"), Uc, LD, 0.0, "x-C");
     auto W = g.transform(g.rebatch(v, LV, targets(v_to), "x-to-W"), Uw, LD, 0.0, "x-W");
     auto kp = g.transform(g.multiply(C, W, 0.0, "x-dir"), Us, LT, 0.0, "x-sum");
-    // the contributions of each round, one per batch, to their batches, summed there
-    std::optional<DeviceGraph::Functions> sum;
-    if (K.size() != 0) sum = g.feed(K, false);
-    for (std::size_t k = 0; k < rounds.size(); ++k) {
-        auto part = g.rebatch(kp, L, targets(to_t[k]), "x-to-K-" + std::to_string(k));
-        sum = sum ? g.gaxpy(1.0, *sum, 1.0, part, 0.0) : part;
-    }
-    g.store(*sum, K);
+    // the contributions to their batches, summed there (and to K so far)
+    std::vector<std::pair<DeviceGraph::Functions, std::function<int(int)>>> parts;
+    parts.emplace_back(kp, [targets = std::vector<int>([&] {
+        std::vector<int> t;
+        for (const Directed& D : dirs) t.push_back(D.t);
+        return t;
+    }())](int r) { return targets[r]; });
+    if (K.size() != 0) parts.emplace_back(g.feed(K, false), [](int c) { return c; });
+    g.store(g.sum_into(parts, L, "x-K"), K);
     g.execute();
 }
 
@@ -278,21 +274,61 @@ DeviceFunctions device_exchange(World& world, DeviceFunctions& psi, double lo, D
 
     const DeviceLayout L = layout_of(psi);
     if (L->num_batches() > 1) {
-        // tiles of whole rounds, of at most `tile` pairs unless a round has more
-        const auto rounds = exchange_rounds(L->num_batches());
-        const auto npairs = [&](const std::vector<std::pair<int, int>>& round) {
-            std::size_t n = 0;
+        // The rounds, each cut into parts of at most `tile` pairs: every block of the round
+        // contributes a chunk of its pairs to each part (the first chunk is never empty, so the
+        // first part, which starts K, reaches every batch). Consecutive parts form the tiles.
+        const auto off = [&](int b) { return long(L->offset(mra::Batch(b))); };
+        const auto size = [&](int b) { return long(L->batch_size(mra::Batch(b))); };
+        std::vector<std::vector<PairChunk>> parts;
+        for (const auto& round : exchange_rounds(L->num_batches())) {
+            std::vector<PairChunk> blocks;
+            std::size_t npairs = 0;
             for (const auto& [a, b] : round) {
-                const std::size_t na = L->batch_size(mra::Batch(a)), nb = L->batch_size(mra::Batch(b));
-                n += (a == b) ? na * (na + 1) / 2 : na * nb;
+                PairChunk q{a, b, {}};
+                for (long i = off(a); i < off(a) + size(a); ++i)
+                    for (long j = (a == b ? i : off(b)); j < off(b) + size(b); ++j) q.pairs.emplace_back(i, j);
+                npairs += q.pairs.size();
+                blocks.push_back(std::move(q));
             }
+            // part k holds chunk k of every block, chunks of ceil(T/m) of a block's T pairs; m
+            // grows until each part fits a tile, or the chunks are single pairs
+            std::size_t max_block = 0;
+            for (const PairChunk& q : blocks) max_block = std::max(max_block, q.pairs.size());
+            const auto part_pairs = [&](std::size_t m, std::size_t k) {
+                std::size_t n = 0;
+                for (const PairChunk& q : blocks) {
+                    const std::size_t c = (q.pairs.size() + m - 1) / m;
+                    n += std::min(q.pairs.size(), (k + 1) * c) - std::min(q.pairs.size(), k * c);
+                }
+                return n;
+            };
+            std::size_t m = (tile == 0) ? 1 : std::max<std::size_t>(1, (npairs + tile - 1) / tile);
+            while (tile != 0 && m < max_block && part_pairs(m, 0) > tile) ++m;
+            for (std::size_t k = 0; k < m; ++k) {
+                std::vector<PairChunk> part;
+                for (const PairChunk& q : blocks) {
+                    const std::size_t c = (q.pairs.size() + m - 1) / m;   // chunk size
+                    const std::size_t p0 = std::min(k * c, q.pairs.size()), p1 = std::min(p0 + c, q.pairs.size());
+                    if (p0 < p1) part.push_back({q.a, q.b, {q.pairs.begin() + p0, q.pairs.begin() + p1}});
+                }
+                if (!part.empty()) parts.push_back(std::move(part));
+            }
+        }
+        const auto npairs = [](const std::vector<PairChunk>& part) {
+            std::size_t n = 0;
+            for (const PairChunk& q : part) n += q.pairs.size();
             return n;
         };
         DeviceFunctions K;
-        for (std::size_t r0 = 0; r0 < rounds.size();) {
-            std::size_t r1 = r0 + 1, count = npairs(rounds[r0]);
-            while (r1 < rounds.size() && (tile == 0 || count + npairs(rounds[r1]) <= tile)) count += npairs(rounds[r1++]);
-            exchange_tile_batched(world, psi, cache, {rounds.begin() + r0, rounds.begin() + r1}, K);
+        for (std::size_t r0 = 0; r0 < parts.size();) {
+            std::vector<PairChunk> chunks = parts[r0];
+            std::size_t r1 = r0 + 1, count = npairs(parts[r0]);
+            while (r1 < parts.size() && (tile == 0 || count + npairs(parts[r1]) <= tile)) {
+                count += npairs(parts[r1]);
+                chunks.insert(chunks.end(), parts[r1].begin(), parts[r1].end());
+                ++r1;
+            }
+            exchange_tile_batched(world, psi, cache, chunks, K);
             r0 = r1;
         }
         return K;
