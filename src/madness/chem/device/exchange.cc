@@ -181,11 +181,10 @@ void exchange_tile_batched(World& world, DeviceFunctions& psi, DeviceOperatorCac
         if (B.a != B.b) dirs.push_back(std::move(db));
     }
 
-    // the layouts of the sets per block and per directed set, on the group of their block's home
+    // the layouts of the sets per block and per directed set, where their block's home batch is
     const auto layout = [&](const std::vector<mra::size_type>& sizes, const std::vector<int>& homes) {
-        std::vector<std::pair<int, int>> ranges;
-        for (int h : homes) ranges.push_back(L->groups().batch_pes(mra::Batch(h)));
-        return std::make_shared<const mra::BatchLayout>(sizes, mra::BatchGroups(ranges, L->num_pes()));
+        return std::make_shared<const mra::BatchLayout>(
+            sizes, L->groups().placed_as(std::vector<mra::Batch>(homes.begin(), homes.end())));
     };
     std::vector<mra::size_type> s_a, s_b, s_p, s_s, s_v, s_d, s_t;
     std::vector<int> h_q, h_r;

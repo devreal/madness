@@ -218,16 +218,16 @@ namespace {
                                  double tol, const std::string& name) {
         const mra::Batch nb = layout->num_batches();
         MADNESS_CHECK_THROW(long(nb) * nb < 32767, "DeviceGraph::transform: too many pairs of batches");
-        std::vector<std::pair<int, int>> ranges;
+        std::vector<mra::Batch> homes;
         std::vector<mra::size_type> sizes_in, sizes_out;
         for (mra::Batch bi = 0; bi < nb; ++bi) {
             for (mra::Batch bo = 0; bo < nb; ++bo) {
-                ranges.push_back(layout->groups().batch_pes(bi));
+                homes.push_back(bi);
                 sizes_in.push_back(layout->batch_size(bi));
                 sizes_out.push_back(layout->batch_size(bo));
             }
         }
-        const mra::BatchGroups pg(ranges, layout->num_pes());
+        const mra::BatchGroups pg = layout->groups().placed_as(homes);
         const DeviceLayout pin = std::make_shared<const mra::BatchLayout>(sizes_in, pg);
         const DeviceLayout pout = std::make_shared<const mra::BatchLayout>(sizes_out, pg);
         // the input of batch bi to its pairs (bi, bo), q = bi*nb + bo

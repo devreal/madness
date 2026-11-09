@@ -280,8 +280,10 @@ struct DeviceProcMap {
     }
 };
 
-/// The device of a node within its process: as the map assigns it (SFCPmap::device, within
-/// the batch's group as SFCPmap::group_part) or, for a map without devices, by a hash of the
+/// The device of a node within its process. Batches that share a process share its devices,
+/// each in its share of them (mra::BatchGroups::batch_devices); within the share, a node goes
+/// where the map assigns it (SFCPmap::device, within the batch's group as
+/// SFCPmap::group_part, scaled to the share) or, for a map without devices, by a hash of the
 /// node's ancestor at a coarse level, so that nearby nodes share a device.
 struct DeviceDevMap {
     std::shared_ptr<const SFCPmap<3>> sfc =
@@ -291,12 +293,16 @@ struct DeviceDevMap {
     DeviceDevMap(const mra::BatchGroups& groups, int ndevice) : groups(groups), ndevice(ndevice) {}
     int operator()(const mra::Key<3>& key) const {
         const Key<3> k = key.to_madness_key();
+        const auto [d0, d1] = groups.batch_devices(key.batch(), ndevice);
+        const int width = d1 - d0;
+        if (width == 1) return d0;
         if (sfc) {
             const auto [first, last] = groups.batch_pes(key.batch());
-            return sfc->group_part(k, last - first).second % ndevice;
+            const int part = sfc->group_part(k, last - first).second % ndevice;   // in [0, ndevice)
+            return d0 + part * width / ndevice;
         }
         constexpr Level coarse = 3;
-        return int((k.level() <= coarse ? k : k.parent(k.level() - coarse)).hash() % ndevice);
+        return d0 + int((k.level() <= coarse ? k : k.parent(k.level() - coarse)).hash() % width);
     }
 };
 

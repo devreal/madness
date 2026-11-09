@@ -45,6 +45,7 @@
 #include <cmath>
 #include <map>
 #include <random>
+#include <set>
 #include <string>
 
 using namespace madness;
@@ -158,6 +159,36 @@ int run(World& world, const std::map<std::string, std::string>& args) {
         });
         world.gop.sum(misplaced);
         check(world, misplaced == 0, tag + "nodes on their batch's group", misplaced, 0);
+
+        // the devices of the nodes (4 per process): batches sharing a process each in their own
+        // share of its devices, a batch with a group of its own on all of them
+        {
+            constexpr int ndev = 4;
+            const DeviceDevMap devmap(groups, ndev);
+            long off_share = 0, shared = 0, spread = 0;
+            std::vector<std::set<int>> used(nb);
+            fv(psi_d).for_each_local_node([&](const auto& key, const auto&) {
+                const auto [d0, d1] = groups.batch_devices(key.batch(), ndev);
+                const int d = devmap(key);
+                off_share += (d < d0 || d >= d1);
+                used[key.batch()].insert(d);
+            });
+            for (mra::Batch a = 0; a < nb; ++a) {
+                const auto [sa, na] = groups.batch_slot(a);
+                // with no more batches on the process than devices, a batch's share is its own
+                for (mra::Batch b = a + 1; b < nb && na <= ndev; ++b)
+                    if (groups.batch_pes(a) == groups.batch_pes(b))
+                        for (int d : used[a]) shared += used[b].count(d);
+                // a batch alone on its processes uses all their devices
+                if (na == 1 && !used[a].empty() && int(used[a].size()) < ndev) ++spread;
+            }
+            world.gop.sum(off_share);
+            world.gop.sum(shared);
+            world.gop.sum(spread);
+            check(world, off_share == 0, tag + "nodes on their batch's devices", off_share, 0);
+            check(world, shared == 0, tag + "batches on one process on different devices", shared, 0);
+            check(world, spread == 0, tag + "a batch alone on its processes on all devices", spread, 0);
+        }
 
         // norms and <psi_i|psi_i>
         {

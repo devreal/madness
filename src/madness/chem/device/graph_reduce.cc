@@ -62,7 +62,7 @@ MatrixEdge DeviceGraph::Impl::add_matrix_inner(NodeEdge a, const DeviceLayout& l
     // bb: the nodes of the home batch stay on their processes, those of the other are sent there.
     // For a set with itself the home alternates, so that each batch is home to about half its pairs.
     std::vector<std::pair<mra::Batch, mra::Batch>> pairs;
-    std::vector<std::pair<int, int>> ranges;
+    std::vector<std::pair<int, int>> ranges, slots;   // the home batch's group and slot
     std::vector<mra::size_type> sizes_a, sizes_b;
     auto ta = std::make_shared<std::vector<std::vector<mra::Batch>>>(la->num_batches());
     auto tb = std::make_shared<std::vector<std::vector<mra::Batch>>>(lb->num_batches());
@@ -72,14 +72,16 @@ MatrixEdge DeviceGraph::Impl::add_matrix_inner(NodeEdge a, const DeviceLayout& l
             MADNESS_CHECK_THROW(pairs.size() < 32767, "DeviceGraph: too many pairs of batches for a matrix");
             pairs.emplace_back(ba, bb);
             const bool home_b = same && ((ba + bb) % 2 == 1);
-            ranges.push_back(home_b ? lb->groups().batch_pes(bb) : la->groups().batch_pes(ba));
+            const mra::BatchGroups& hg = home_b ? lb->groups() : la->groups();
+            ranges.push_back(hg.batch_pes(home_b ? bb : ba));
+            slots.push_back(hg.batch_slot(home_b ? bb : ba));
             sizes_a.push_back(la->batch_size(ba));
             sizes_b.push_back(lb->batch_size(bb));
             (*ta)[ba].push_back(p);
             (*tb)[bb].push_back(p);
         }
     }
-    const mra::BatchGroups pg(ranges, la->num_pes());
+    const mra::BatchGroups pg(ranges, la->num_pes(), slots);
     const DeviceLayout pa = std::make_shared<const mra::BatchLayout>(sizes_a, pg);
     const DeviceLayout pb = std::make_shared<const mra::BatchLayout>(sizes_b, pg);
     NodeEdge a_p, b_p;
