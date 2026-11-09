@@ -2955,13 +2955,32 @@ void SCF::solve_simple(World& world) {
                                       ? std::stoul(std::getenv("MRA_TTG_EXCHANGE_TILE")) : device_exchange_auto_tile;
     const bool device_only = resident && local_potential && param.deriv() == "abgv";
     DeviceFunctions amo_d;
-    // KAIN (maxsub > 1): the history of iterates and residuals as one device vector, pair s
-    // holding psi^(s) at [2sN, 2sN+N) and -r^(s) at [2sN+N, 2sN+2N), oldest first; kain_Q is
-    // the KAIN matrix of the pairs
+    // KAIN (maxsub > 1): the history of iterates psi^(s) and negated residuals -r^(s), oldest
+    // first, a device vector each with the orbitals' layout: KAIN only combines the history of
+    // the same orbital, so it is elementwise in the orbitals but for kain_Q, the KAIN matrix of
+    // the pairs, a sum over them
     const bool kain = param.maxsub() > 1;
-    DeviceFunctions hist_d;
-    long nhist = 0;
+    std::vector<DeviceFunctions> hist_psi, hist_rneg;
     tensorT kain_Q;
+    // validation: the history as MADNESS functions [psi^(0), -r^(0), psi^(1), -r^(1), ...], and
+    // the comparison of the device's with such a list
+    auto download_history = [&]() {
+        vecfuncT ref;
+        for (std::size_t t = 0; t < hist_psi.size(); ++t) {
+            for (auto& f : device_download(world, hist_psi[t], amo.front())) ref.push_back(f);
+            for (auto& f : device_download(world, hist_rneg[t], amo.front())) ref.push_back(f);
+        }
+        return ref;
+    };
+    auto validate_history = [&](const vecfuncT& ref, const std::string& what) {
+        for (std::size_t t = 0; t < hist_psi.size(); ++t) {
+            const long n = hist_psi[t].size();
+            const auto first = ref.begin() + 2 * t * n;
+            validate_device_functions(world, vecfuncT(first, first + n), hist_psi[t], amo.front(), what + " psi");
+            validate_device_functions(world, vecfuncT(first + n, first + 2 * n), hist_rneg[t], amo.front(),
+                                      what + " -r");
+        }
+    };
     // the nuclear potential on the device, uploaded once: vnuc_h is the host function it was
     // made from (held, so that a new function cannot reuse its impl's address)
     DeviceFunctions vnuc_d;
@@ -3299,7 +3318,7 @@ void SCF::solve_simple(World& world) {
             if (validate_mra_ttg) {
                 psi_ref = device_download(world, amo_d, amo.front());
                 Vpsi_ref = device_download(world, Vpsi_d, amo.front());
-                if (kain && nhist > 0) hist_ref = device_download(world, hist_d, amo.front());
+                if (kain) hist_ref = download_history();
             }
             {
                 DeviceRange range("Diagonalization (device)");
@@ -3329,14 +3348,10 @@ void SCF::solve_simple(World& world) {
                     return D;
                 });
                 g.store(g.transform(psi_rot, scale, n, 0.0), amo_d);
-                if (kain && nhist > 0) {   // rotate the KAIN history along (cf. rotate_subspace)
-                    const long nb = 2 * nhist;
-                    auto Ublock = g.decide(U, [n, nb](const Tensor<double>& u) {
-                        Tensor<double> b(nb * n, nb * n);
-                        for (long k = 0; k < nb; ++k) b(Slice(k * n, k * n + n - 1), Slice(k * n, k * n + n - 1)) = u;
-                        return b;
-                    });
-                    g.store(g.transform(g.feed(hist_d, false), Ublock, nb * n, 0.0), hist_d);
+                if (kain) {   // rotate the KAIN history along (cf. rotate_subspace), each entry as psi
+                    for (auto* hist : {&hist_psi, &hist_rneg}) {
+                        for (auto& h : *hist) g.store(g.transform(g.feed(h, false), U, n, 0.0), h);
+                    }
                 }
                 g.execute();
             }
@@ -3359,12 +3374,14 @@ void SCF::solve_simple(World& world) {
                 truncate(world, psi_rot, thresh);
                 normalize(world, psi_rot);
                 validate_device_functions(world, psi_rot, amo_d, amo.front(), "rotated psi");
-                if (kain && nhist > 0) {
-                    const long nb = 2 * nhist;
-                    tensorT Ublock(nb * n, nb * n);
-                    for (long k = 0; k < nb; ++k) Ublock(Slice(k * n, k * n + n - 1), Slice(k * n, k * n + n - 1)) = U_dev;
-                    validate_device_functions(world, transform(world, hist_ref, Ublock, 0.0, true), hist_d,
-                                              amo.front(), "rotated KAIN history");
+                if (kain && !hist_psi.empty()) {
+                    vecfuncT rotated;
+                    for (std::size_t k = 0; k < hist_ref.size(); k += n) {
+                        for (auto& f : transform(world, vecfuncT(hist_ref.begin() + k, hist_ref.begin() + k + n), U_dev,
+                                                 0.0, true))
+                            rotated.push_back(f);
+                    }
+                    validate_history(rotated, "rotated KAIN history");
                 }
             }
             aeps = evals;
@@ -3486,43 +3503,51 @@ void SCF::solve_simple(World& world) {
             END_TIMER(world, "BSH residual (device)");
 
             if (kain) {
-                // KAIN (cf. update_subspace) [ttg: concat + matrix_inner + transform + norm]
+                // KAIN (cf. update_subspace). The history holds each orbital's own iterates and
+                // residuals: all but the KAIN matrix, a sum over the orbitals, is elementwise in them.
                 START_TIMER(world);
                 const long n = nmo;
-                // append the current pair [psi, -r] to the history [ttg: concat(s) + matrix_inner, one graph]
-                tensorT M;   // <pair_i | hist_j>
+                // append the current pair: the orbitals move into the history (the update makes new
+                // ones), with the negated residual
+                hist_psi.push_back(std::move(amo_d));
+                hist_rneg.push_back(std::move(rneg_d));
+                long m = long(hist_psi.size());
                 // validation: the history as MADNESS functions, followed through every change below
                 vecfuncT hist_ref;
-                if (validate_mra_ttg) {
-                    if (nhist > 0) hist_ref = device_download(world, hist_d, amo.front());
-                    for (auto& f : device_download(world, amo_d, amo.front())) hist_ref.push_back(f);
-                    for (auto& f : device_download(world, rneg_d, amo.front())) hist_ref.push_back(f);
-                }
-                {
-                    DeviceRange range("KAIN append history (device)");
-                    DeviceGraph g(world);
-                    auto psi = g.feed(amo_d, true);
-                    auto pair = g.concat(psi, g.feed(rneg_d, false));
-                    auto hist = (nhist == 0) ? pair : g.concat(g.feed(hist_d, false), pair);
-                    auto r = g.matrix_inner(pair, hist);
-                    g.store(hist, hist_d);
-                    g.execute();
-                    M = g.get(r);
-                }
-                if (validate_mra_ttg) {
-                    validate_device_functions(world, hist_ref, hist_d, amo.front(), "KAIN history");
-                    const vecfuncT pair_ref(hist_ref.end() - 2 * n, hist_ref.end());
-                    validate_device_values(world, matrix_inner(world, pair_ref, hist_ref), M, "KAIN <pair|history>");
-                }
-                long m = ++nhist;
+                if (validate_mra_ttg) hist_ref = download_history();
 
                 // new row and column of the KAIN matrix: sum_i <psi_i|r^(t)_i>, sum_i <psi^(t)_i|r_i>
+                // [ttg: inner, 2m of them in one graph]
                 tensorT ms(m), sm(m);
-                for (long t = 0; t < m; ++t) {
-                    for (long i = 0; i < n; ++i) {
-                        ms[t] -= M(i, 2 * t * n + n + i);
-                        sm[t] -= M(n + i, 2 * t * n + i);
+                {
+                    DeviceRange range("KAIN matrix (device)");
+                    DeviceGraph g(world);
+                    std::vector<DeviceGraph::Functions> p(m), r(m);
+                    for (long t = 0; t < m; ++t) {
+                        p[t] = g.feed(hist_psi[t], true);
+                        r[t] = g.feed(hist_rneg[t], true);
                     }
+                    std::vector<DeviceGraph::Result> pr(m), rp(m);
+                    for (long t = 0; t < m; ++t) {
+                        pr[t] = g.inner(p[m - 1], r[t]);
+                        rp[t] = g.inner(r[m - 1], p[t]);
+                    }
+                    g.execute();
+                    for (long t = 0; t < m; ++t) {
+                        ms[t] = -g.get(pr[t]).sum();
+                        sm[t] = -g.get(rp[t]).sum();
+                    }
+                }
+                if (validate_mra_ttg) {
+                    tensorT ms_ref(m), sm_ref(m);
+                    for (long t = 0; t < m; ++t) {
+                        for (long i = 0; i < n; ++i) {
+                            ms_ref[t] -= inner(hist_ref[2 * (m - 1) * n + i], hist_ref[2 * t * n + n + i]);
+                            sm_ref[t] -= inner(hist_ref[2 * (m - 1) * n + n + i], hist_ref[2 * t * n + i]);
+                        }
+                    }
+                    validate_device_values(world, ms_ref, ms, "KAIN matrix row");
+                    validate_device_values(world, sm_ref, sm, "KAIN matrix column");
                 }
                 tensorT newQ(m, m);
                 if (m > 1) newQ(Slice(0, -2), Slice(0, -2)) = kain_Q;
@@ -3549,18 +3574,11 @@ void SCF::solve_simple(World& world) {
                     }
                     // subspace malfunction: keep only the current pair
                     if (world.rank() == 0 and (param.print_level() > 3)) print("Restarting KAIN due to subspace malfunction");
-                    tensorT keep_last(2 * m * n, 2 * n);
-                    for (long i = 0; i < 2 * n; ++i) keep_last(2 * (m - 1) * n + i, i) = 1.0;
-                    {
-                        DeviceRange range("KAIN restart (device)");
-                        device_transform(world, hist_d, keep_last, 0.0);
-                    }
-                    if (validate_mra_ttg) {
-                        hist_ref = transform(world, hist_ref, keep_last, 0.0, true);
-                        validate_device_functions(world, hist_ref, hist_d, amo.front(), "KAIN history (restart)");
-                    }
+                    hist_psi.erase(hist_psi.begin(), hist_psi.end() - 1);
+                    hist_rneg.erase(hist_rneg.begin(), hist_rneg.end() - 1);
+                    if (validate_mra_ttg) hist_ref = vecfuncT(hist_ref.end() - 2 * n, hist_ref.end());
                     const double q = kain_Q(m - 1, m - 1);
-                    nhist = m = 1;
+                    m = 1;
                     kain_Q = tensorT(1, 1);
                     kain_Q(0, 0) = q;
                     rcond = 1e-12;
@@ -3569,54 +3587,65 @@ void SCF::solve_simple(World& world) {
                 if (world.rank() == 0 and (param.print_level() > 3)) print("Subspace solution", kc);
 
                 // new orbitals sum_t c_t (psi^(t) - r^(t)), as the step D from the current psi (the
-                // last pair), restricted to ||D_i|| <= maxrotn (cf. do_step_restriction)
-                tensorT D(2 * m * n, n);
-                for (long t = 0; t < m; ++t) {
-                    for (long i = 0; i < n; ++i) {
-                        D(2 * t * n + i, i) = kc[t];
-                        D(2 * t * n + n + i, i) = kc[t];
-                    }
-                }
-                for (long i = 0; i < n; ++i) D(2 * (m - 1) * n + i, i) -= 1.0;
+                // last pair), restricted to ||D_i|| <= maxrotn (cf. do_step_restriction). One graph:
+                // D = sum_t (c_t - [t == m-1]) psi^(t) + c_t (-r^(t)), its norms, the restriction
+                // decided from them, and psi^(m-1) + step_i D_i
+                // [ttg: gaxpy chain + norm + transform + gaxpy]
                 std::vector<double> dnorm;
                 {
-                    DeviceRange range("KAIN step norms (device)");
-                    dnorm = device_transform_norms(world, hist_d, D);
+                    DeviceRange range("KAIN update orbitals (device)");
+                    DeviceGraph g(world);
+                    std::vector<double> c;
+                    std::vector<DeviceGraph::Functions> f;
+                    for (long t = 0; t < m; ++t) {
+                        c.push_back(kc[t] - (t == m - 1 ? 1.0 : 0.0));
+                        f.push_back(g.feed(hist_psi[t], true));
+                        c.push_back(kc[t]);
+                        f.push_back(g.feed(hist_rneg[t], true));
+                    }
+                    auto D = g.combine(c, f);
+                    auto Dnorm = g.norms(D);
+                    const double maxrotn = param.maxrotn();
+                    auto step = g.decide(Dnorm, [maxrotn](const Tensor<double>& norms) {
+                        Tensor<double> S(norms.dim(0), norms.dim(0));
+                        for (long i = 0; i < norms.dim(0); ++i) S(i, i) = (norms(i) > maxrotn) ? maxrotn / norms(i) : 1.0;
+                        return S;
+                    });
+                    // the history is kept: combine, as it never passes on a node of psi^(m-1)
+                    g.store(g.combine({1.0, 1.0}, {f[2 * (m - 1)], g.transform(D, step, n, 0.0)}), amo_d);
+                    g.execute();
+                    const Tensor<double> dn = g.get(Dnorm);
+                    dnorm.assign(dn.ptr(), dn.ptr() + dn.size());
                 }
                 if (validate_mra_ttg) {
+                    tensorT D(2 * m * n, n);
+                    for (long t = 0; t < m; ++t) {
+                        for (long i = 0; i < n; ++i) {
+                            D(2 * t * n + i, i) = kc[t];
+                            D(2 * t * n + n + i, i) = kc[t];
+                        }
+                    }
+                    for (long i = 0; i < n; ++i) D(2 * (m - 1) * n + i, i) -= 1.0;
                     const std::vector<double> ref = norm2s(world, transform(world, hist_ref, D, 0.0, true));
                     validate_device_values(world, ref, dnorm, "KAIN step norms");
-                }
-                tensorT Unew(2 * m * n, n);
-                for (long i = 0; i < n; ++i) {
-                    const double step = (dnorm[i] > param.maxrotn()) ? param.maxrotn() / dnorm[i] : 1.0;
-                    Unew(_, i) = step * D(_, i);
-                    Unew(2 * (m - 1) * n + i, i) += 1.0;
-                }
-                {
-                    DeviceRange range("KAIN update orbitals (device)");
-                    amo_d = device_transformed(world, hist_d, Unew, 0.0);
-                }
-                if (validate_mra_ttg)
+                    tensorT Unew(2 * m * n, n);
+                    for (long i = 0; i < n; ++i) {
+                        const double step = (dnorm[i] > param.maxrotn()) ? param.maxrotn() / dnorm[i] : 1.0;
+                        Unew(_, i) = step * D(_, i);
+                        Unew(2 * (m - 1) * n + i, i) += 1.0;
+                    }
                     validate_device_functions(world, transform(world, hist_ref, Unew, 0.0, true), amo_d, amo.front(),
                                               "KAIN orbitals");
+                }
                 double drms, dmax;
                 vector_stats(dnorm, drms, dmax);
                 if (world.rank() == 0 and (param.print_level() > 2))
                     print("Norm of vector changes alpha : rms", drms, "   max", dmax);
 
                 // drop the oldest pair once the history is full
-                if (nhist == param.maxsub()) {
-                    tensorT drop_first(2 * m * n, 2 * (m - 1) * n);
-                    for (long i = 0; i < 2 * (m - 1) * n; ++i) drop_first(2 * n + i, i) = 1.0;
-                    {
-                        DeviceRange range("KAIN drop oldest (device)");
-                        device_transform(world, hist_d, drop_first, 0.0);
-                    }
-                    if (validate_mra_ttg)
-                        validate_device_functions(world, transform(world, hist_ref, drop_first, 0.0, true), hist_d,
-                                                  amo.front(), "KAIN history (drop oldest)");
-                    --nhist;
+                if (long(hist_psi.size()) == param.maxsub()) {
+                    hist_psi.erase(hist_psi.begin());
+                    hist_rneg.erase(hist_rneg.begin());
                     kain_Q = copy(kain_Q(Slice(1, -1), Slice(1, -1)));
                 }
                 END_TIMER(world, "KAIN update (device)");

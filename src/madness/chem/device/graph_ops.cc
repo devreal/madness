@@ -67,6 +67,25 @@ DeviceGraph::Functions DeviceGraph::gaxpy(double a, Functions x, double b, Funct
     return pimpl->add_functions(trunc_e, x.size);
 }
 
+DeviceGraph::Functions DeviceGraph::combine(const std::vector<double>& c, const std::vector<Functions>& f) {
+    MADNESS_CHECK_THROW(f.size() >= 2 && c.size() == f.size(), "DeviceGraph::combine: two or more sets, a coefficient each");
+    auto& g = pimpl->g;
+    const std::size_t N = f.front().size;
+    for (const auto& x : f) MADNESS_CHECK_THROW(x.size == N, "DeviceGraph::combine: the sets must have the same size");
+    auto fns = make_mrattg_functionset(N);
+    // a chain of gaxpys, none forwarding an input node: c0 f0 + c1 f1, then + c2 f2, ...
+    NodeEdge acc = pimpl->get(f.front()).compressed;
+    double ca = c.front();
+    for (std::size_t k = 1; k < f.size(); ++k) {
+        NodeEdge out_e;
+        g.add(mra::make_gaxpy(ca, c[k], fns, g.K, acc, pimpl->get(f[k]).compressed, out_e, "combine",
+                              device_procmap(), device_devicemap(), /*forward=*/false));
+        acc = out_e;
+        ca = 1.0;
+    }
+    return pimpl->add_functions(acc, N);
+}
+
 DeviceGraph::Functions DeviceGraph::apply_local_potential(const functionT& v, Functions psi, double tol) {
     return apply_local_potential(load(v), psi, tol);
 }

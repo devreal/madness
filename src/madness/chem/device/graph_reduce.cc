@@ -55,6 +55,20 @@ DeviceGraph::Result DeviceGraph::matrix_inner(Functions a, Functions b) {
     return Result{int(pimpl->results.size()) - 1};
 }
 
+DeviceGraph::Result DeviceGraph::inner(Functions a, Functions b) {
+    MADNESS_CHECK_THROW(a.size == b.size, "DeviceGraph::inner: a and b must have the same size");
+    auto& g = pimpl->g;
+    Impl::Res& r = pimpl->add_result(long(a.size), 0);
+    r.vector.emplace();
+    g.add(mra::make_inner<double, 3>(make_mrattg_functionset(a.size), g.K, pimpl->get(a).compressed,
+                                     pimpl->get(b).compressed, *r.vector, "inner", device_procmap(),
+                                     device_devicemap(), pimpl->inner_group));
+    g.add(ttg::make_tt([&r](const mra::Key<3>& key, const mra::DenseTensor<double, 1>& v) {
+        std::copy(v.current_view().data(), v.current_view().data() + r.value.size(), r.value.ptr());
+    }, ttg::edges(*r.vector), ttg::edges(), "inner_sink"));
+    return Result{int(pimpl->results.size()) - 1};
+}
+
 DeviceGraph::Result DeviceGraph::norms(Functions a) {
     auto& g = pimpl->g;
     Impl::Res& r = pimpl->add_result(long(a.size), 0);

@@ -126,6 +126,9 @@ namespace madness {
         Functions convolution(const poperatorT& op, Functions in, double tol, DeviceOperatorCache* cache = nullptr);
         /// a x_i + b y_i, truncated with tol unless tol == 0
         Functions gaxpy(double a, Functions x, double b, Functions y, double tol);
+        /// sum_k c[k] f[k]_i for two or more sets f[k] of the same size, not truncated. Every node of the
+        /// result is new, so the sets may be fed with keep (see mra::FunctionVector).
+        Functions combine(const std::vector<double>& c, const std::vector<Functions>& f);
         /// out_j = sum_i in_i U(i,j), truncated with tol unless tol == 0
         Functions transform(Functions in, const Tensor<double>& U, double tol, const std::string& name = "transform");
         /// the same with U computed in the graph; M is the number of columns of U
@@ -135,6 +138,8 @@ namespace madness {
 
         /// <a_i|b_j>; a and b may be the same
         Result matrix_inner(Functions a, Functions b);
+        /// <a_i|b_i> for a and b of the same size
+        Result inner(Functions a, Functions b);
         /// ||a_i||
         Result norms(Functions a);
         /// 1/2 sum_axis <d psi_i|d psi_j> (abgv derivative)
