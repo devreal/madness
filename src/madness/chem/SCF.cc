@@ -2954,6 +2954,11 @@ void SCF::solve_simple(World& world) {
     const std::size_t exchange_tile = std::getenv("MRA_TTG_EXCHANGE_TILE")
                                       ? std::stoul(std::getenv("MRA_TTG_EXCHANGE_TILE")) : device_exchange_auto_tile;
     const bool device_only = resident && local_potential && param.deriv() == "abgv";
+    if (resident) {
+        if (mrattg_batches > 0) set_device_orbital_batches(mrattg_batches);
+        if (world.rank() == 0)
+            print("MRA-TTG: the orbitals in", std::min<int>(device_orbital_batches(), amo.size()), "batch(es)");
+    }
     DeviceFunctions amo_d;
     // KAIN (maxsub > 1): the history of iterates psi^(s) and negated residuals -r^(s), oldest
     // first, a device vector each with the orbitals' layout: KAIN only combines the history of

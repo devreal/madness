@@ -32,6 +32,7 @@
 /// \file device/functions.cc
 /// \brief Device vectors of functions: upload, download, inner products, transform, update.
 
+#include <limits>
 #include "common.h"
 
 #if defined(MRA_ENABLE_CUDA)
@@ -91,7 +92,8 @@ int device_count(World& world) {
 }
 
 void set_device_orbital_batches(int nbatch) {
-    MADNESS_CHECK_THROW(nbatch >= 1, "set_device_orbital_batches: need at least one batch");
+    MADNESS_CHECK_THROW(nbatch >= 1 && nbatch <= std::numeric_limits<mra::Batch>::max(),
+                        "set_device_orbital_batches: between 1 and 32767 batches");
     device_orbital_batches_ref() = mra::Batch(nbatch);
 }
 

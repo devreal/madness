@@ -219,6 +219,9 @@ public:
     bool validate_mra_ttg = false;
     bool use_solve_simple = false;   ///< run solve_simple instead of solve (--solve-simple)
     bool mrattg_resident = false;    ///< solve_simple keeps the orbitals on MRA-TTG (--mra-ttg-resident)
+    /// the batches the orbitals are split into on MRA-TTG, each on its own group of processes
+    /// (--mra-ttg-batches=N; 0: as set before, by default MRA_TTG_ORBITAL_BATCHES or 1)
+    int mrattg_batches = 0;
 
     scf_data e_data;
 
@@ -280,6 +283,10 @@ public:
         }
         if (parser.key_exists("mra-ttg-resident")) {
             mrattg_resident = true;
+        }
+        if (parser.key_exists("mra-ttg-batches")) {
+            mrattg_batches = std::stoi(parser.value("mra-ttg-batches"));
+            MADNESS_CHECK_THROW(mrattg_batches >= 1, "--mra-ttg-batches: need at least one batch");
         }
         work_dir = std::filesystem::current_path();
     }
