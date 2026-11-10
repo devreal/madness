@@ -41,7 +41,7 @@ namespace madness {
 /// psi is kept, Vpsi receives the result
 void device_apply_local_potential(World& world, const functionT& v, DeviceFunctions& psi,
                                   DeviceFunctions& Vpsi, double tol) {
-    DeviceGraph g(world);
+    DeviceGraph g(world, "local_potential");
     g.store(g.apply_local_potential(v, g.feed(psi, true), tol), Vpsi);
     g.execute();
 }
@@ -83,7 +83,7 @@ DeviceGraph::Functions DeviceGraph::density(Functions psi, const tensorT& occ) {
 
 /// sum_i occ_i psi_i^2 (cf. SCF::make_density), compressed, with the process map of `like`; psi is kept
 functionT device_density(World& world, DeviceFunctions& psi, const tensorT& occ, const functionT& like) {
-    DeviceGraph g(world);
+    DeviceGraph g(world, "density");
     functionT rho;
     g.store(g.density(g.feed(psi, true), occ), rho, like);
     g.execute();

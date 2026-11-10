@@ -130,7 +130,7 @@ vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
     auto store_tt         = mra::vmra::make_vmra_store(result, residual ? residual_result : recompress_result,
                                                        true /* add_leaves */);
 
-    execute_mra_ttg(start, mrattg_tt_list(tts, {convolve.get(), store_tt.get()}));
+    execute_mra_ttg(start, mrattg_tt_list(tts, {convolve.get(), store_tt.get()}), {}, "bsh_apply");
 
     scf_end_timer(world, residual ? "Apply BSH & residual" : "Apply BSH & truncate");
 

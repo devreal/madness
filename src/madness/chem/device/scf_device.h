@@ -98,7 +98,8 @@ namespace madness {
         struct Matrix { int id = -1; };
         using Decision = std::function<Tensor<double>(const Tensor<double>&)>;
 
-        explicit DeviceGraph(World& world);
+        /// name: of the graph's dot file (set_device_dot_dir)
+        explicit DeviceGraph(World& world, const std::string& name = "graph");
         ~DeviceGraph();
         DeviceGraph(const DeviceGraph&) = delete;
         DeviceGraph& operator=(const DeviceGraph&) = delete;
@@ -205,6 +206,9 @@ namespace madness {
     /// processes. Process-wide; set it on all processes before uploading orbitals. Default 1, or
     /// MRA_TTG_ORBITAL_BATCHES.
     void set_device_orbital_batches(int nbatch);
+    /// Debugging aid: write the dot (GraphViz) description of every MRA-TTG graph into dir right
+    /// before it executes, one file per graph (empty: none; the default is MRA_TTG_DOT)
+    void set_device_dot_dir(const std::string& dir);
     int device_orbital_batches();
 
     /// Adds the cost of the nodes of a device vector on this process to the load balancer:

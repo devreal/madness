@@ -45,6 +45,7 @@ DeviceFunctions device_bsh_residual(World& world, DeviceFunctions& psi, DeviceFu
                                            DeviceOperatorCache* cache) {
     using T = double;
     MraGraph g;
+    g.name = "bsh_residual";
     const mra::size_type N = psi.size();
     // in the orbitals' batches: each batch is computed by its process group; the Fock matrix must
     // be block-diagonal in the batches (canonical orbitals: diagonal), as MRA-TTG checks

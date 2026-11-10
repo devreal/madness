@@ -99,6 +99,8 @@ void set_device_orbital_batches(int nbatch) {
 
 int device_orbital_batches() { return device_orbital_batches_ref(); }
 
+void set_device_dot_dir(const std::string& dir) { device_dot_dir_ref() = dir; }
+
 void device_add_lb_cost(LoadBalanceDeux<3>& lb, DeviceFunctions& v) {
     constexpr int nchild = mra::Key<3>::num_children();
     const DeviceLayout layout = layout_of(v);
@@ -122,6 +124,7 @@ void device_add_lb_cost(LoadBalanceDeux<3>& lb, DeviceFunctions& v) {
 /// copy MADNESS functions into a device vector
 DeviceFunctions device_upload(World& world, const vecfuncT& f) {
     MraGraph g;
+    g.name = "upload";
     NodeEdge e;
     DeviceFunctions d;
     // orbitals (or functions of them) in the orbitals' batches; a single function (a potential) on all processes
@@ -136,6 +139,7 @@ DeviceFunctions device_upload(World& world, const vecfuncT& f) {
 /// copy a device vector into (compressed) MADNESS functions with the process map of `like`
 vecfuncT device_download(World& world, DeviceFunctions& d, const functionT& like) {
     MraGraph g;
+    g.name = "download";
     NodeEdge e;
     vecfuncT out(d.size());
     for (auto& f : out) f.set_impl(like, false);
@@ -149,7 +153,7 @@ vecfuncT device_download(World& world, DeviceFunctions& d, const functionT& like
 
 /// <a_i|b_j>; a and b may be the same vector
 Tensor<double> device_matrix_inner(World& world, DeviceFunctions& a, DeviceFunctions& b) {
-    DeviceGraph g(world);
+    DeviceGraph g(world, "matrix_inner");
     auto fa = g.feed(a, true);
     auto fb = (&a == &b) ? fa : g.feed(b, true);
     auto r = g.matrix_inner(fa, fb);
@@ -159,7 +163,7 @@ Tensor<double> device_matrix_inner(World& world, DeviceFunctions& a, DeviceFunct
 
 /// ||a_i||
 std::vector<double> device_norms(World& world, DeviceFunctions& a) {
-    DeviceGraph g(world);
+    DeviceGraph g(world, "norms");
     auto r = g.norms(g.feed(a, true));
     g.execute();
     Tensor<double> n = g.get(r);
@@ -169,14 +173,14 @@ std::vector<double> device_norms(World& world, DeviceFunctions& a) {
 /// v_j <- sum_i v_i U(i,j), truncated with tol unless tol == 0 (cf. madness::transform)
 void device_transform(World& world, DeviceFunctions& v, const Tensor<double>& U, double tol) {
     MADNESS_CHECK_THROW(U.dim(0) == long(v.size()), "device_transform: U must have v.size() rows");
-    DeviceGraph g(world);
+    DeviceGraph g(world, "transform");
     g.store(g.transform(g.feed(v, false), U, tol), v);
     g.execute();
 }
 
 /// [a, b]: the functions of a followed by those of b, in a new vector; a and b are kept or consumed
 DeviceFunctions device_concat(World& world, DeviceFunctions& a, bool keep_a, DeviceFunctions& b, bool keep_b) {
-    DeviceGraph g(world);
+    DeviceGraph g(world, "concat");
     DeviceFunctions out;
     auto fa = g.feed(a, keep_a);
     g.store(g.concat(fa, g.feed(b, keep_b)), out);
@@ -187,6 +191,7 @@ DeviceFunctions device_concat(World& world, DeviceFunctions& a, bool keep_a, Dev
 /// out_j = sum_i v_i U(i,j) in a new vector, truncated with tol unless tol == 0; v is kept
 DeviceFunctions device_transformed(World& world, DeviceFunctions& v, const Tensor<double>& U, double tol) {
     MraGraph g;
+    g.name = "transformed";
     const mra::size_type N = v.size(), M = U.dim(1);
     MADNESS_CHECK_THROW(U.dim(0) == long(N), "device_transformed: U must have v.size() rows");
     require_one_batch(*layout_of(v), "device_transformed");
@@ -211,6 +216,7 @@ DeviceFunctions device_transformed(World& world, DeviceFunctions& v, const Tenso
 std::vector<double> device_transform_norms(World& world, DeviceFunctions& v, const Tensor<double>& U) {
     using T = double;
     MraGraph g;
+    g.name = "transform_norms";
     const mra::size_type N = v.size(), M = U.dim(1);
     MADNESS_CHECK_THROW(U.dim(0) == long(N), "device_transform_norms: U must have v.size() rows");
     require_one_batch(*layout_of(v), "device_transform_norms");
@@ -240,7 +246,7 @@ void device_scale(World& world, DeviceFunctions& v, const std::vector<double>& c
 
 /// v_i <- v_i / ||v_i||, in one graph: the scaling is computed from the norms while v waits in it
 void device_normalize(World& world, DeviceFunctions& v) {
-    DeviceGraph g(world);
+    DeviceGraph g(world, "normalize");
     auto f = g.feed(v, false);
     auto scale = g.decide(g.norms(f), [](const Tensor<double>& n) {
         Tensor<double> D(n.dim(0), n.dim(0));
@@ -254,6 +260,7 @@ void device_normalize(World& world, DeviceFunctions& v) {
 /// a_i <- a_i - c_i r_i; consumes r
 void device_update(World& world, DeviceFunctions& a, DeviceFunctions& r, const std::vector<double>& c) {
     MraGraph g;
+    g.name = "update";
     const mra::size_type N = a.size();
     const DeviceLayout layout = layout_of(a);   // a diagonal transform: within each batch
     MADNESS_CHECK_THROW(same_batches(*layout, *layout_of(r)), "device_update: a and r in different batches");

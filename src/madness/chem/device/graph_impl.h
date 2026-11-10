@@ -91,7 +91,7 @@ struct DeviceGraph::Impl {
     std::vector<DeviceFunctions*> stored;
     std::vector<DeviceFunctions*> kept;
 
-    explicit Impl(World& world) : world(world) {}
+    Impl(World& world, const std::string& name) : world(world) { g.name = name; }
 
     const ttg::Buffer<mra::Domain<3>>& domain() {
         if (!db) db.emplace(device_domain());

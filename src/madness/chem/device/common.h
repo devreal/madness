@@ -39,7 +39,10 @@
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <iostream>
 #include <mutex>
@@ -99,8 +102,19 @@ inline std::vector<ttg::TTBase*> mrattg_tt_list(const std::vector<std::unique_pt
 /// seconds and the graph has not completed by then, the tasks of `tts` (and of `start`)
 /// that were discovered but have not executed are printed (TTBase::print_incomplete_tasks);
 /// the graph keeps executing.
+/// Debugging aid: the directory into which the dot (GraphViz) description of every MRA-TTG graph
+/// is written right before it executes, NNNN-name.dot numbered in the order of execution (empty:
+/// none). Set with set_device_dot_dir (moldft --mra-ttg-dot=dir) or MRA_TTG_DOT.
+inline std::string& device_dot_dir_ref() {
+    static std::string dir = [] {
+        const char* v = std::getenv("MRA_TTG_DOT");
+        return v ? std::string(v) : std::string();
+    }();
+    return dir;
+}
+
 inline void execute_mra_ttg(auto&& start, const std::vector<ttg::TTBase*>& tts = {},
-                            const std::function<void()>& on_hang = {}) {
+                            const std::function<void()>& on_hang = {}, const std::string& name = "graph") {
     static const double timeout = [] {
         const char* v = std::getenv("MRA_TTG_HANG_TIMEOUT");
         return v ? std::atof(v) : 0.0;
@@ -124,11 +138,19 @@ inline void execute_mra_ttg(auto&& start, const std::vector<ttg::TTBase*>& tts =
     }
     auto connected = make_graph_executable(start.get());
     assert(connected);
+    static int graph_id = 0;
+    const int this_graph = graph_id++;
+    // Debugging aid: the graph's dot description (device_dot_dir_ref), written by one process, as
+    // every process builds the same graph; the traversal from the start reaches all of it
+    if (const std::string& dir = device_dot_dir_ref(); !dir.empty() && ttg::default_execution_context().rank() == 0) {
+        std::filesystem::create_directories(dir);
+        char file[32];
+        std::snprintf(file, sizeof(file), "%04d-", this_graph);
+        std::ofstream(std::filesystem::path(dir) / (file + name + ".dot")) << ttg::Dot(true)(start.get());
+    }
     // Debugging aid: with MRA_TTG_TRACE set (and TTG configured with TTG_ENABLE_TRACE), every graph
     // is traced to std::clog, between lines marking its begin and end
     static const bool trace = std::getenv("MRA_TTG_TRACE") != nullptr;
-    static int graph_id = 0;
-    const int this_graph = graph_id++;
     if (trace) {
         std::clog << "=== MRA-TTG graph " << this_graph << " begin" << std::endl;
         ttg::trace_on();
@@ -446,6 +468,7 @@ inline mra::FunctionData<double, 3>::BCType device_bc() {
 
 /// the tasks of one graph, started at the root key of a single batch
 struct MraGraph {
+    std::string name = "graph";   // of its dot file (device_dot_dir_ref)
     ttg::Edge<mra::Key<3>, void> control;
     std::vector<std::unique_ptr<ttg::TTBase>> tts;
     const mra::size_type K = FunctionDefaults<3>::get_k();
@@ -457,7 +480,7 @@ struct MraGraph {
     void execute() {
         auto fns = make_mrattg_functionset(1);
         auto start = mra::make_start(fns, control);
-        execute_mra_ttg(start, mrattg_tt_list(tts), on_hang);
+        execute_mra_ttg(start, mrattg_tt_list(tts), on_hang, name);
     }
 };
 

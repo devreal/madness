@@ -2479,6 +2479,9 @@ void SCF::orthonormalize(World& world, vecfuncT& amo_new) const {
 // For given protocol, solve the DFT/HF/response equations
 void SCF::solve(World& world) {
     PROFILE_MEMBER_FUNC(SCF);
+#ifdef HAVE_MRA_TTG
+    if (!mrattg_dot_dir.empty()) set_device_dot_dir(mrattg_dot_dir);
+#endif // HAVE_MRA_TTG
     functionT arho_old, brho_old;
     const double dconv = std::max(FunctionDefaults<3>::get_thresh(),
                                   param.dconv());
@@ -2926,6 +2929,9 @@ void SCF::solve(World& world) {
 /// the form [ttg: ...] note which MRA-TTG building block each step maps onto.
 void SCF::solve_simple(World& world) {
     PROFILE_MEMBER_FUNC(SCF);
+#ifdef HAVE_MRA_TTG
+    if (!mrattg_dot_dir.empty()) set_device_dot_dir(mrattg_dot_dir);
+#endif // HAVE_MRA_TTG
     MADNESS_CHECK_THROW(param.spin_restricted() && param.nalpha() == param.nbeta(),
                         "solve_simple supports closed-shell (spin-restricted, nalpha==nbeta) only");
     MADNESS_CHECK_THROW(param.pcm_data() == "none", "solve_simple does not support PCM");
@@ -3107,7 +3113,7 @@ void SCF::solve_simple(World& world) {
             {
                 DeviceRange range("Density, Coulomb potential, KE (device)");
                 DeviceFunctions& vn_d = resident_vnuc();
-                DeviceGraph g(world);
+                DeviceGraph g(world, "density_coulomb_kinetic");
                 auto psi = g.feed(amo_d, true);
                 auto arho_f = g.density(psi, aocc);
                 g.store(arho_f, arho, amo.front());
@@ -3139,7 +3145,7 @@ void SCF::solve_simple(World& world) {
                 {
                     DeviceRange range("Coulomb potential (device)");
                     DeviceFunctions& vn_d = resident_vnuc();
-                    DeviceGraph g(world);
+                    DeviceGraph g(world, "coulomb");
                     auto [enuc_r, ecoul_r] = device_coulomb(g, g.load(arho), vn_d);
                     g.execute();
                     enuclear = g.get(enuc_r)(0, 0);
@@ -3224,7 +3230,7 @@ void SCF::solve_simple(World& world) {
             tensorT pe;
             {
                 DeviceRange range("V*psi, PE (device)");
-                DeviceGraph g(world);
+                DeviceGraph g(world, "vpsi_pe");
                 const double thresh = FunctionDefaults<3>::get_thresh();
                 auto psi = g.feed(amo_d, true);
                 // [ttg: gaxpy + truncate] vloc = vlocal + vxc, truncated (vlocal_d already is)
@@ -3327,7 +3333,7 @@ void SCF::solve_simple(World& world) {
             }
             {
                 DeviceRange range("Diagonalization (device)");
-                DeviceGraph g(world);
+                DeviceGraph g(world, "diagonalization");
                 auto psi = g.feed(amo_d, false);
                 auto vpsi = g.feed(Vpsi_d, false);
                 // runs in a task on one process: no collectives (sygv, not sygvp)
@@ -3526,7 +3532,7 @@ void SCF::solve_simple(World& world) {
                 tensorT ms(m), sm(m);
                 {
                     DeviceRange range("KAIN matrix (device)");
-                    DeviceGraph g(world);
+                    DeviceGraph g(world, "kain_matrix");
                     std::vector<DeviceGraph::Functions> p(m), r(m);
                     for (long t = 0; t < m; ++t) {
                         p[t] = g.feed(hist_psi[t], true);
@@ -3599,7 +3605,7 @@ void SCF::solve_simple(World& world) {
                 std::vector<double> dnorm;
                 {
                     DeviceRange range("KAIN update orbitals (device)");
-                    DeviceGraph g(world);
+                    DeviceGraph g(world, "kain_update");
                     std::vector<double> c;
                     std::vector<DeviceGraph::Functions> f;
                     for (long t = 0; t < m; ++t) {

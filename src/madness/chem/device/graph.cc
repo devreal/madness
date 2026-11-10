@@ -39,7 +39,7 @@
 
 namespace madness {
 
-DeviceGraph::DeviceGraph(World& world) : pimpl(std::make_unique<Impl>(world)) {}
+DeviceGraph::DeviceGraph(World& world, const std::string& name) : pimpl(std::make_unique<Impl>(world, name)) {}
 DeviceGraph::~DeviceGraph() = default;
 
 DeviceGraph::Functions DeviceGraph::feed(DeviceFunctions& v, bool keep) {
@@ -163,7 +163,7 @@ Tensor<double> DeviceGraph::get(Result r) const {
 
 /// 1/2 sum_axis <d psi_i|d psi_j> (cf. SCF::kinetic_energy_matrix with the abgv derivative); psi is kept
 Tensor<double> device_kinetic_matrix(World& world, DeviceFunctions& psi) {
-    DeviceGraph g(world);
+    DeviceGraph g(world, "kinetic_matrix");
     auto r = g.kinetic_matrix(g.feed(psi, true));
     g.execute();
     return g.get(r);

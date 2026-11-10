@@ -239,7 +239,7 @@ void exchange_tile_batched(World& world, DeviceFunctions& psi, DeviceOperatorCac
         return [to = std::move(to)](int b) { return to[b]; };
     };
 
-    DeviceGraph g(world);
+    DeviceGraph g(world, "exchange");
     auto f = g.feed(psi, true);
     // [ttg: rebatch x2 + transform x2 + multiply + compress/truncate], per block
     auto A = g.transform(g.rebatch(f, LA, targets(to_a), "x-to-A"), Ua, LP, 0.0, "x-A");
@@ -362,7 +362,7 @@ DeviceFunctions device_exchange(World& world, DeviceFunctions& psi, double lo, D
             Us(d, dirs[d].target) = 1.0;
         }
 
-        DeviceGraph g(world);
+        DeviceGraph g(world, "exchange");
         auto f = g.feed(psi, true);
         // [ttg: transform x2 + multiply + compress/truncate]
         auto pair = g.multiply(g.transform(f, Ua, 0.0, "x-A"), g.transform(f, Ub, 0.0, "x-B"), thresh, "x-pair");

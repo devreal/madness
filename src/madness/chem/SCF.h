@@ -222,6 +222,9 @@ public:
     /// the batches the orbitals are split into on MRA-TTG, each on its own group of processes
     /// (--mra-ttg-batches=N; 0: as set before, by default MRA_TTG_ORBITAL_BATCHES or 1)
     int mrattg_batches = 0;
+    /// debugging aid: the directory the dot (GraphViz) description of every MRA-TTG graph is
+    /// written into before it executes (--mra-ttg-dot=dir; empty: as set before, by MRA_TTG_DOT)
+    std::string mrattg_dot_dir;
 
     scf_data e_data;
 
@@ -287,6 +290,9 @@ public:
         if (parser.key_exists("mra-ttg-batches")) {
             mrattg_batches = std::stoi(parser.value("mra-ttg-batches"));
             MADNESS_CHECK_THROW(mrattg_batches >= 1, "--mra-ttg-batches: need at least one batch");
+        }
+        if (parser.key_exists("mra-ttg-dot")) {
+            mrattg_dot_dir = parser.value("mra-ttg-dot");
         }
         work_dir = std::filesystem::current_path();
     }
