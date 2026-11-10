@@ -3174,8 +3174,9 @@ void SCF::solve_simple(World& world) {
         }
 #endif // HAVE_MRA_TTG
 
-        // [ttg: XC potential (pointwise unaryop on rho) -- missing;
-        //  HF exchange (pair products, N^2 convolutions, reduction) -- missing]
+        // [ttg: XC potential (pointwise unaryop on rho) -- missing, computed on the host from rho;
+        //  HF exchange -- on the device with the resident orbitals (device_exchange), on the host
+        //  without them or with MRA_TTG_HOST_EXCHANGE]
         double exc = 0.0, enl = 0.0, ekin = 0.0;
         vecfuncT Vpsi;
         tensorT fock;
@@ -3197,7 +3198,8 @@ void SCF::solve_simple(World& world) {
             }
             END_TIMER(world, "DFT potential");
 
-            // [ttg: transform + multiply + truncate + convolution (all pairs) + multiply + transform]
+            // [ttg: per block of pairs of batches: transform + multiply + truncate + convolution +
+            //  multiply + transform; contributions summed into their batches]
             DeviceFunctions Kpsi_d;
             vecfuncT Kref;   // the host exchange, for validation
             if (hf_coeff != 0.0) {
