@@ -360,82 +360,6 @@ inline auto device_devicemap() {
     return device_devicemap(mra::BatchGroups(1, ttg::default_execution_context().size()));
 }
 
-/// Feed MADNESS functions into an MRA-TTG graph as compressed nodes on `out`.
-
-/// Compressed trees are loaded as-is; reconstructed trees are compressed in the graph.
-template <typename T, mra::Dimension NDIM, typename FunctionSetT>
-void load_compressed_mrattg(const std::vector<Function<T, (std::size_t)NDIM>>& f,
-                            const std::shared_ptr<FunctionSetT>& fns, mra::size_type K,
-                            const mra::FunctionData<T, NDIM>& functiondata,
-                            ttg::Edge<mra::Key<NDIM>, void>& control,
-                            ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>>& out,
-                            std::vector<std::unique_ptr<ttg::TTBase>>& tts,
-                            const std::string& name) {
-    const auto state = f.front().get_impl()->get_tree_state();
-    if (state == madness::TreeState::reconstructed) {
-        ttg::Edge<mra::Key<NDIM>, mra::FunctionsReconstructedNode<T, NDIM>> reconstructed;
-        tts.push_back(mra::vmra::make_vmra_load(f, control, reconstructed, "load_" + name,
-                                                std::shared_ptr<const mra::BatchLayout>(fns->batchman())));
-        tts.push_back(mra::make_compress(fns, K, false, functiondata, reconstructed, out, "compress_" + name,
-                                         device_procmap(fns), device_devicemap(fns)));
-    } else if (state == madness::TreeState::compressed) {
-        tts.push_back(mra::vmra::make_vmra_load(f, control, out, "load_" + name,
-                                                std::shared_ptr<const mra::BatchLayout>(fns->batchman())));
-    } else {
-        throw std::runtime_error(name + " must be in reconstructed or compressed form");
-    }
-}
-
-/// Compress the reconstructed nodes on `in` onto `out`, truncated with tol unless tol == 0.
-/// The truncation is folded into the compression, unless MRA_TTG_SEPARATE_TRUNCATE is set:
-/// then a separate make_truncate pass follows, a workaround for MRA-TTG versions whose folded
-/// truncation still sends nodes their parent drops.
-template <typename FunctionSetT>
-inline void add_compress(std::vector<std::unique_ptr<ttg::TTBase>>& tts, const std::shared_ptr<FunctionSetT>& fns,
-                         mra::size_type K, const mra::FunctionData<double, 3>& functiondata,
-                         ttg::Edge<mra::Key<3>, mra::FunctionsReconstructedNode<double, 3>>& in,
-                         ttg::Edge<mra::Key<3>, mra::FunctionsCompressedNode<double, 3>>& out,
-                         double tol, const std::string& name) {
-    static const bool separate = std::getenv("MRA_TTG_SEPARATE_TRUNCATE") != nullptr;
-    const int mode = FunctionDefaults<3>::get_truncate_mode();
-    const double min_width = FunctionDefaults<3>::get_cell_min_width();
-    if (tol <= 0.0 || !separate) {
-        tts.push_back(mra::make_compress(fns, K, false, functiondata, in, out, name, device_procmap(fns), device_devicemap(fns),
-                                         /*enable_truncate=*/tol > 0.0, tol, mode, min_width));
-    } else {
-        ttg::Edge<mra::Key<3>, mra::FunctionsCompressedNode<double, 3>> compressed;
-        tts.push_back(mra::make_compress(fns, K, false, functiondata, in, compressed, name,
-                                         device_procmap(fns), device_devicemap(fns)));
-        tts.push_back(mra::make_truncate(fns, K, tol, mode, min_width, compressed, out, name + "-truncate",
-                                         device_procmap(fns), device_devicemap(fns)));
-    }
-}
-
-/// Compress the non-standard nodes on `in` (e.g., a convolution result) onto `out` in a single
-/// bottom-up pass, truncated as in add_compress. Replaces make_reconstruct(accumulate_NS = true)
-/// followed by add_compress.
-template <typename FunctionSetT>
-inline void add_compress_from_ns(std::vector<std::unique_ptr<ttg::TTBase>>& tts, const std::shared_ptr<FunctionSetT>& fns,
-                                 mra::size_type K, const mra::FunctionData<double, 3>& functiondata,
-                                 ttg::Edge<mra::Key<3>, mra::FunctionsCompressedNode<double, 3>>& in,
-                                 ttg::Edge<mra::Key<3>, mra::FunctionsCompressedNode<double, 3>>& out,
-                                 double tol, const std::string& name) {
-    static const bool separate = std::getenv("MRA_TTG_SEPARATE_TRUNCATE") != nullptr;
-    const int mode = FunctionDefaults<3>::get_truncate_mode();
-    const double min_width = FunctionDefaults<3>::get_cell_min_width();
-    if (tol <= 0.0 || !separate) {
-        tts.push_back(mra::make_compress_from_ns(fns, K, functiondata, in, out, name, device_procmap(fns),
-                                                 device_devicemap(fns), /*enable_truncate=*/tol > 0.0, tol, mode,
-                                                 min_width));
-    } else {
-        ttg::Edge<mra::Key<3>, mra::FunctionsCompressedNode<double, 3>> compressed;
-        tts.push_back(mra::make_compress_from_ns(fns, K, functiondata, in, compressed, name,
-                                                 device_procmap(fns), device_devicemap(fns)));
-        tts.push_back(mra::make_truncate(fns, K, tol, mode, min_width, compressed, out, name + "-truncate",
-                                         device_procmap(fns), device_devicemap(fns)));
-    }
-}
-
 /// the batches a device vector was stored in (one batch if it never was)
 inline DeviceLayout layout_of(DeviceFunctions& d) { return fv(d).layout() ? fv(d).layout() : one_batch(d.size()); }
 
@@ -447,13 +371,100 @@ inline auto make_mrattg_functionset(const DeviceLayout& layout) {
 /// function set of N functions in a single batch
 inline auto make_mrattg_functionset(mra::size_type N) { return make_mrattg_functionset(one_batch(N)); }
 
+using DeviceFunctionSet = decltype(make_mrattg_functionset(1));
+using NodeEdge = ttg::Edge<mra::Key<3>, mra::FunctionsCompressedNode<double, 3>>;
+using RecEdge = ttg::Edge<mra::Key<3>, mra::FunctionsReconstructedNode<double, 3>>;
+using MatrixEdge = ttg::Edge<mra::Key<3>, mra::DenseTensor<double, 2>>;
+using VectorEdge = ttg::Edge<mra::Key<3>, mra::DenseTensor<double, 1>>;
+using TTPtr = std::unique_ptr<ttg::TTBase>;
+
+/// The MRA-TTG operators the graphs of the SCF are built from, on the process and device maps
+/// of the SCF (device_procmap, device_devicemap) of the batches of their function set (of the
+/// output set for a transform), or of the layout of a vector or of host functions.
+///
+/// Each forwards to the mra:: function of the same name, which is a template returning a TT
+/// whose type names its task lambdas: instantiating one costs a large share of the compile time
+/// and memory of a TU. They are defined (instantiated) once, in device/ops_*.cc, instead of in
+/// every TU that uses them. Arguments are forwarded as they are passed: tasks may refer to them.
+namespace device_ops {
+
+TTPtr make_compress(const DeviceFunctionSet& fns, mra::size_type K, bool is_ns,
+                    const mra::FunctionData<double, 3>& functiondata, RecEdge& in, NodeEdge& out,
+                    const std::string& name, bool enable_truncate = false, double thresh = 0.0,
+                    int truncate_mode = 0, double cell_min_width = 0.0, const mra::BatchGroup& batch_group = {});
+TTPtr make_compress_from_ns(const DeviceFunctionSet& fns, mra::size_type K,
+                            const mra::FunctionData<double, 3>& functiondata, NodeEdge& in, NodeEdge& out,
+                            const std::string& name, bool enable_truncate = false, double thresh = 0.0,
+                            int truncate_mode = 0, double cell_min_width = 0.0);
+TTPtr make_nonstandard(const DeviceFunctionSet& fns, mra::size_type K,
+                       const mra::FunctionData<double, 3>& functiondata, NodeEdge in, NodeEdge out,
+                       const std::string& name);
+TTPtr make_truncate(const DeviceFunctionSet& fns, mra::size_type K, double thresh, int truncate_mode,
+                    double cell_min_width, NodeEdge& in, NodeEdge& out, const std::string& name);
+/// forward: pass a node of one operand on unchanged where the other has none (see mra::make_gaxpy)
+TTPtr make_gaxpy(double scalarA, double scalarB, const DeviceFunctionSet& fns, mra::size_type K,
+                 NodeEdge in1, NodeEdge in2, NodeEdge out, const char* name, bool forward = true);
+TTPtr make_norm(const DeviceFunctionSet& fns, mra::size_type K, NodeEdge in, VectorEdge result, const char* name);
+/// out_j = sum_i in_i U(i,j), U fixed; on the maps of fns_out
+TTPtr make_transform(const DeviceFunctionSet& fns_in, const DeviceFunctionSet& fns_out, mra::size_type K,
+                     std::shared_ptr<mra::DenseTensor<double, 2>> U, NodeEdge in, NodeEdge out,
+                     const std::string& name);
+/// out_j = sum_i in_i U(i,j), U arriving on an edge; on the maps of fns_out
+TTPtr make_transform(const DeviceFunctionSet& fns_in, const DeviceFunctionSet& fns_out, mra::size_type K,
+                     MatrixEdge U, NodeEdge in, NodeEdge out, const std::string& name);
+TTPtr make_convolution(const DeviceFunctionSet& fns, mra::size_type K, NodeEdge in, NodeEdge out,
+                       const mra::GaussianConvolutionOperator<double, 3>& op, double thresh, int truncate_mode,
+                       double cell_min_width, const std::string& name);
+
+/// the nodes of a device vector on `out`, on the maps of `layout` (null: its own, layout_of);
+/// keep: leave them in the vector
+TTPtr make_feed(DeviceFunctions& v, ttg::Edge<mra::Key<3>, void>& control, NodeEdge& out, bool keep,
+                const std::string& name, const DeviceLayout& layout = nullptr);
+/// store the N functions arriving on `in` in the (empty) device vector v, in the batches of
+/// `layout` (one batch if null)
+TTPtr make_store(DeviceFunctions& v, NodeEdge& in, mra::size_type N, const std::string& name,
+                 const DeviceLayout& layout = nullptr);
+/// load MADNESS functions (in the form of `out`'s nodes) into a graph, in the batches of
+/// `layout` (one batch if null)
+TTPtr make_vmra_load(const vecfuncT& f, ttg::Edge<mra::Key<3>, void>& control, RecEdge& out, const std::string& name,
+                     const DeviceLayout& layout = nullptr);
+TTPtr make_vmra_load(const vecfuncT& f, ttg::Edge<mra::Key<3>, void>& control, NodeEdge& out, const std::string& name,
+                     const DeviceLayout& layout = nullptr);
+/// store compressed nodes, in the batches of `layout` (one batch if null), into MADNESS
+/// functions, adding the leaves MRA-TTG dropped (add_leaves)
+TTPtr make_vmra_store(vecfuncT& f, NodeEdge& in, const std::string& name = "vmra_store",
+                      const DeviceLayout& layout = nullptr);
+
+} // namespace device_ops
+
+/// Feed MADNESS functions into an MRA-TTG graph as compressed nodes on `out`, in the batches of fns.
+
+/// Compressed trees are loaded as-is; reconstructed trees are compressed in the graph.
+void load_compressed_mrattg(const vecfuncT& f, const DeviceFunctionSet& fns, mra::size_type K,
+                            const mra::FunctionData<double, 3>& functiondata,
+                            ttg::Edge<mra::Key<3>, void>& control, NodeEdge& out,
+                            std::vector<TTPtr>& tts, const std::string& name);
+
+/// Compress the reconstructed nodes on `in` onto `out`, truncated with tol unless tol == 0.
+/// The truncation is folded into the compression, unless MRA_TTG_SEPARATE_TRUNCATE is set:
+/// then a separate make_truncate pass follows, a workaround for MRA-TTG versions whose folded
+/// truncation still sends nodes their parent drops.
+void add_compress(std::vector<TTPtr>& tts, const DeviceFunctionSet& fns, mra::size_type K,
+                  const mra::FunctionData<double, 3>& functiondata, RecEdge& in, NodeEdge& out,
+                  double tol, const std::string& name);
+
+/// Compress the non-standard nodes on `in` (e.g., a convolution result) onto `out` in a single
+/// bottom-up pass, truncated as in add_compress. Replaces make_reconstruct(accumulate_NS = true)
+/// followed by add_compress.
+void add_compress_from_ns(std::vector<TTPtr>& tts, const DeviceFunctionSet& fns, mra::size_type K,
+                          const mra::FunctionData<double, 3>& functiondata, NodeEdge& in, NodeEdge& out,
+                          double tol, const std::string& name);
+
 // ---------------------------------------------------------------------------------------
 // Orbitals held in device memory between MRA-TTG graphs (mra::FunctionVector). Each device_*
 // function builds and executes one graph; vectors are fed into it and stored from it without
 // their coefficients passing through the host.
 // ---------------------------------------------------------------------------------------
-
-using NodeEdge = ttg::Edge<mra::Key<3>, mra::FunctionsCompressedNode<double, 3>>;
 
 /// boundary condition of the MRA-TTG derivative operators: that of FunctionDefaults, the same on all sides
 inline mra::FunctionData<double, 3>::BCType device_bc() {

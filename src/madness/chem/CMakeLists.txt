@@ -31,28 +31,35 @@ if (HAVE_MRA_TTG)
       device/graph_reduce.cc
       device/graph_conv.cc
       device/exchange.cc
+      # the MRA-TTG operators the TUs above share, instantiated once (device_ops in device/common.h)
+      device/ops_compress.cc
+      device/ops_convolution.cc
+      device/ops_elementwise.cc
+      device/ops_io.cc
     )
-  if (TARGET mra::cuda OR TARGET mra::hip)
+  if (TARGET mra::cuda)
+    # Plain C++: the kernels these TUs launch are explicitly instantiated in mra::cuda
+    # (MRA-TTG's src/kernels), so nvcc is not needed here. Compiling the TTG/MADNESS
+    # headers for the device would cost cicc far more memory than the host compiler.
+    get_target_property(_mra_defs mra::base INTERFACE_COMPILE_DEFINITIONS)
+    if (NOT "MRA_ENABLE_EXPLICIT_INSTANTIATION=1" IN_LIST _mra_defs)
+      message(FATAL_ERROR "The SCF device code needs MRA-TTG's kernel instantiations: "
+                          "build MRA-TTG with MRA_ENABLE_EXPLICIT_INSTANTIATION=ON")
+    endif()
+    # Full debug info on these TTG-heavy TUs more than doubles their compile time
+    # and makes each object 300-850 MB, almost all .debug_str.
+    option(MADNESS_DEVICE_DEBUG_LINE_TABLES_ONLY
+           "RelWithDebInfo: limit debug info of the TTG TUs in src/madness/chem/device to line tables (-g1)" ON)
+    if (MADNESS_DEVICE_DEBUG_LINE_TABLES_ONLY)
+      set_source_files_properties(${MADCHEM_SCF_DEVICE_SOURCES} PROPERTIES
+                                  COMPILE_OPTIONS "$<$<CONFIG:RelWithDebInfo>:-g1>")
+    endif()
+  elseif (TARGET mra::hip)
     mra_generate_gpu_wrappers(
         SOURCES ${MADCHEM_SCF_DEVICE_SOURCES}
-        CUDA_OUTPUT_VAR _scf_device_cu
         HIP_OUTPUT_VAR  _scf_device_hip
       )
-    if (TARGET mra::cuda)
-      set(MADCHEM_SCF_DEVICE_SOURCES ${_scf_device_cu})
-      # Full host debug info on these TTG-heavy TUs more than doubles their host compile
-      # (graph.cu: 625 s vs 253 s) and makes each object 300-850 MB, almost all .debug_str.
-      # nvcc appends its own -g after any -Xcompiler flags, so the -g must be swapped out of
-      # the config flags themselves; this is directory-scoped and only touches CUDA TUs here.
-      option(MADNESS_CUDA_HOST_DEBUG_LINE_TABLES_ONLY
-             "RelWithDebInfo: limit host debug info of the CUDA TUs in src/madness/chem to line tables (-g1)" ON)
-      if (MADNESS_CUDA_HOST_DEBUG_LINE_TABLES_ONLY)
-        string(REGEX REPLACE "(^| )-g( |$)" "\\1-Xcompiler=-g1\\2"
-               CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO}")
-      endif()
-    elseif (TARGET mra::hip)
-      set(MADCHEM_SCF_DEVICE_SOURCES ${_scf_device_hip})
-    endif()
+    set(MADCHEM_SCF_DEVICE_SOURCES ${_scf_device_hip})
   endif()
   list(APPEND MADCHEM_SCF_SOURCES ${MADCHEM_SCF_DEVICE_SOURCES})
 endif()

@@ -50,8 +50,7 @@ void DeviceGraph::store(Functions f, functionT& out, const functionT& like) {
     pimpl->host_out.emplace_back(1);
     vecfuncT& v = pimpl->host_out.back();
     v[0].set_impl(like, false);
-    pimpl->g.add(mra::vmra::make_vmra_store(v, pimpl->get(f).compressed, true /* add_leaves */,
-                                            madness::TreeState::compressed, "store_host", pimpl->get(f).layout));
+    pimpl->g.add(device_ops::make_vmra_store(v, pimpl->get(f).compressed, "store_host", pimpl->get(f).layout));
     pimpl->host_targets.push_back(&out);
 }
 
@@ -62,11 +61,10 @@ DeviceGraph::Functions DeviceGraph::gaxpy(double a, Functions x, double b, Funct
     auto& g = pimpl->g;
     auto fns = make_mrattg_functionset(layout);
     NodeEdge out_e, trunc_e;
-    g.add(mra::make_gaxpy(a, b, fns, g.K, pimpl->get(x).compressed, pimpl->get(y).compressed, out_e, "gaxpy",
-                          device_procmap(layout), device_devicemap(layout)));
+    g.add(device_ops::make_gaxpy(a, b, fns, g.K, pimpl->get(x).compressed, pimpl->get(y).compressed, out_e, "gaxpy"));
     if (tol <= 0.0) return pimpl->add_functions(out_e, layout);
-    g.add(mra::make_truncate(fns, g.K, tol, FunctionDefaults<3>::get_truncate_mode(),
-                             FunctionDefaults<3>::get_cell_min_width(), out_e, trunc_e, "gaxpy-truncate", device_procmap(layout), device_devicemap(layout)));
+    g.add(device_ops::make_truncate(fns, g.K, tol, FunctionDefaults<3>::get_truncate_mode(),
+                                    FunctionDefaults<3>::get_cell_min_width(), out_e, trunc_e, "gaxpy-truncate"));
     return pimpl->add_functions(trunc_e, layout);
 }
 
@@ -85,8 +83,8 @@ DeviceGraph::Functions DeviceGraph::combine(const std::vector<double>& c, const 
     double ca = c.front();
     for (std::size_t k = 1; k < f.size(); ++k) {
         NodeEdge out_e;
-        g.add(mra::make_gaxpy(ca, c[k], fns, g.K, acc, pimpl->get(f[k]).compressed, out_e, "combine",
-                              device_procmap(layout), device_devicemap(layout), /*forward=*/false));
+        g.add(device_ops::make_gaxpy(ca, c[k], fns, g.K, acc, pimpl->get(f[k]).compressed, out_e, "combine",
+                                     /*forward=*/false));
         acc = out_e;
         ca = 1.0;
     }
@@ -141,12 +139,11 @@ namespace {
                            UT&& U, double tol, const std::string& name) {
         auto fns_out = make_mrattg_functionset(out_layout);
         NodeEdge out_e, trunc_e;
-        g.add(mra::make_transform<double, 3>(make_mrattg_functionset(in_layout), fns_out, g.K, std::forward<UT>(U), in,
-                                             out_e, name, device_procmap(out_layout), device_devicemap(out_layout)));
+        g.add(device_ops::make_transform(make_mrattg_functionset(in_layout), fns_out, g.K, std::forward<UT>(U), in,
+                                         out_e, name));
         if (tol <= 0.0) return out_e;
-        g.add(mra::make_truncate(fns_out, g.K, tol, FunctionDefaults<3>::get_truncate_mode(),
-                                 FunctionDefaults<3>::get_cell_min_width(), out_e, trunc_e, name + "-truncate",
-                                 device_procmap(out_layout), device_devicemap(out_layout)));
+        g.add(device_ops::make_truncate(fns_out, g.K, tol, FunctionDefaults<3>::get_truncate_mode(),
+                                        FunctionDefaults<3>::get_cell_min_width(), out_e, trunc_e, name + "-truncate"));
         return trunc_e;
     }
 
@@ -247,17 +244,16 @@ namespace {
         MatrixEdge U_p = distribute_blocks(g, U_full, layout, std::size_t(nb) * nb,
                                            [nb](std::size_t q) { return mra::Batch(q / nb); },
                                            [nb](std::size_t q) { return mra::Batch(q % nb); }, name);
-        g.add(mra::make_transform<double, 3>(make_mrattg_functionset(pin), make_mrattg_functionset(pout), g.K, U_p,
-                                             in_p, part, name, device_procmap(pout), device_devicemap(pout)));
+        g.add(device_ops::make_transform(make_mrattg_functionset(pin), make_mrattg_functionset(pout), g.K, U_p,
+                                         in_p, part, name));
         // the partial results of all input batches, moved to their output batches and summed
         NodeEdge sum = impl.add_sum_into({{part, pout, [nb](mra::Batch q) { return int(q % nb); }}}, layout,
                                          name + "-sum");
         auto fns = make_mrattg_functionset(layout);
         if (tol <= 0.0) return sum;
         NodeEdge trunc_e;
-        g.add(mra::make_truncate(fns, g.K, tol, FunctionDefaults<3>::get_truncate_mode(),
-                                 FunctionDefaults<3>::get_cell_min_width(), sum, trunc_e, name + "-truncate",
-                                 device_procmap(layout), device_devicemap(layout)));
+        g.add(device_ops::make_truncate(fns, g.K, tol, FunctionDefaults<3>::get_truncate_mode(),
+                                        FunctionDefaults<3>::get_cell_min_width(), sum, trunc_e, name + "-truncate"));
         return trunc_e;
     }
 }
@@ -393,8 +389,7 @@ NodeEdge DeviceGraph::Impl::add_sum_into(const std::vector<SumSource>& sources, 
             route(cur, cur_layout, routes, {x, y, pass}, lvl + "-route");
         }
         // (a literal name: make_gaxpy keeps the pointer)
-        g.add(mra::make_gaxpy(T(1.0), T(1.0), make_mrattg_functionset(nl.layout), g.K, x, y, sum, "sum-gaxpy",
-                              device_procmap(nl.layout), device_devicemap(nl.layout)));
+        g.add(device_ops::make_gaxpy(T(1.0), T(1.0), make_mrattg_functionset(nl.layout), g.K, x, y, sum, "sum-gaxpy"));
         cur = ttg::fuse(sum, pass);   // (pass connected even when nothing passes at this level)
         cur_layout = nl.layout;
         cur_elem.clear();

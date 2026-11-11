@@ -120,7 +120,7 @@ static vecfuncT mrattg_transform(World& world, const vecfuncT& v, const Tensor<d
     auto start = mra::make_start(fns_in, control);
     load_compressed_mrattg(v, fns_in, K, functiondata, control, in_e, tts, "v");
     tts.push_back(mra::make_transform<T, NDIM>(fns_in, fns_out, K, Ud, in_e, out_e));
-    tts.push_back(mra::vmra::make_vmra_store(out, out_e, true /* add_leaves */));
+    tts.push_back(device_ops::make_vmra_store(out, out_e));
     execute_mra_ttg(start, mrattg_tt_list(tts));
     return out;
 }

@@ -64,11 +64,10 @@ DeviceGraph::Functions DeviceGraph::convolution(const poperatorT& op, Functions 
     pimpl->operators.push_back(dop);
     NodeEdge ns_e, conv_e, out_e;
     // non-standard form for the convolution, compressed (and truncated) result, each in a single pass
-    g.add(mra::make_nonstandard(fns, g.K, g.functiondata, pimpl->get(in).compressed, ns_e, "nonstandard",
-                                device_procmap(layout), device_devicemap(layout)));
-    g.add(mra::make_convolution(fns, g.K, ns_e, conv_e, *dop, T(FunctionDefaults<3>::get_thresh()),
-                                FunctionDefaults<3>::get_truncate_mode(), FunctionDefaults<3>::get_cell_min_width(),
-                                "convolution", device_procmap(layout), device_devicemap(layout)));
+    g.add(device_ops::make_nonstandard(fns, g.K, g.functiondata, pimpl->get(in).compressed, ns_e, "nonstandard"));
+    g.add(device_ops::make_convolution(fns, g.K, ns_e, conv_e, *dop, T(FunctionDefaults<3>::get_thresh()),
+                                       FunctionDefaults<3>::get_truncate_mode(), FunctionDefaults<3>::get_cell_min_width(),
+                                       "convolution"));
     add_compress_from_ns(g.tts, fns, g.K, g.functiondata, conv_e, out_e, tol, "recompress_convolution");
     return pimpl->add_functions(out_e, layout);
 }

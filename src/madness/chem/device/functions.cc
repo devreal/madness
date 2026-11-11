@@ -130,7 +130,7 @@ DeviceFunctions device_upload(World& world, const vecfuncT& f) {
     // orbitals (or functions of them) in the orbitals' batches; a single function (a potential) on all processes
     const DeviceLayout layout = device_orbital_layout(f.size());
     load_compressed_mrattg(f, make_mrattg_functionset(layout), g.K, g.functiondata, g.control, e, g.tts, "upload");
-    g.add(fv(d).make_store(e, f.size(), "upload_store", device_procmap(layout), device_devicemap(layout), layout));
+    g.add(device_ops::make_store(d, e, f.size(), "upload_store", layout));
     g.execute();
     check_device_tree(d, "device_upload");
     return d;
@@ -144,9 +144,8 @@ vecfuncT device_download(World& world, DeviceFunctions& d, const functionT& like
     vecfuncT out(d.size());
     for (auto& f : out) f.set_impl(like, false);
     const DeviceLayout layout = layout_of(d);
-    g.add(fv(d).make_feed(g.control, e, true /* keep */, "download", device_procmap(layout), device_devicemap(layout)));
-    g.add(mra::vmra::make_vmra_store(out, e, true /* add_leaves */, madness::TreeState::compressed, "download_store",
-                                     layout));
+    g.add(device_ops::make_feed(d, g.control, e, true /* keep */, "download", layout));
+    g.add(device_ops::make_vmra_store(out, e, "download_store", layout));
     g.execute();
     return out;
 }
@@ -198,15 +197,14 @@ DeviceFunctions device_transformed(World& world, DeviceFunctions& v, const Tenso
     auto fns_out = make_mrattg_functionset(M);
     NodeEdge in_e, out_e, trunc_e;
     DeviceFunctions out;
-    g.add(fv(v).make_feed(g.control, in_e, true, "feed", device_procmap(), device_devicemap()));
-    g.add(mra::make_transform<double, 3>(make_mrattg_functionset(N), fns_out, g.K, device_matrix(U), in_e, out_e,
-                                         "transform", device_procmap(), device_devicemap()));
+    g.add(device_ops::make_feed(v, g.control, in_e, true, "feed"));
+    g.add(device_ops::make_transform(make_mrattg_functionset(N), fns_out, g.K, device_matrix(U), in_e, out_e,
+                                     "transform"));
     if (tol > 0.0) {
-        g.add(mra::make_truncate(fns_out, g.K, tol, FunctionDefaults<3>::get_truncate_mode(),
-                                 FunctionDefaults<3>::get_cell_min_width(), out_e, trunc_e, "truncate",
-                                 device_procmap(), device_devicemap()));
+        g.add(device_ops::make_truncate(fns_out, g.K, tol, FunctionDefaults<3>::get_truncate_mode(),
+                                        FunctionDefaults<3>::get_cell_min_width(), out_e, trunc_e, "truncate"));
     }
-    g.add(fv(out).make_store(tol > 0.0 ? trunc_e : out_e, M, "store", device_procmap(), device_devicemap()));
+    g.add(device_ops::make_store(out, tol > 0.0 ? trunc_e : out_e, M, "store"));
     g.execute();
     check_device_tree(out, "device_transformed");
     return out;
@@ -223,10 +221,10 @@ std::vector<double> device_transform_norms(World& world, DeviceFunctions& v, con
     auto fns_out = make_mrattg_functionset(M);
     NodeEdge in_e, out_e;
     ttg::Edge<mra::Key<3>, mra::DenseTensor<T, 1>> norm_e;
-    g.add(fv(v).make_feed(g.control, in_e, true, "feed", device_procmap(), device_devicemap()));
-    g.add(mra::make_transform<T, 3>(make_mrattg_functionset(N), fns_out, g.K, device_matrix(U), in_e, out_e,
-                                    "transform", device_procmap(), device_devicemap()));
-    g.add(mra::make_norm(fns_out, g.K, out_e, norm_e, "norm", device_procmap(), device_devicemap()));
+    g.add(device_ops::make_feed(v, g.control, in_e, true, "feed"));
+    g.add(device_ops::make_transform(make_mrattg_functionset(N), fns_out, g.K, device_matrix(U), in_e, out_e,
+                                     "transform"));
+    g.add(device_ops::make_norm(fns_out, g.K, out_e, norm_e, "norm"));
     std::vector<double> norms(M, 0.0);
     g.add(ttg::make_tt([&norms, M](const mra::Key<3>& key, const mra::DenseTensor<T, 1>& n) {
         const T* data = n.current_view().data();
@@ -268,11 +266,11 @@ void device_update(World& world, DeviceFunctions& a, DeviceFunctions& r, const s
     Tensor<double> D(static_cast<long>(N), static_cast<long>(N));
     for (mra::size_type i = 0; i < N; ++i) D(i, i) = c[i];
     NodeEdge a_e, r_e, cr_e, out_e;
-    g.add(fv(r).make_feed(g.control, r_e, false, "feed_r", device_procmap(layout), device_devicemap(layout)));
-    g.add(fv(a).make_feed(g.control, a_e, false, "feed_a", device_procmap(layout), device_devicemap(layout)));
-    g.add(mra::make_transform<double, 3>(fns, fns, g.K, device_matrix(D), r_e, cr_e, "scale_r", device_procmap(layout), device_devicemap(layout)));
-    g.add(mra::make_gaxpy(1.0, -1.0, fns, g.K, a_e, cr_e, out_e, "update", device_procmap(layout), device_devicemap(layout)));
-    g.add(fv(a).make_store(out_e, N, "store", device_procmap(layout), device_devicemap(layout), layout));
+    g.add(device_ops::make_feed(r, g.control, r_e, false, "feed_r", layout));
+    g.add(device_ops::make_feed(a, g.control, a_e, false, "feed_a", layout));
+    g.add(device_ops::make_transform(fns, fns, g.K, device_matrix(D), r_e, cr_e, "scale_r"));
+    g.add(device_ops::make_gaxpy(1.0, -1.0, fns, g.K, a_e, cr_e, out_e, "update"));
+    g.add(device_ops::make_store(a, out_e, N, "store", layout));
     g.execute();
     check_device_tree(a, "device_update");
 }

@@ -48,10 +48,6 @@
 
 namespace madness {
 
-using RecEdge = ttg::Edge<mra::Key<3>, mra::FunctionsReconstructedNode<double, 3>>;
-using MatrixEdge = ttg::Edge<mra::Key<3>, mra::DenseTensor<double, 2>>;
-using VectorEdge = ttg::Edge<mra::Key<3>, mra::DenseTensor<double, 1>>;
-
 struct DeviceGraph::Impl {
     World& world;
     MraGraph g;

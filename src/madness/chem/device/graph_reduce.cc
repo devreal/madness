@@ -134,8 +134,7 @@ DeviceGraph::Result DeviceGraph::norms(Functions a) {
     Impl::Res& r = pimpl->add_result(long(a.size), 0);
     r.vector.emplace();
     r.layout = layout;
-    g.add(mra::make_norm(make_mrattg_functionset(layout), g.K, pimpl->get(a).compressed, *r.vector, "norm",
-                         device_procmap(layout), device_devicemap(layout)));
+    g.add(device_ops::make_norm(make_mrattg_functionset(layout), g.K, pimpl->get(a).compressed, *r.vector, "norm"));
     g.add(make_batch_vector_sink(*r.vector, r.value, layout, "norm_sink"));
     return Result{int(pimpl->results.size()) - 1};
 }
@@ -156,8 +155,8 @@ DeviceGraph::Result DeviceGraph::kinetic_matrix(Functions psi) {
     for (mra::Dimension axis = 0; axis < 3; ++axis) {
         const std::string name = "d" + std::to_string(axis);
         NodeEdge dc_e;
-        g.add(mra::make_compress(fns, g.K, false, g.functiondata, d_e[axis], dc_e, "compress_" + name,
-                                 device_procmap(layout), device_devicemap(layout), false, T{}, 0, T{}, compress_group));
+        g.add(device_ops::make_compress(fns, g.K, false, g.functiondata, d_e[axis], dc_e, "compress_" + name,
+                                        false, T{}, 0, T{}, compress_group));
         pimpl->add_matrix_inner(dc_e, layout, dc_e, layout, true, r, 0.5, "inner_" + name);
     }
     return Result{int(pimpl->results.size()) - 1};

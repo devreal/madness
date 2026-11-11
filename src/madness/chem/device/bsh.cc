@@ -90,21 +90,19 @@ vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
     if (Vpsi.front().get_impl()->get_tree_state() == madness::TreeState::reconstructed) {
         // Reconstructed nodes: load and compress into nonstandard form
         ttg::Edge<mra::Key<NDIM>, mra::FunctionsReconstructedNode<T, NDIM>> load_vmra;
-        tts.push_back(mra::vmra::make_vmra_load(Vpsi, load_control, load_vmra, "load_vmra"));
-        tts.push_back(mra::make_compress(gaussians, K, true, functiondata, load_vmra, conv_input, "compress",
-                                                   device_procmap(gaussians), device_devicemap(gaussians)));
+        tts.push_back(device_ops::make_vmra_load(Vpsi, load_control, load_vmra, "load_vmra"));
+        tts.push_back(device_ops::make_compress(gaussians, K, true, functiondata, load_vmra, conv_input, "compress"));
     } else if (Vpsi.front().get_impl()->get_tree_state() == madness::TreeState::compressed) {
         // Compressed nodes: load and convert into nonstandard form in a single top-down pass
         ttg::Edge<mra::Key<NDIM>, mra::FunctionsCompressedNode<T, NDIM>> load_vmra;
-        tts.push_back(mra::vmra::make_vmra_load(Vpsi, load_control, load_vmra, "load_vmra"));
-        tts.push_back(mra::make_nonstandard(gaussians, K, functiondata, load_vmra, conv_input, "nonstandard",
-                                                      device_procmap(gaussians), device_devicemap(gaussians)));
+        tts.push_back(device_ops::make_vmra_load(Vpsi, load_control, load_vmra, "load_vmra"));
+        tts.push_back(device_ops::make_nonstandard(gaussians, K, functiondata, load_vmra, conv_input, "nonstandard"));
     } else {
         throw std::runtime_error("Vpsi must be in reconstructed or compressed form");
     }
-    auto convolve         = mra::make_convolution(gaussians, K, conv_input, convolution_result, op, precision, truncate_mode,
-                                                    FunctionDefaults<NDIM>::get_cell_min_width(), "convolution",
-                                                    device_procmap(gaussians), device_devicemap(gaussians));
+    auto convolve         = device_ops::make_convolution(gaussians, K, conv_input, convolution_result, op, precision,
+                                                         truncate_mode, FunctionDefaults<NDIM>::get_cell_min_width(),
+                                                         "convolution");
     // back to standard form in a single bottom-up pass, truncation folded in (see add_compress_from_ns)
     add_compress_from_ns(tts, gaussians, K, functiondata, convolution_result, recompress_result, precision,
                          "recompress_convolution");
@@ -115,9 +113,9 @@ vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
     std::vector<double> norms(N, 0.0);
     if (residual) {
         load_compressed_mrattg(*psi, gaussians, K, functiondata, load_control, psi_compressed, tts, "psi");
-        tts.push_back(mra::make_gaxpy(T(1.0), T(-1.0), gaussians, K, psi_compressed, recompress_result,
-                                      residual_result, "residual", device_procmap(gaussians), device_devicemap(gaussians)));
-        tts.push_back(mra::make_norm(gaussians, K, residual_result, norm_result, "residual_norm", device_procmap(gaussians), device_devicemap(gaussians)));
+        tts.push_back(device_ops::make_gaxpy(T(1.0), T(-1.0), gaussians, K, psi_compressed, recompress_result,
+                                             residual_result, "residual"));
+        tts.push_back(device_ops::make_norm(gaussians, K, residual_result, norm_result, "residual_norm"));
         // the norms of all N functions arrive at the root of the (single) batch
         tts.push_back(ttg::make_tt([&norms, N](const mra::Key<NDIM>& key, const mra::DenseTensor<T, 1>& n) {
             MADNESS_CHECK_THROW(key.level() == 0 && n.size() == N, "residual norms: expected one batch at the root");
@@ -127,8 +125,7 @@ vecfuncT SCF::apply_bsh_mrattg(World& world, vecfuncT& Vpsi, const tensorT& eps,
     }
     // add_leaves: MRA-TTG does not forward nodes truncated away for all functions,
     // MADNESS needs them as empty leaves to keep the compressed tree well-formed
-    auto store_tt         = mra::vmra::make_vmra_store(result, residual ? residual_result : recompress_result,
-                                                       true /* add_leaves */);
+    auto store_tt         = device_ops::make_vmra_store(result, residual ? residual_result : recompress_result);
 
     execute_mra_ttg(start, mrattg_tt_list(tts, {convolve.get(), store_tt.get()}), {}, "bsh_apply");
 
