@@ -60,7 +60,33 @@ TTPtr make_vmra_load(const vecfuncT& f, ttg::Edge<mra::Key<3>, void>& control, N
 }
 
 TTPtr make_vmra_store(vecfuncT& f, NodeEdge& in, const std::string& name, const DeviceLayout& layout) {
+#if defined(MRA_ENABLE_HOST)
     return mra::vmra::make_vmra_store(f, in, true /* add_leaves */, madness::TreeState::compressed, name, layout);
+#else
+    /* The store is a host task, which reads the host copy of the coefficients without checking
+     * that it is current: TTG pushes data out to the host for a host consumer only in some cases
+     * (e.g., not when all GPUs can access their peers). A device task first copies each node to
+     * the host (wait), then hands it on. */
+    using node_type = mra::FunctionsCompressedNode<double, 3>;
+    const DeviceLayout l = layout ? layout : one_batch(f.size());
+    NodeEdge host_e(name + "-host");
+    auto to_host_tt = ttg::make_tt<::Space>([](const mra::Key<3>& key, const node_type& node) -> TASKTYPE {
+        if (!node.empty() && !node.coeffs().buffer().empty()) {
+            co_await ttg::device::select(node.coeffs().buffer());
+            co_await ttg::device::wait(node.coeffs().buffer());
+        }
+        co_await ttg::device::send<0>(key, node);
+    }, ttg::edges(in), ttg::edges(host_e), name + "-to_host", {"input"}, {"output"});
+    to_host_tt->set_keymap(device_procmap(l));
+    to_host_tt->set_devicemap(device_devicemap(l));
+    auto store_tt = mra::vmra::make_vmra_store(f, host_e, true /* add_leaves */, madness::TreeState::compressed,
+                                               name, layout);
+    auto ins = std::make_tuple(to_host_tt->template in<0>());
+    std::vector<std::unique_ptr<ttg::TTBase>> ops;
+    ops.push_back(std::move(to_host_tt));
+    ops.push_back(std::move(store_tt));
+    return ttg::make_ttg(std::move(ops), ins, std::make_tuple(), name);
+#endif
 }
 
 } // namespace device_ops
