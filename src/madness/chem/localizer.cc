@@ -74,22 +74,36 @@ Tensor<T> Localizer::compute_localization_matrix(World& world, const MolecularOr
     // localize using the reconstructed orbitals
     std::vector<Function<T, NDIM>> psi = metric.is_initialized() ? metric * mo_in.get_mos() : mo_in.get_mos();
 
+    Tensor<T> mo_ao, dipole;
+    if (needs_dipole_matrix()) dipole = dipole_matrix(world, psi);
+    else mo_ao = matrix_inner(world, psi, ao);
+    return compute_localization_matrix(world, mo_ao, dipole, mo_in.get_localize_sets(), randomize);
+}
+
+template<typename T>
+Tensor<T> Localizer::compute_localization_matrix(World& world, const Tensor<T>& mo_ao, const Tensor<T>& dipole,
+                                                 const std::vector<int>& set, bool randomize) const {
+    const Tensor<T>& m = needs_dipole_matrix() ? dipole : mo_ao;
+    MADNESS_CHECK_THROW(m.has_data(), needs_dipole_matrix() ? "Localizer: boys needs the dipole matrix"
+                                                            : "Localizer: this method needs <mo|ao>");
+    const long nmo = m.dim(0);
+    MADNESS_CHECK_THROW(long(set.size()) == nmo, "Localizer: one localize set per orbital");
+
     DistributedMatrix<T> dUT;
     if (method == "pm") {
-        dUT = localize_PM(world, psi, mo_in.get_localize_sets(), tolloc, randomize, false);
+        dUT = localize_PM(world, mo_ao, set, tolloc, randomize, false);
     } else if (method == "boys") {
-        dUT = localize_boys(world, psi, mo_in.get_localize_sets(), tolloc, randomize);
+        dUT = localize_boys(world, dipole, set, tolloc, randomize);
     } else if (method == "new") {
-        dUT = localize_new(world, psi, mo_in.get_localize_sets(), tolloc, randomize, false);
+        dUT = localize_new(world, mo_ao, set, tolloc, randomize, false);
     } else if (method == "new_sys") {
-        dUT = localize_new_systolic(world, psi, mo_in.get_localize_sets(), tolloc, randomize, false);
+        dUT = localize_new_systolic(world, mo_ao, set, tolloc, randomize, false);
     } else if (method == "cholesky") {
-        dUT = localize_cholesky(world, psi, mo_in.get_localize_sets());
+        dUT = localize_cholesky(world, mo_ao, set);
     } else {
         print("unknown localization method", method);
         MADNESS_EXCEPTION("unknown localization method", 1);
     }
-    long nmo = mo_in.get_mos().size();
     Tensor<T> UT(nmo, nmo);
     dUT.copy_to_replicated(UT);
     return UT;
@@ -167,26 +181,40 @@ bool Localizer::check_core_valence_separation(const Tensor<T>& Fock, const std::
 }
 
 
+template<std::size_t NDIM>
+std::vector<Function<double, NDIM>> Localizer::dipole_functions(World& world) {
+    static_assert(NDIM >= 3, "the dipole has three components");
+    std::vector<Function<double, NDIM>> fdip;
+    for (int axis = 0; axis < 3; ++axis) {
+        auto dipole = [axis](const Vector<double, NDIM>& x) { return x[axis]; };
+        fdip.push_back(FunctionFactory<double, NDIM>(world).functor(dipole).initial_level(4));
+    }
+    return fdip;
+}
+
 template<typename T, std::size_t NDIM>
-DistributedMatrix<T> Localizer::localize_boys(World& world, const std::vector<Function<T, NDIM>>& mo,
+Tensor<T> Localizer::dipole_matrix(World& world, const std::vector<Function<T, NDIM>>& mo) {
+    const double vtol = 1.e-7;
+    const long nmo = mo.size();
+    Tensor<T> dip(nmo, nmo, 3);
+    const auto fdip = dipole_functions<NDIM>(world);
+    for (int axis = 0; axis < 3; ++axis)
+        dip(_, _, axis) = matrix_inner(world, mo, mul_sparse(world, fdip[axis], mo, vtol), true);
+    return dip;
+}
+
+template<typename T>
+DistributedMatrix<T> Localizer::localize_boys(World& world, const Tensor<T>& dip_in,
                                               const std::vector<int>& set, const double thresh1,
                                               const bool randomize,
                                               const bool doprint) const {
     typedef Tensor<T> tensorT;
-    typedef Function<T, NDIM> functionT;
-    typedef FunctionFactory<T, NDIM> factoryT;
 
-    double vtol = 1.e-7;
     double thresh = thresh1;
     if (thresh < 1e-6) thresh = 1e-6; //<<<<<<<<<<<<<<<<<<<<< need to implement new line search like in pm routine
 
-    long nmo = mo.size();
-    tensorT dip(nmo, nmo, 3);
-    for (int axis = 0; axis < 3; ++axis) {
-        auto dipole = [&axis](const Vector<double, NDIM>& x) { return x[axis]; };
-        functionT fdip = factoryT(world).functor(dipole).initial_level(4);
-        dip(_, _, axis) = matrix_inner(world, mo, mul_sparse(world, fdip, mo, vtol), true);
-    }
+    tensorT dip = copy(dip_in);   // rotated along with U
+    long nmo = dip.dim(0);
 
     tensorT U(nmo, nmo);
     default_random_generator.setstate(
@@ -319,12 +347,12 @@ DistributedMatrix<T> Localizer::localize_boys(World& world, const std::vector<Fu
 }
 
 
-template<typename T, std::size_t NDIM>
-DistributedMatrix<T> Localizer::localize_PM(World& world, const std::vector<Function<T, NDIM>>& mo,
+template<typename T>
+DistributedMatrix<T> Localizer::localize_PM(World& world, const Tensor<T>& mo_ao,
                                             const std::vector<int>& set, const double thresh,
                                             const bool randomize, const bool doprint) const {
 
-    DistributedMatrix<T> dUT = distributed_localize_PM(world, mo, ao, set, at_to_bf, at_nbf,
+    DistributedMatrix<T> dUT = distributed_localize_PM(world, mo_ao, ao, set, at_to_bf, at_nbf,
                                                        thresh, thetamax, randomize, doprint);
     return dUT;
 }
@@ -333,14 +361,15 @@ DistributedMatrix<T> Localizer::localize_PM(World& world, const std::vector<Func
 /// Build the "new" method's working basis: transform the AO-projection matrix C into the
 /// orthonormal atomic-eigenfunction basis and construct the per-atom localization blocks
 /// (1s / 2s2p / rest). Shared by localize_new (rank-0 CG) and localize_new_systolic.
-template<typename T, std::size_t NDIM>
-void Localizer::prepare_new_basis(World& world, const std::vector<Function<T, NDIM>>& mo,
+template<typename T>
+void Localizer::prepare_new_basis(const Tensor<T>& mo_ao,
                                   Tensor<T>& C, std::vector<int>& at_to_bf,
                                   std::vector<int>& at_nbf) const {
     typedef Tensor<T> tensorT;
     int nao = ao.size();
+    MADNESS_CHECK_THROW(mo_ao.ndim() == 2 && mo_ao.dim(1) == nao, "Localizer: <mo|ao> must be nmo x nao");
 
-    C = matrix_inner(world, mo, ao);
+    C = copy(mo_ao);
 
     bool use_atomic_evecs = true;
     if (use_atomic_evecs) {
@@ -412,19 +441,19 @@ void Localizer::prepare_new_basis(World& world, const std::vector<Function<T, ND
 
 }
 
-template<typename T, std::size_t NDIM>
-DistributedMatrix<T> Localizer::localize_new(World& world, const std::vector<Function<T, NDIM>>& mo,
+template<typename T>
+DistributedMatrix<T> Localizer::localize_new(World& world, const Tensor<T>& mo_ao,
                                              const std::vector<int>& set, double thresh,
                                              const bool randomize, const bool doprint) const {
     // PROFILE_MEMBER_FUNC(SCF);
     typedef Tensor<T> tensorT;
 
-    int nmo = mo.size();
+    int nmo = mo_ao.dim(0);
     int nao = ao.size();
 
     tensorT C;
     std::vector<int> at_to_bf, at_nbf;
-    prepare_new_basis(world, mo, C, at_to_bf, at_nbf);
+    prepare_new_basis(mo_ao, C, at_to_bf, at_nbf);
 
     // Below here atoms may be shells or atoms --- by default shells
 
@@ -616,13 +645,13 @@ DistributedMatrix<T> Localizer::localize_new(World& world, const std::vector<Fun
 /// ranks idle -- beyond ~1500 orbitals a single call then exceeds the runtime idle
 /// watchdog (MAD_WAIT_TIMEOUT). A different optimizer on the same objective: it reaches
 /// a different, equally valid local maximum.
-template<typename T, std::size_t NDIM>
-DistributedMatrix<T> Localizer::localize_new_systolic(World& world, const std::vector<Function<T, NDIM>>& mo,
+template<typename T>
+DistributedMatrix<T> Localizer::localize_new_systolic(World& world, const Tensor<T>& mo_ao,
                                                       const std::vector<int>& set, double thresh,
                                                       const bool randomize, const bool doprint) const {
     Tensor<T> C;
     std::vector<int> at_to_bf, at_nbf;
-    prepare_new_basis(world, mo, C, at_to_bf, at_nbf);
+    prepare_new_basis(mo_ao, C, at_to_bf, at_nbf);
     // randomize is ignored, as in the PM path
     return distributed_localize_new(world, C, set, at_to_bf, at_nbf, thresh, thetamax);
 }
@@ -639,15 +668,15 @@ DistributedMatrix<T> Localizer::localize_new_systolic(World& world, const std::v
 /// divided over ranks; slices evolve by identical per-function arithmetic on
 /// replicated data, so the pivot sequence -- and U -- are independent of the rank
 /// count. Each pivot step costs two scalar allreduces.
-template<typename T, std::size_t NDIM>
-DistributedMatrix<T> Localizer::localize_cholesky(World& world, const std::vector<Function<T, NDIM>>& mo,
+template<typename T>
+DistributedMatrix<T> Localizer::localize_cholesky(World& world, const Tensor<T>& mo_ao,
                                                   const std::vector<int>& set) const {
     typedef Tensor<T> tensorT;
-    const long nmo = mo.size();
+    const long nmo = mo_ao.dim(0);
 
     tensorT C;
     std::vector<int> at_to_bf, at_nbf;
-    prepare_new_basis(world, mo, C, at_to_bf, at_nbf);
+    prepare_new_basis(mo_ao, C, at_to_bf, at_nbf);
     const long nao = C.dim(1);
 
     // this rank owns the pivot-diagonal slice [mulo, muhi)
@@ -1026,6 +1055,18 @@ MolecularOrbitals<double, 3> Localizer::localize(const MolecularOrbitals<double,
 template
 MolecularOrbitals<double, 3> Localizer::localize(const MolecularOrbitals<double, 3>& mo_in, const Tensor<double>& Fock,
                                                  bool randomize) const;
+
+template
+Tensor<double> Localizer::compute_localization_matrix(World& world, const MolecularOrbitals<double, 3>& mo_in,
+                                                      bool randomize) const;
+
+template
+Tensor<double> Localizer::compute_localization_matrix(World& world, const Tensor<double>& mo_ao,
+                                                      const Tensor<double>& dipole, const std::vector<int>& set,
+                                                      bool randomize) const;
+
+template
+std::vector<Function<double, 3>> Localizer::dipole_functions<3>(World& world);
 
 template
 std::size_t Localizer::determine_frozen_orbitals(const Tensor<double> fmat);

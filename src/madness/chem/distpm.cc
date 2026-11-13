@@ -304,20 +304,19 @@ public:
 };
 
 
-DistributedMatrix<double> distributed_localize_PM(World & world,
-                                                  const vecfuncT & mo,
-                                                  const vecfuncT & ao,
-                                                  const std::vector<int> & set,
-                                                  const std::vector<int> & at_to_bf,
-                                                  const std::vector<int> & at_nbf,
-                                                  const double thresh,
-                                                  const double thetamax,
-                                                  const bool randomize,
-                                                  const bool doprint)
+/// the systolic PM optimization from dC = <mo|ao> (distributed by columns)
+static DistributedMatrix<double> distributed_localize_PM(World & world,
+                                                         DistributedMatrix<double> & dC,
+                                                         const vecfuncT & ao,
+                                                         const std::vector<int> & set,
+                                                         const std::vector<int> & at_to_bf,
+                                                         const std::vector<int> & at_nbf,
+                                                         const double thresh,
+                                                         const double thetamax)
 {
     // Make Svec ... this can be much more efficient!
     tensorT S = matrix_inner(world, ao, ao, true);
-    long nmo = mo.size();
+    long nmo = dC.coldim();   // A(n,m): n = nmo
     long nao = S.dim(0);
     long natom = at_to_bf.size();
 
@@ -331,9 +330,6 @@ DistributedMatrix<double> distributed_localize_PM(World & world,
     // Make initial matrices
     DistributedMatrix<double> dU = column_distributed_matrix<double>(world, nmo, nmo);
     dU.fill_identity();
-
-    DistributedMatrix<double> dC = column_distributed_matrix<double>(world, nmo, nao);
-    matrix_inner(dC, mo, ao);
 
     DistributedMatrix<double> dA = concatenate_rows(dC,dU);
 
@@ -389,6 +385,40 @@ DistributedMatrix<double> distributed_localize_PM(World & world,
     // }
     // world.gop.broadcast(U.ptr(), U.size(), 0);
     //return U;
+}
+
+DistributedMatrix<double> distributed_localize_PM(World & world,
+                                                  const vecfuncT & mo,
+                                                  const vecfuncT & ao,
+                                                  const std::vector<int> & set,
+                                                  const std::vector<int> & at_to_bf,
+                                                  const std::vector<int> & at_nbf,
+                                                  const double thresh,
+                                                  const double thetamax,
+                                                  const bool randomize,
+                                                  const bool doprint)
+{
+    DistributedMatrix<double> dC = column_distributed_matrix<double>(world, mo.size(), ao.size());
+    matrix_inner(dC, mo, ao);
+    return distributed_localize_PM(world, dC, ao, set, at_to_bf, at_nbf, thresh, thetamax);
+}
+
+DistributedMatrix<double> distributed_localize_PM(World & world,
+                                                  const Tensor<double> & mo_ao,
+                                                  const vecfuncT & ao,
+                                                  const std::vector<int> & set,
+                                                  const std::vector<int> & at_to_bf,
+                                                  const std::vector<int> & at_nbf,
+                                                  const double thresh,
+                                                  const double thetamax,
+                                                  const bool randomize,
+                                                  const bool doprint)
+{
+    MADNESS_CHECK_THROW(mo_ao.ndim() == 2 && mo_ao.dim(1) == long(ao.size()),
+                        "distributed_localize_PM: <mo|ao> must be nmo x nao");
+    DistributedMatrix<double> dC = column_distributed_matrix<double>(world, mo_ao.dim(0), mo_ao.dim(1));
+    dC.copy_from_replicated(mo_ao);
+    return distributed_localize_PM(world, dC, ao, set, at_to_bf, at_nbf, thresh, thetamax);
 }
 
 DistributedMatrix<double> distributed_localize_new(World& world,

@@ -20,6 +20,18 @@ extern DistributedMatrix<double> distributed_localize_PM(World& world,
                                                          const bool randomize = true,
                                                          const bool doprint = false);
 
+/// the same from the replicated (nmo x nao) matrix mo_ao = <mo|ao> instead of the orbitals
+extern DistributedMatrix<double> distributed_localize_PM(World& world,
+                                                         const Tensor<double>& mo_ao,
+                                                         const std::vector<Function<double, 3>>& ao,
+                                                         const std::vector<int>& set,
+                                                         const std::vector<int>& at_to_bf,
+                                                         const std::vector<int>& at_nbf,
+                                                         const double thresh = 1e-9,
+                                                         const double thetamax = 0.5,
+                                                         const bool randomize = true,
+                                                         const bool doprint = false);
+
 /// Distributed optimization for the "new" localization method.
 
 /// The "new" objective is Pipek-Mezey in an orthonormal basis, so it is optimized with

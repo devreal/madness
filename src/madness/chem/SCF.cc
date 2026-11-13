@@ -2935,8 +2935,19 @@ void SCF::solve_simple(World& world) {
     MADNESS_CHECK_THROW(param.spin_restricted() && param.nalpha() == param.nbeta(),
                         "solve_simple supports closed-shell (spin-restricted, nalpha==nbeta) only");
     MADNESS_CHECK_THROW(param.pcm_data() == "none", "solve_simple does not support PCM");
-    if (param.do_localize() && world.rank() == 0)
-        print("solve_simple: ignoring localize =", param.localize_method(), "-- using canonical orbitals");
+    // localized orbitals (cf. solve): rotated at the start of each iteration, the Fock matrix is
+    // then not diagonalized and the residual couples the orbitals through its off-diagonal part
+    const bool localize = param.do_localize();
+    // a near-identity rotation only churns the trees: skipped below this largest off-diagonal
+    // element of U (as solve)
+    const double localize_skip_tol = 0.01;
+    auto max_offdiag = [](const tensorT& U) {
+        double m = 0.0;
+        for (long i = 0; i < U.dim(0); ++i)
+            for (long j = 0; j < U.dim(1); ++j)
+                if (i != j) m = std::max(m, std::abs(U(i, j)));
+        return m;
+    };
 
     const double dconv = std::max(FunctionDefaults<3>::get_thresh(), param.dconv());
     functionT arho_old;
@@ -2996,18 +3007,136 @@ void SCF::solve_simple(World& world) {
     // made from (held, so that a new function cannot reuse its impl's address)
     DeviceFunctions vnuc_d;
     functionT vnuc_h;
+    // the AO basis on the device for the localization, uploaded once per protocol: ao_h is the host
+    // set it was made from (held, as vnuc_h)
+    DeviceFunctions ao_d;
+    vecfuncT ao_h;
+    auto resident_ao = [&]() -> DeviceFunctions& {
+        if (ao_d.size() == 0 || ao_h.size() != ao.size() || ao_h.front().get_impl() != ao.front().get_impl()) {
+            DeviceRange range("AO basis to device");
+            ao_d = device_upload(world, ao);
+            ao_h = ao;
+        }
+        return ao_d;
+    };
 #endif // HAVE_MRA_TTG
 
     for (int iter = 0; iter < param.maxiter(); ++iter) {
         if (world.rank() == 0 and (param.print_level() > 1))
             printf("\nIteration %d at time %.1fs\n\n", iter, wall_time());
 #ifdef HAVE_MRA_TTG
-        if (resident) {
+        if (resident && iter == 0) {
             START_TIMER(world);
-            if (iter == 0) {
+            {
                 DeviceRange range("Orbitals to device");
                 amo_d = device_upload(world, amo);
-            } else if (!device_only || validate_mra_ttg) {
+            }
+            END_TIMER(world, "Orbitals to device");
+        }
+#endif // HAVE_MRA_TTG
+
+        // localize the orbitals (cf. solve). The localizer works on matrices of the orbitals
+        // (<psi|ao>, or the dipole matrix for boys), which come from where the orbitals are.
+        bool rotated = false;
+        if (localize) {
+            START_TIMER(world);
+            Localizer localizer(world, aobasis, molecule, ao);
+            localizer.set_method(param.localize_method());
+            localizer.set_pivot_state(&localize_pivot_state_a);
+            const double trantol = vtol / std::min(30.0, double(amo.size()));
+#ifdef HAVE_MRA_TTG
+            if (resident) {
+                // [ttg: matrix_inner with the AO basis, or multiply x3 + matrix_inner; the optimization
+                //  on the host (collective); transform + truncate + norm + transform, with the KAIN
+                //  history rotated along]
+                const long n = amo_d.size();
+                tensorT mo_ao, dip;
+                {
+                    DeviceRange range("Localization matrix (device)");
+                    std::vector<functionT> fdip;
+                    if (localizer.needs_dipole_matrix()) fdip = Localizer::dipole_functions<3>(world);
+                    else resident_ao();   // uploaded before the graph is built, as that runs a graph
+                    DeviceGraph g(world, "localize_matrix");
+                    auto psi = g.feed(amo_d, true);
+                    std::vector<DeviceGraph::Result> r;
+                    if (localizer.needs_dipole_matrix()) {
+                        for (const auto& f : fdip) r.push_back(g.matrix_inner(psi, g.multiply(g.load(f), psi, 0.0, "dipole")));
+                    } else {
+                        r.push_back(g.matrix_inner(psi, g.feed(ao_d, true)));
+                    }
+                    g.execute();
+                    if (localizer.needs_dipole_matrix()) {
+                        dip = tensorT(n, n, 3);
+                        for (int axis = 0; axis < 3; ++axis) dip(_, _, axis) = g.get(r[axis]);
+                    } else {
+                        mo_ao = g.get(r[0]);
+                    }
+                }
+                vecfuncT psi_ref;   // validation: the orbitals before the rotation
+                if (validate_mra_ttg) {
+                    psi_ref = device_download(world, amo_d, amo.front());
+                    if (localizer.needs_dipole_matrix())
+                        validate_device_values(world, Localizer::dipole_matrix(world, psi_ref), dip, "dipole matrix");
+                    else
+                        validate_device_values(world, matrix_inner(world, psi_ref, ao), mo_ao, "<psi|ao>");
+                }
+                tensorT UT = localizer.compute_localization_matrix(world, mo_ao, dip, aset, iter == 0);
+                const double offdiag = max_offdiag(UT);
+                if (offdiag > localize_skip_tol) {
+                    UT.screen(trantol);
+                    const tensorT U = transpose(UT);
+                    const double thresh = FunctionDefaults<3>::get_thresh();
+                    {
+                        DeviceRange range("Localization rotation (device)");
+                        DeviceGraph g(world, "localize_rotate");
+                        auto psi_rot = g.transform(g.feed(amo_d, false), U, thresh);
+                        auto scale = g.decide(g.norms(psi_rot), [](const Tensor<double>& norms) {
+                            Tensor<double> D(norms.dim(0), norms.dim(0));
+                            for (long i = 0; i < norms.dim(0); ++i) D(i, i) = 1.0 / norms(i);
+                            return D;
+                        });
+                        g.store(g.transform(psi_rot, scale, n, 0.0, /*block_diagonal=*/true), amo_d);
+                        if (kain) {   // the history along, as in the diagonalization: KAIN is per orbital
+                            for (auto* hist : {&hist_psi, &hist_rneg}) {
+                                for (auto& h : *hist) g.store(g.transform(g.feed(h, false), U, 0.0), h);
+                            }
+                        }
+                        g.execute();
+                    }
+                    rotated = true;
+                    if (validate_mra_ttg) {
+                        vecfuncT ref = transform(world, psi_ref, U);
+                        truncate(world, ref, thresh);
+                        normalize(world, ref);
+                        validate_device_functions(world, ref, amo_d, amo.front(), "localized psi");
+                    }
+                } else if (world.rank() == 0 && param.print_level() >= 3) {
+                    printf("  localize: rotation skipped (max offdiag %.1e)\n", offdiag);
+                }
+            } else
+#endif // HAVE_MRA_TTG
+            {
+                MolecularOrbitals<double, 3> mo(amo, aeps, {}, aocc, aset);
+                tensorT UT = localizer.compute_localization_matrix(world, mo, iter == 0);
+                const double offdiag = max_offdiag(UT);
+                if (offdiag > localize_skip_tol) {
+                    UT.screen(trantol);
+                    amo = transform(world, amo, transpose(UT));
+                    truncate(world, amo);
+                    normalize(world, amo);
+                    bmo = amo;
+                    rotated = true;
+                } else if (world.rank() == 0 && param.print_level() >= 3) {
+                    printf("  localize: rotation skipped (max offdiag %.1e)\n", offdiag);
+                }
+            }
+            END_TIMER(world, "localize");
+        }
+
+#ifdef HAVE_MRA_TTG
+        if (resident && (iter > 0 || rotated) && (!device_only || validate_mra_ttg)) {
+            START_TIMER(world);
+            {
                 DeviceRange range("Orbitals to host");
                 amo = device_download(world, amo_d, amo.front());
                 bmo = amo;
@@ -3307,14 +3436,22 @@ void SCF::solve_simple(World& world) {
 
         // [ttg: matrix_inner + transform + truncate + norm; sygv stays on host (nmo x nmo)]
 #ifdef HAVE_MRA_TTG
+        if (resident && !Vpsi.empty()) {
+            START_TIMER(world);
+            DeviceRange range("Vpsi to device");
+            Vpsi_d = device_upload(world, Vpsi);
+            Vpsi.clear();
+            END_TIMER(world, "Vpsi to device");
+        }
+#endif // HAVE_MRA_TTG
+        if (localize) {
+            // localized orbitals stay as they are: the orbital energies are the diagonal of the
+            // Fock matrix, whose off-diagonal part enters the residual (cf. solve)
+            if (aeps.size() != fock.dim(0)) aeps = tensorT(fock.dim(0));
+            for (long i = 0; i < fock.dim(0); ++i) aeps(i) = fock(i, i);
+        } else
+#ifdef HAVE_MRA_TTG
         if (resident) {
-            if (!Vpsi.empty()) {
-                START_TIMER(world);
-                DeviceRange range("Vpsi to device");
-                Vpsi_d = device_upload(world, Vpsi);
-                Vpsi.clear();
-                END_TIMER(world, "Vpsi to device");
-            }
             // one graph, psi and Vpsi fed and stored once: the overlap, from it U (computed on the
             // host while the graph runs, cf. get_fock_transformation), the rotation of psi, Vpsi and
             // the KAIN history, and the normalization of psi
@@ -3443,13 +3580,26 @@ void SCF::solve_simple(World& world) {
                     converged_for_thresh = FunctionDefaults<3>::get_thresh();
                     converged_for_dconv = dconv;
                 }
+                tensorT evals = aeps;
+                if (localize) {
+                    // the eigenvalues of the Fock matrix in the localized orbitals (cf. solve); aeps
+                    // stays its diagonal
+                    tensorT overlap;
+#ifdef HAVE_MRA_TTG
+                    if (resident) overlap = device_matrix_inner(world, amo_d, amo_d);
+                    else
+#endif // HAVE_MRA_TTG
+                    overlap = matrix_inner(world, amo, amo, true);
+                    tensorT u;
+                    sygv(fock, overlap, 1, u, evals);
+                }
                 if (world.rank() == 0 and (param.print_level() > 1)) {
                     if (converged) print("\nConverged!\n");
                     print("alpha eigenvalues");
-                    print(aeps);
+                    print(evals);
                 }
 #ifdef HAVE_MRA_TTG
-                if (resident) {   // the diagonalized orbitals
+                if (resident) {   // the final orbitals
                     DeviceRange range("Orbitals to host");
                     amo = device_download(world, amo_d, amo.front());
                     bmo = amo;
@@ -3752,8 +3902,12 @@ void SCF::solve_simple(World& world) {
     dipole(world, rho);
 
     if (param.nwfile() == "none") {
-        if (world.rank() == 0 and (param.print_level() > 1))
-            print("Orbitals are eigenvectors - energies are eigenvalues\nAnalysis of alpha MO vectors");
+        if (world.rank() == 0 and (param.print_level() > 1)) {
+            if (localize)
+                print("Orbitals are localized - energies are diagonal Fock matrix elements\nAnalysis of alpha MO vectors");
+            else
+                print("Orbitals are eigenvectors - energies are eigenvalues\nAnalysis of alpha MO vectors");
+        }
         analyze_vectors(world, amo, ao, vtol, molecule, param.print_level(), aobasis, aocc, aeps);
     }
 }

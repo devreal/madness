@@ -80,6 +80,26 @@ public:
     template<typename T, std::size_t NDIM>
     Tensor<T> compute_localization_matrix(World& world, const MolecularOrbitals<T, NDIM>& mo_in, bool randomize) const;
 
+    /// whether the method works on the dipole matrix <mo_i|r_axis|mo_j> (boys) instead of <mo_i|ao_mu>
+    bool needs_dipole_matrix() const { return method == "boys"; }
+
+    /// the localization matrix UT (as the other overload) from matrices of the orbitals instead of
+    /// the orbitals, e.g., computed where the orbitals are held (MRA-TTG): mo_ao = <mo_i|ao_mu>
+    /// (nmo x nao) unless needs_dipole_matrix(), then dipole = <mo_i|r_axis|mo_j> (nmo x nmo x 3,
+    /// see dipole_functions); the other one may be empty. Without a metric (set_metric) only.
+    /// set: the localize set of each orbital. Collective.
+    template<typename T>
+    Tensor<T> compute_localization_matrix(World& world, const Tensor<T>& mo_ao, const Tensor<T>& dipole,
+                                          const std::vector<int>& set, bool randomize) const;
+
+    /// the functions r_axis of the dipole matrix (axis 0, 1, 2)
+    template<std::size_t NDIM>
+    static std::vector<Function<double, NDIM>> dipole_functions(World& world);
+
+    /// <mo_i|r_axis|mo_j> (nmo x nmo x 3)
+    template<typename T, std::size_t NDIM>
+    static Tensor<T> dipole_matrix(World& world, const std::vector<Function<T, NDIM>>& mo);
+
     /// localize orbitals while enforcing core-valence separation
 
     /// @param[in]  World   the world
@@ -129,44 +149,44 @@ public:
 
 private:
 
-    template<typename T, std::size_t NDIM>
+    template<typename T>
     DistributedMatrix<T>
-    localize_PM(World& world, const std::vector<Function<T, NDIM>>& mo, const std::vector<int>& set,
+    localize_PM(World& world, const Tensor<T>& mo_ao, const std::vector<int>& set,
                 const double thresh = 1e-9, const bool randomize = true, const bool doprint = false) const;
 
-    template<typename T, std::size_t NDIM>
+    template<typename T>
     DistributedMatrix<T> localize_boys(World& world,
-                                       const std::vector<Function<T, NDIM>>& mo,
+                                       const Tensor<T>& dipole,
                                        const std::vector<int>& set,
                                        const double thresh = 1e-9,
                                        const bool randomize = true,
                                        const bool doprint = false) const;
 
-    template<typename T, std::size_t NDIM>
+    template<typename T>
     DistributedMatrix<T> localize_cholesky(World& world,
-                                           const std::vector<Function<T, NDIM>>& mo,
+                                           const Tensor<T>& mo_ao,
                                            const std::vector<int>& set) const;
 
-    template<typename T, std::size_t NDIM>
+    template<typename T>
     DistributedMatrix<T> localize_new(World& world,
-                                      const std::vector<Function<T, NDIM>>& mo,
+                                      const Tensor<T>& mo_ao,
                                       const std::vector<int>& set,
                                       const double thresh = 1e-9,
                                       const bool randomize = true,
                                       const bool doprint = false) const;
 
     /// the "new" objective optimized with distributed systolic Jacobi sweeps (localize=new_sys)
-    template<typename T, std::size_t NDIM>
+    template<typename T>
     DistributedMatrix<T> localize_new_systolic(World& world,
-                                               const std::vector<Function<T, NDIM>>& mo,
+                                               const Tensor<T>& mo_ao,
                                                const std::vector<int>& set,
                                                const double thresh = 1e-9,
                                                const bool randomize = true,
                                                const bool doprint = false) const;
 
     /// build the "new" method's orthonormal atomic-eigenfunction basis and localization blocks
-    template<typename T, std::size_t NDIM>
-    void prepare_new_basis(World& world, const std::vector<Function<T, NDIM>>& mo,
+    template<typename T>
+    void prepare_new_basis(const Tensor<T>& mo_ao,
                            Tensor<T>& C, std::vector<int>& at_to_bf,
                            std::vector<int>& at_nbf) const;
 
