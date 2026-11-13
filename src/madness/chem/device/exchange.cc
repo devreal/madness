@@ -56,6 +56,8 @@
 /// each of its blocks.
 
 #include <algorithm>
+#include <cstdlib>
+#include <limits>
 #include "graph_impl.h"
 
 namespace madness {
@@ -65,8 +67,22 @@ namespace madness {
 /// exchange slows down beyond ~100-110 pairs per graph (4.3 s at 96, 6.9 s at 128, 38 s at all
 /// 325), i.e. ~18 trees per pair in half the pool; 20 leaves some margin.
 static constexpr double exchange_pair_trees = 20.0;
-/// the share of the device memory pools given to the pairs of one exchange graph
-static constexpr double exchange_pool_share = 0.5;
+/// the share of each device memory pool given to the pairs of one exchange graph, by default:
+/// half on one process (the calibration above); less on several, where data sent between the
+/// processes takes device memory too (staging for remote sends, received copies) and a GPU
+/// manager left without memory it can evict can stall. MRA_TTG_EXCHANGE_POOL_SHARE overrides it.
+static constexpr double exchange_pool_share_single = 0.5;
+static constexpr double exchange_pool_share_multi = 0.3;
+
+static double exchange_pool_share(World& world) {
+    if (const char* s = std::getenv("MRA_TTG_EXCHANGE_POOL_SHARE"); s != nullptr && *s != '\0') {
+        char* end = nullptr;
+        const double v = std::strtod(s, &end);
+        if (end != s && v > 0.0 && v <= 1.0) return v;
+        if (world.rank() == 0) print("MRA_TTG_EXCHANGE_POOL_SHARE must be in (0, 1], ignoring", s);
+    }
+    return world.size() > 1 ? exchange_pool_share_multi : exchange_pool_share_single;
+}
 
 /// bytes of the device memory pools of this process. PaRSEC takes its pool at startup (a share of
 /// each device's memory, PARSEC_MCA_device_cuda_memory_use), so the free memory cannot be queried.
@@ -86,33 +102,53 @@ static std::size_t local_device_pool_bytes() {
 std::size_t device_exchange_tile(World& world, DeviceFunctions& psi) {
     const double N = double(psi.size());
     const double npairs = N * (N + 1) / 2;
-    // the size of the orbitals: their nonzero function-nodes (each holds (2k)^3 coefficients)
-    double nodes = 0;
+    // the size of the orbitals on this process: their nonzero function-nodes (each holds (2k)^3
+    // coefficients)
+    double local_nodes = 0;
     fv(psi).for_each_local_node([&](const auto&, const auto& node) {
-        if (!node.empty()) nodes += double(node.coeffs().sparsity().count_nonzero());
+        if (!node.empty()) local_nodes += double(node.coeffs().sparsity().count_nonzero());
     });
-    double pool = double(local_device_pool_bytes());
+    const double local_pool = double(local_device_pool_bytes());
+    double nodes = local_nodes;
     world.gop.sum(nodes);
-    world.gop.sum(pool);
-    if (pool == 0 || nodes == 0 || npairs == 0) return 0;   // no device pool known: one graph
+    if (nodes == 0 || npairs == 0) return 0;
 
     // A pair holds, at the same time, its product, the convolution's intermediates and result, and
     // the directed products it contributes to K. Each is a tree about the size of an orbital, made
-    // finer by the convolution (the potential extends further than the product).
+    // finer by the convolution (the potential extends further than the product). The trees of a
+    // pair are distributed over the processes like the orbitals, so this process holds its share
+    // of the nodes of every pair.
     const double k = FunctionDefaults<3>::get_k();
     const double node_bytes = 8.0 * 8 * k * k * k;   // (2k)^3 doubles
-    const double bytes_per_pair = exchange_pair_trees * (nodes / N) * node_bytes;
+    const double local_bytes_per_pair = exchange_pair_trees * (local_nodes / N) * node_bytes;
     // part of the pool stays with what the graph does not hold per pair: the resident orbitals,
     // K, the operator tables and the buffers PaRSEC keeps for reuse
-    const double budget = exchange_pool_share * pool;
-    const double fit = std::floor(budget / bytes_per_pair);
+    const double share = exchange_pool_share(world);
+    // the pairs that fit on this process's devices; the process that fits the fewest sets the tile
+    // (summing the pools of all devices would assume a perfectly even distribution)
+    double fit = std::numeric_limits<double>::max();
+    bool no_pool = false;
+    if (local_bytes_per_pair > 0) {
+        if (local_pool == 0) no_pool = true;
+        else fit = std::floor(share * local_pool / local_bytes_per_pair);
+    }
+    double any_no_pool = no_pool ? 1.0 : 0.0;
+    world.gop.max(any_no_pool);
+    if (any_no_pool > 0) return 0;   // no device pool known: one graph
+    world.gop.min(fit);
+    // for the report: the smallest pool and the largest share of the nodes of a process
+    double min_pool = local_pool, max_nodes = local_nodes;
+    world.gop.min(min_pool);
+    world.gop.max(max_nodes);
     // tiles of even size: as many as needed, each as full as the others (0: all in one graph)
     const double ntiles = std::ceil(npairs / std::max(fit, 1.0));
     const std::size_t tile = fit >= npairs ? 0 : std::size_t(std::ceil(npairs / ntiles));
     if (world.rank() == 0)
         print("device exchange:", std::size_t(npairs), "pairs in", std::size_t(ntiles), "tile(s) (",
-              std::size_t(nodes / N), "nodes per orbital, about", std::lround(bytes_per_pair / 1e6), "MB per pair,",
-              std::lround(pool / 1e9), "GB of device memory )");
+              std::size_t(nodes / N), "nodes per orbital, up to", std::lround(100.0 * max_nodes / nodes),
+              "% of them on one process, about", std::lround(exchange_pair_trees * (nodes / N) * node_bytes / 1e6),
+              "MB per pair; ", std::lround(100 * share), "% of the smallest device pool,",
+              std::lround(min_pool / 1e9), "GB )");
     return tile;
 }
 
