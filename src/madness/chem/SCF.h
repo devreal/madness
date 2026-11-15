@@ -256,6 +256,10 @@ public:
     double current_energy;
     double converged_for_thresh=1.e10;   ///< mos are converged for this threshold
     double converged_for_dconv=1.e10;    ///< mos are converged for this density
+    /// the threshold the mos were last converged for, kept when they are reprojected (in k) or
+    /// re-truncated for another threshold, unlike converged_for_thresh: how refined they are.
+    /// Sizes the device exchange of the first iterations at a tighter threshold.
+    double refined_for_thresh=1.e10;
     double converged_for_tconv=1.e10;    ///< derivatives of mos are converged for this threshold
 
     /// what amo/bmo actually hold, recorded in the restartdata header

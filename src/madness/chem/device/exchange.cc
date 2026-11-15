@@ -65,8 +65,11 @@ namespace madness {
 /// the device memory a pair holds in an exchange graph, in trees of the average orbital's size.
 /// Calibrated on water5 HF at k=8 (one A100, 34 GB pool): with ~290 nodes per orbital the
 /// exchange slows down beyond ~100-110 pairs per graph (4.3 s at 96, 6.9 s at 128, 38 s at all
-/// 325), i.e. ~18 trees per pair in half the pool; 20 leaves some margin.
-static constexpr double exchange_pair_trees = 20.0;
+/// 325), i.e. ~18 trees per pair in half the pool. Water10 HF at k=8, thresh 1e-6 (four A100s,
+/// half of 159 GB) with 253 nodes per orbital: 425 pairs per graph evict (49.6 s), 255 do not
+/// (2.0 s), i.e. 23-38 trees per pair. A graph that evicts is 25-60 times slower, while graphs
+/// of half the size cost only ~10 % more, so this errs on the large side.
+static constexpr double exchange_pair_trees = 40.0;
 /// the share of each device memory pool given to the pairs of one exchange graph, by default:
 /// half on one process (the calibration above); less on several, where data sent between the
 /// processes takes device memory too (staging for remote sends, received copies) and a GPU
@@ -99,19 +102,38 @@ static std::size_t local_device_pool_bytes() {
     return bytes;
 }
 
-std::size_t device_exchange_tile(World& world, DeviceFunctions& psi) {
-    const double N = double(psi.size());
-    const double npairs = N * (N + 1) / 2;
-    // the size of the orbitals on this process: their nonzero function-nodes (each holds (2k)^3
-    // coefficients)
+/// the nonzero function-nodes (each holds (2k)^3 coefficients) of the orbitals on this process
+static double local_orbital_nodes(DeviceFunctions& psi) {
     double local_nodes = 0;
     fv(psi).for_each_local_node([&](const auto&, const auto& node) {
         if (!node.empty()) local_nodes += double(node.coeffs().sparsity().count_nonzero());
     });
+    return local_nodes;
+}
+
+double device_nodes_per_orbital(World& world, DeviceFunctions& psi) {
+    double nodes = local_orbital_nodes(psi);
+    world.gop.sum(nodes);
+    return psi.size() > 0 ? nodes / double(psi.size()) : 0.0;
+}
+
+std::size_t device_exchange_tile(World& world, DeviceFunctions& psi, double min_nodes_per_orbital) {
+    const double N = double(psi.size());
+    const double npairs = N * (N + 1) / 2;
+    // the size of the orbitals on this process
+    double local_nodes = local_orbital_nodes(psi);
     const double local_pool = double(local_device_pool_bytes());
     double nodes = local_nodes;
     world.gop.sum(nodes);
     if (nodes == 0 || npairs == 0) return 0;
+    // orbitals not yet refined for this threshold: size the pairs for the orbitals they will
+    // become, keeping each process's share of the nodes
+    const bool floored = min_nodes_per_orbital * N > nodes;
+    if (floored) {
+        const double scale = min_nodes_per_orbital * N / nodes;
+        local_nodes *= scale;
+        nodes *= scale;
+    }
 
     // A pair holds, at the same time, its product, the convolution's intermediates and result, and
     // the directed products it contributes to K. Each is a tree about the size of an orbital, made
@@ -145,7 +167,7 @@ std::size_t device_exchange_tile(World& world, DeviceFunctions& psi) {
     const std::size_t tile = fit >= npairs ? 0 : std::size_t(std::ceil(npairs / ntiles));
     if (world.rank() == 0)
         print("device exchange:", std::size_t(npairs), "pairs in", std::size_t(ntiles), "tile(s) (",
-              std::size_t(nodes / N), "nodes per orbital, up to", std::lround(100.0 * max_nodes / nodes),
+              std::size_t(nodes / N), floored ? "nodes per orbital (expected; fewer now), up to" : "nodes per orbital, up to", std::lround(100.0 * max_nodes / nodes),
               "% of them on one process, about", std::lround(exchange_pair_trees * (nodes / N) * node_bytes / 1e6),
               "MB per pair; ", std::lround(100 * share), "% of the smallest device pool,",
               std::lround(min_pool / 1e9), "GB )");
@@ -302,11 +324,11 @@ void exchange_tile_batched(World& world, DeviceFunctions& psi, DeviceOperatorCac
 } // namespace
 
 DeviceFunctions device_exchange(World& world, DeviceFunctions& psi, double lo, DeviceOperatorCache& cache,
-                                std::size_t tile) {
+                                std::size_t tile, double min_nodes_per_orbital) {
     const long N = long(psi.size());
     const double thresh = FunctionDefaults<3>::get_thresh();
     if (!cache.exchange_op) cache.exchange_op = poperatorT(CoulombOperatorPtr(world, lo, thresh));
-    if (tile == device_exchange_auto_tile) tile = device_exchange_tile(world, psi);
+    if (tile == device_exchange_auto_tile) tile = device_exchange_tile(world, psi, min_nodes_per_orbital);
 
     const DeviceLayout L = layout_of(psi);
     if (L->num_batches() > 1) {

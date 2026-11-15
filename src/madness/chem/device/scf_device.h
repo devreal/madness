@@ -265,16 +265,29 @@ namespace madness {
     /// tile of device_exchange: chosen by device_exchange_tile
     inline constexpr std::size_t device_exchange_auto_tile = std::size_t(-1);
 
+    /// The growth of the orbitals (nodes per orbital) from those converged for a threshold to those
+    /// converged for the next one of the protocol: their first iterations at the tighter threshold
+    /// refine them (water10 HF, k=6 at 1e-4 to k=8 at 1e-6: 92 to 253 nodes, water20: 100 to 319
+    /// over two iterations), and their products refine far beyond them right away. An exchange tile
+    /// sized for the unrefined orbitals evicts; one sized for orbitals this much larger does not.
+    inline constexpr double device_exchange_unrefined_growth = 4.0;
+
+    /// the average number of nonzero nodes of the orbitals. Collective.
+    double device_nodes_per_orbital(World& world, DeviceFunctions& psi);
+
     /// the number of orbital pairs per exchange graph whose data fits in device memory (0: all of
-    /// them), estimated from the size of the orbitals (their nonzero nodes), k and the device memory
-    /// pools of all processes. Collective.
-    std::size_t device_exchange_tile(World& world, DeviceFunctions& psi);
+    /// them), estimated from the size of the orbitals (their nonzero nodes, at least
+    /// min_nodes_per_orbital on average: for orbitals not yet refined for the threshold), k and the
+    /// device memory pools of all processes. Collective.
+    std::size_t device_exchange_tile(World& world, DeviceFunctions& psi, double min_nodes_per_orbital = 0.0);
 
     /// the Hartree-Fock exchange K psi_i = sum_j psi_j G(psi_j psi_i) with the Poisson operator G
     /// (lo, thresh) of the host Exchange, in tiles of `tile` pairs i <= j (0: all in one graph;
-    /// device_exchange_auto_tile: see device_exchange_tile); psi is kept. G is kept in the cache.
+    /// device_exchange_auto_tile: see device_exchange_tile, with min_nodes_per_orbital); psi is
+    /// kept. G is kept in the cache.
     DeviceFunctions device_exchange(World& world, DeviceFunctions& psi, double lo, DeviceOperatorCache& cache,
-                                    std::size_t tile = device_exchange_auto_tile);
+                                    std::size_t tile = device_exchange_auto_tile,
+                                    double min_nodes_per_orbital = 0.0);
 
     /// sum_i occ_i psi_i^2, compressed, with the process map of `like`; psi is kept
     functionT device_density(World& world, DeviceFunctions& psi, const tensorT& occ, const functionT& like);

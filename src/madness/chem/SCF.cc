@@ -459,6 +459,7 @@ void SCF::load_mos(World& world) {
     }
 
     // if everything worked out, set convergence parameters
+    refined_for_thresh = meta.converged_for_thresh;
     if (needs_redo) {
         // reprojected in k or re-truncated, so the stored convergence no longer
         // describes the orbitals we now hold
@@ -2758,6 +2759,7 @@ void SCF::solve(World& world) {
                 // over-claims, at the final level it under-claims.
                 if (converged) {
                     converged_for_thresh=FunctionDefaults<3>::get_thresh();
+                    refined_for_thresh=converged_for_thresh;
                     converged_for_dconv=dconv;
                 }
                 if (world.rank() == 0 && converged and (param.print_level() > 1)) {
@@ -2970,6 +2972,14 @@ void SCF::solve_simple(World& world) {
     // pairs of orbitals per exchange graph (0: all in one); by default estimated to fit device memory
     const std::size_t exchange_tile = std::getenv("MRA_TTG_EXCHANGE_TILE")
                                       ? std::stoul(std::getenv("MRA_TTG_EXCHANGE_TILE")) : device_exchange_auto_tile;
+    // orbitals converged for a looser threshold (of the protocol, or of a restart; not an initial
+    // guess) are not yet
+    // refined for this one, and their products far less: the exchange tiles of this protocol are
+    // sized for orbitals device_exchange_unrefined_growth times the size of those it starts from
+    // (set at the first exchange; < 0: not yet)
+    const bool exchange_unrefined = refined_for_thresh < 1.e9
+                                    && refined_for_thresh > FunctionDefaults<3>::get_thresh();
+    double exchange_min_nodes = -1.0;
     const bool device_only = resident && local_potential && param.deriv() == "abgv";
     if (resident) {
         if (mrattg_batches > 0) set_device_orbital_batches(mrattg_batches);
@@ -3335,7 +3345,12 @@ void SCF::solve_simple(World& world) {
                 START_TIMER(world);
                 {
                     DeviceRange range("HF exchange (device)");
-                    Kpsi_d = device_exchange(world, amo_d, param.lo(), device_operator_cache(), exchange_tile);
+                    if (exchange_min_nodes < 0.0)
+                        exchange_min_nodes = exchange_unrefined
+                                             ? device_exchange_unrefined_growth * device_nodes_per_orbital(world, amo_d)
+                                             : 0.0;
+                    Kpsi_d = device_exchange(world, amo_d, param.lo(), device_operator_cache(), exchange_tile,
+                                             exchange_min_nodes);
                 }
                 END_TIMER(world, "HF exchange (device)");
                 if (validate_mra_ttg) {
@@ -3578,6 +3593,7 @@ void SCF::solve_simple(World& world) {
             if (converged || iter == param.maxiter() - 1) {
                 if (converged) {
                     converged_for_thresh = FunctionDefaults<3>::get_thresh();
+                    refined_for_thresh = converged_for_thresh;
                     converged_for_dconv = dconv;
                 }
                 tensorT evals = aeps;
