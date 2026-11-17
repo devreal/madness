@@ -42,34 +42,53 @@ DeviceOperatorCache& SCF::device_operator_cache() {
     return *device_operators;
 }
 
-DeviceGraph::Functions DeviceGraph::convolution(const poperatorT& op, Functions in, double tol,
-                                                DeviceOperatorCache* cache) {
+namespace {
+
+/// dop(in), compressed and truncated with tol unless tol == 0
+DeviceGraph::Functions add_convolution(DeviceGraph::Impl& impl, std::shared_ptr<mra::GaussianConvolutionOperator<double, 3>> dop,
+                                       DeviceGraph::Functions in, double tol) {
     using T = double;
-    auto& g = pimpl->g;
-    const DeviceLayout layout = pimpl->get(in).layout;   // per batch: one operator for every function
+    auto& g = impl.g;
+    const DeviceLayout layout = impl.get(in).layout;
     // the convolution tasks refer to the function set's shared_ptr object itself and to the
     // operator (captured by reference): both are held here, at stable addresses, until the graph has run
     auto fns_holder = std::make_shared<decltype(make_mrattg_functionset(layout))>(make_mrattg_functionset(layout));
     const auto& fns = *fns_holder;
-    std::shared_ptr<mra::GaussianConvolutionOperator<T, 3>> dop;
-    if (cache) {
-        for (auto& [hop, d] : cache->ops) if (hop == op) dop = d;
-    }
-    if (!dop) {
-        // one operator for all N functions
-        dop = std::make_shared<mra::GaussianConvolutionOperator<T, 3>>(op);
-        if (cache) cache->ops.emplace_back(op, dop);
-    }
-    pimpl->operators.push_back(fns_holder);
-    pimpl->operators.push_back(dop);
+    impl.operators.push_back(fns_holder);
+    impl.operators.push_back(dop);
     NodeEdge ns_e, conv_e, out_e;
     // non-standard form for the convolution, compressed (and truncated) result, each in a single pass
-    g.add(device_ops::make_nonstandard(fns, g.K, g.functiondata, pimpl->get(in).compressed, ns_e, "nonstandard"));
+    g.add(device_ops::make_nonstandard(fns, g.K, g.functiondata, impl.get(in).compressed, ns_e, "nonstandard"));
     g.add(device_ops::make_convolution(fns, g.K, ns_e, conv_e, *dop, T(FunctionDefaults<3>::get_thresh()),
                                        FunctionDefaults<3>::get_truncate_mode(), FunctionDefaults<3>::get_cell_min_width(),
                                        "convolution"));
     add_compress_from_ns(g.tts, fns, g.K, g.functiondata, conv_e, out_e, tol, "recompress_convolution");
-    return pimpl->add_functions(out_e, layout);
+    return impl.add_functions(out_e, layout);
+}
+
+} // namespace
+
+DeviceGraph::Functions DeviceGraph::convolution(const poperatorT& op, Functions in, double tol,
+                                                DeviceOperatorCache* cache) {
+    std::shared_ptr<mra::GaussianConvolutionOperator<double, 3>> dop;
+    if (cache) {
+        for (auto& [hop, d] : cache->ops) if (hop == op) dop = d;
+    }
+    if (!dop) {
+        // one operator for all N functions (per batch: every function of the set)
+        dop = std::make_shared<mra::GaussianConvolutionOperator<double, 3>>(op);
+        if (cache) cache->ops.emplace_back(op, dop);
+    }
+    return add_convolution(*pimpl, std::move(dop), in, tol);
+}
+
+DeviceGraph::Functions DeviceGraph::convolution(const std::vector<poperatorT>& ops, Functions in, double tol,
+                                                DeviceOperatorCache* cache) {
+    device_check(ops.size() == in.size, "DeviceGraph::convolution: one operator per function");
+    // the matrices of the 1D terms earlier operators generated are reused (see DeviceOperatorCache)
+    auto dop = std::make_shared<mra::GaussianConvolutionOperator<double, 3>>(ops, cache ? cache->bsh_tables : nullptr);
+    if (cache) cache->bsh_tables = dop->term_tables();
+    return add_convolution(*pimpl, std::move(dop), in, tol);
 }
 
 } // namespace madness

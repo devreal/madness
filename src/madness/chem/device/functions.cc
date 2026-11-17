@@ -32,6 +32,7 @@
 /// \file device/functions.cc
 /// \brief Device vectors of functions: upload, download, inner products, transform, update.
 
+#include <algorithm>
 #include <limits>
 #include "common.h"
 
@@ -119,6 +120,44 @@ void device_add_lb_cost(LoadBalanceDeux<3>& lb, DeviceFunctions& v) {
             if (leafs[c] > 0) lb.add_cost(key.child_at(c).to_madness_key(), double(leafs[c]), false);
         }
     });
+}
+
+double device_lb_pair_weight() {
+    static const double w = [] {
+        const char* v = std::getenv("MRA_TTG_LB_PAIR_WEIGHT");
+        return v ? std::max(0.0, std::atof(v)) : device_lb_pair_weight_default;
+    }();
+    return w;
+}
+
+double device_add_exchange_lb_cost(LoadBalanceDeux<3>& lb, DeviceFunctions& v, double weight) {
+    if (weight <= 0.0) return 0.0;
+    constexpr int nchild = mra::Key<3>::num_children();
+    const DeviceLayout layout = layout_of(v);
+    const auto pairs = [](long n) { return 0.5 * double(n) * double(n + 1); };
+    double added = 0.0;
+    fv(v).for_each_local_node([&](const mra::Key<3>& key, const auto& node) {
+        const int N = int(layout->batch_size(key.batch()));
+        long interior = 0;
+        std::array<long, nchild> leafs{};
+        for (int i = 0; i < N; ++i) {
+            if (node.is_zero(i) && node.is_all_child_leaf(i)) continue;   // its tree ended above
+            ++interior;
+            for (int c = 0; c < nchild; ++c) leafs[c] += node.is_child_leaf(i, c);
+        }
+        if (interior > 0) {
+            const double cost = weight * pairs(interior);
+            lb.add_cost(key.to_madness_key(), cost, false);
+            added += cost;
+        }
+        for (int c = 0; c < nchild; ++c) {
+            if (leafs[c] == 0) continue;
+            const double cost = weight * pairs(leafs[c]);
+            lb.add_cost(key.child_at(c).to_madness_key(), cost, false);
+            added += cost;
+        }
+    });
+    return added;
 }
 
 /// copy MADNESS functions into a device vector

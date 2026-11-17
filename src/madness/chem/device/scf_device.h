@@ -127,6 +127,12 @@ namespace madness {
         /// tol unless tol == 0. With a cache, the MRA-TTG operator made for op is kept there and
         /// reused, with every level of 1D matrices it generated, while op stays the same.
         Functions convolution(const poperatorT& op, Functions in, double tol, DeviceOperatorCache* cache = nullptr);
+        /// ops[i](in_i), one operator per function (e.g., the BSH operators of the orbitals), compressed
+        /// and truncated with tol unless tol == 0. With a cache, the MRA-TTG operator reuses the 1D
+        /// matrices of the term tables kept there (DeviceOperatorCache::bsh_tables) if they hold all of
+        /// its terms, and keeps its own tables there.
+        Functions convolution(const std::vector<poperatorT>& ops, Functions in, double tol,
+                              DeviceOperatorCache* cache = nullptr);
         /// a x_i + b y_i, truncated with tol unless tol == 0
         Functions gaxpy(double a, Functions x, double b, Functions y, double tol);
         /// sum_k c[k] f[k]_i for two or more sets f[k] of the same size, not truncated. Every node of the
@@ -217,6 +223,23 @@ namespace madness {
     /// Not while a graph executes.
     void device_add_lb_cost(LoadBalanceDeux<3>& lb, DeviceFunctions& v);
 
+    /// default of device_lb_pair_weight: a pair's node against 8 for a function's interior node
+    /// (device_add_lb_cost). An estimate, to be calibrated with the totals SCF::loadbal prints.
+    inline constexpr double device_lb_pair_weight_default = 1.0;
+
+    /// the weight of device_add_exchange_lb_cost: MRA_TTG_LB_PAIR_WEIGHT, else
+    /// device_lb_pair_weight_default (0: no exchange cost)
+    double device_lb_pair_weight();
+
+    /// Adds the cost of the exchange to the load balancer: weight * n(n+1)/2 at a node where n
+    /// functions of v are present, the pairs whose products the exchange forms, convolves and
+    /// multiplies there (and likewise for the functions' leafs). Node counts alone cut the space
+    /// into pieces of equal orbital nodes, which for the exchange are not equal work: where many
+    /// orbitals overlap (coarse levels, the middle of the molecule) the pairs grow quadratically.
+    /// Counts the pairs within each batch of v's nodes only. Returns the cost added on this
+    /// process. Not while a graph executes.
+    double device_add_exchange_lb_cost(LoadBalanceDeux<3>& lb, DeviceFunctions& v, double weight);
+
     /// copy MADNESS functions into a device vector: a set of orbitals (or of functions of them) in
     /// the orbitals' batches (set_device_orbital_batches), a single function on all processes
     DeviceFunctions device_upload(World& world, const vecfuncT& f);
@@ -251,12 +274,30 @@ namespace madness {
     /// a_i <- a_i - c_i r_i; consumes r
     void device_update(World& world, DeviceFunctions& a, DeviceFunctions& r, const std::vector<double>& c);
 
+    /// whether the tiles of the BSH residual take every ntiles-th orbital of a batch instead of a
+    /// contiguous range (MRA_TTG_SPREAD_TILES, default 1). The device map is cut for all orbitals
+    /// together; consecutive localized orbitals are near each other, so a contiguous tile's work
+    /// lies on a few devices, a strided one's on all of them (water20, k=8: BSH 9.4 -> 8.2 s).
+    bool device_spread_tiles();
+
+    /// tile of device_bsh_residual: chosen by device_bsh_tile
+    inline constexpr std::size_t device_bsh_auto_tile = std::size_t(-1);
+
+    /// the number of orbitals per BSH residual graph whose data fits in device memory (0: all of
+    /// them), estimated as device_exchange_tile does. Collective.
+    std::size_t device_bsh_tile(World& world, DeviceFunctions& psi, double min_nodes_per_orbital = 0.0);
+
     /// rneg = G(-2 (Vpsi - psi fockp)) - psi and its norms; psi is kept, Vpsi is consumed. With a
     /// cache, the BSH operators reuse the 1D matrices of earlier ones (see DeviceOperatorCache).
+    /// The orbitals are processed in tiles of about `tile` orbitals, one graph each (0: all in one;
+    /// device_bsh_auto_tile: see device_bsh_tile, with min_nodes_per_orbital); with the orbitals in
+    /// several batches, a tile is a part of every batch.
     DeviceFunctions device_bsh_residual(World& world, DeviceFunctions& psi, DeviceFunctions& Vpsi,
                                         const Tensor<double>& fockp, const tensorT& eps,
                                         const CalculationParameters& param, std::vector<double>& rnorm,
-                                        DeviceOperatorCache* cache = nullptr);
+                                        DeviceOperatorCache* cache = nullptr,
+                                        std::size_t tile = device_bsh_auto_tile,
+                                        double min_nodes_per_orbital = 0.0);
 
     /// Vpsi_i = v psi_i for one (host) function v, truncated with tol unless tol == 0; psi is kept
     void device_apply_local_potential(World& world, const functionT& v, DeviceFunctions& psi,

@@ -58,6 +58,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include "graph_impl.h"
 
 namespace madness {
@@ -70,6 +71,9 @@ namespace madness {
 /// (2.0 s), i.e. 23-38 trees per pair. A graph that evicts is 25-60 times slower, while graphs
 /// of half the size cost only ~10 % more, so this errs on the large side.
 static constexpr double exchange_pair_trees = 40.0;
+/// the exchange tiles per graph, overlapped (see device_exchange; MRA_TTG_EXCHANGE_OVERLAP overrides
+/// it, 1: one graph per tile)
+static constexpr std::size_t exchange_overlap_tiles = 4;
 /// the share of each device memory pool given to the pairs of one exchange graph, by default:
 /// half on one process (the calibration above); less on several, where data sent between the
 /// processes takes device memory too (staging for remote sends, received copies) and a GPU
@@ -117,6 +121,23 @@ double device_nodes_per_orbital(World& world, DeviceFunctions& psi) {
     return psi.size() > 0 ? nodes / double(psi.size()) : 0.0;
 }
 
+/// the items (pairs, orbitals) of local_bytes_per_item each on this process that fit into
+/// local_budget bytes on every process: the process that fits the fewest decides (summing the pools
+/// of all processes would assume a perfectly even distribution). -1: some process knows no device
+/// pool. Collective.
+static double items_that_fit(World& world, double local_bytes_per_item, double local_budget) {
+    double fit = std::numeric_limits<double>::max();
+    bool no_pool = false;
+    if (local_bytes_per_item > 0) {
+        if (local_budget <= 0) no_pool = true;
+        else fit = std::floor(local_budget / local_bytes_per_item);
+    }
+    double any_no_pool = no_pool ? 1.0 : 0.0;
+    world.gop.max(any_no_pool);
+    world.gop.min(fit);
+    return any_no_pool > 0 ? -1.0 : fit;
+}
+
 std::size_t device_exchange_tile(World& world, DeviceFunctions& psi, double min_nodes_per_orbital) {
     const double N = double(psi.size());
     const double npairs = N * (N + 1) / 2;
@@ -146,18 +167,8 @@ std::size_t device_exchange_tile(World& world, DeviceFunctions& psi, double min_
     // part of the pool stays with what the graph does not hold per pair: the resident orbitals,
     // K, the operator tables and the buffers PaRSEC keeps for reuse
     const double share = exchange_pool_share(world);
-    // the pairs that fit on this process's devices; the process that fits the fewest sets the tile
-    // (summing the pools of all devices would assume a perfectly even distribution)
-    double fit = std::numeric_limits<double>::max();
-    bool no_pool = false;
-    if (local_bytes_per_pair > 0) {
-        if (local_pool == 0) no_pool = true;
-        else fit = std::floor(share * local_pool / local_bytes_per_pair);
-    }
-    double any_no_pool = no_pool ? 1.0 : 0.0;
-    world.gop.max(any_no_pool);
-    if (any_no_pool > 0) return 0;   // no device pool known: one graph
-    world.gop.min(fit);
+    const double fit = items_that_fit(world, local_bytes_per_pair, share * local_pool);
+    if (fit < 0) return 0;   // no device pool known: one graph
     // for the report: the smallest pool and the largest share of the nodes of a process
     double min_pool = local_pool, max_nodes = local_nodes;
     world.gop.min(min_pool);
@@ -171,6 +182,59 @@ std::size_t device_exchange_tile(World& world, DeviceFunctions& psi, double min_
               "% of them on one process, about", std::lround(exchange_pair_trees * (nodes / N) * node_bytes / 1e6),
               "MB per pair; ", std::lround(100 * share), "% of the smallest device pool,",
               std::lround(min_pool / 1e9), "GB )");
+    return tile;
+}
+
+/// the device memory an orbital holds in a BSH residual graph, in trees of the average orbital's
+/// size: its Fock transform, the shifted V psi, its non-standard form, the convolution's result
+/// (much finer than the orbital: the operator spreads every node over its neighbors) and the
+/// residual. Calibrated on water20 HF at k=8, thresh 1e-6 (four A100s, half of 159 GB), in the
+/// second iteration after k=6: 50 orbitals per graph evict (32.8 s, against 39 s for all 100 in one
+/// graph), 25 do not (7.4 s). Sized together with the expected growth of the orbitals at the start
+/// of a protocol (device_exchange_unrefined_growth, 697 instead of ~100 nodes per orbital for
+/// water20), which picks 4 tiles of 25; 250 trees picked 8 tiles, ~2-4 s slower per iteration.
+/// Without that growth, e.g., restarting from orbitals already converged for this threshold, the
+/// actual node counts may pick tiles that evict.
+static constexpr double bsh_orbital_trees = 120.0;
+
+bool device_spread_tiles() {
+    static const bool spread = [] {
+        const char* v = std::getenv("MRA_TTG_SPREAD_TILES");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return spread;
+}
+
+std::size_t device_bsh_tile(World& world, DeviceFunctions& psi, double min_nodes_per_orbital) {
+    const double N = double(psi.size());
+    double local_nodes = local_orbital_nodes(psi);
+    const double local_pool = double(local_device_pool_bytes());
+    double nodes = local_nodes;
+    world.gop.sum(nodes);
+    if (nodes == 0 || N == 0) return 0;
+    // orbitals not yet refined for this threshold: sized for the orbitals they will become
+    const bool floored = min_nodes_per_orbital * N > nodes;
+    if (floored) {
+        const double scale = min_nodes_per_orbital * N / nodes;
+        local_nodes *= scale;
+        nodes *= scale;
+    }
+    const double k = FunctionDefaults<3>::get_k();
+    const double node_bytes = 8.0 * 8 * k * k * k;   // (2k)^3 doubles
+    // the trees of an orbital are distributed over the processes like the orbitals
+    const double local_bytes_per_orbital = bsh_orbital_trees * (local_nodes / N) * node_bytes;
+    const double share = exchange_pool_share(world);
+    const double fit = items_that_fit(world, local_bytes_per_orbital, share * local_pool);
+    if (fit < 0) return 0;   // no device pool known: one graph
+    double min_pool = local_pool;
+    world.gop.min(min_pool);
+    const double ntiles = std::ceil(N / std::max(fit, 1.0));
+    const std::size_t tile = fit >= N ? 0 : std::size_t(std::ceil(N / ntiles));
+    if (world.rank() == 0)
+        print("device BSH residual:", std::size_t(N), "orbitals in", std::size_t(ntiles), "tile(s) (",
+              std::size_t(nodes / N), floored ? "nodes per orbital (expected; fewer now), about" : "nodes per orbital, about",
+              std::lround(bsh_orbital_trees * (nodes / N) * node_bytes / 1e6), "MB per orbital; ",
+              std::lround(100 * share), "% of the smallest device pool,", std::lround(min_pool / 1e9), "GB )");
     return tile;
 }
 
@@ -397,42 +461,76 @@ DeviceFunctions device_exchange(World& world, DeviceFunctions& psi, double lo, D
         for (long j = i; j < N; ++j) pairs.emplace_back(i, j);
     if (tile == 0) tile = pairs.size();
 
-    DeviceFunctions K;
-    for (std::size_t p0 = 0; p0 < pairs.size(); p0 += tile) {
-        const long T = long(std::min(tile, pairs.size() - p0));
-        // the directed products of this tile: (target, source, pair)
-        struct Directed { long target, source, pair; };
-        std::vector<Directed> dirs;
-        for (long p = 0; p < T; ++p) {
-            const auto [i, j] = pairs[p0 + p];
-            dirs.push_back({i, j, p});
-            if (i != j) dirs.push_back({j, i, p});
-        }
-        const long D = long(dirs.size());
-        Tensor<double> Ua(N, T), Ub(N, T), Uc(N, D), Uw(T, D), Us(D, N);
-        for (long p = 0; p < T; ++p) {
-            Ua(pairs[p0 + p].first, p) = 1.0;
-            Ub(pairs[p0 + p].second, p) = 1.0;
-        }
-        for (long d = 0; d < D; ++d) {
-            Uc(dirs[d].source, d) = 1.0;
-            Uw(dirs[d].pair, d) = 1.0;
-            Us(d, dirs[d].target) = 1.0;
-        }
+    // Tiles per graph (MRA_TTG_EXCHANGE_OVERLAP, default exchange_overlap_tiles): within a graph,
+    // a tile starts once the convolution of the previous one is complete (the norm reduction of
+    // its V finishes only after every node of V), so its products and convolution run while the
+    // previous tile forms its directed products and contributions to K, on GPUs that would
+    // otherwise idle until that tile's last device finishes. Only one convolution, the bulk of a
+    // tile's memory, is in flight at a time. The tiles' contributions are summed in the graph; a
+    // graph ends with a fence, as a tile used to.
+    const std::size_t ntiles = (pairs.size() + tile - 1) / tile;
+    const std::size_t per_graph = std::max<std::size_t>(1, [] {
+        const char* v = std::getenv("MRA_TTG_EXCHANGE_OVERLAP");
+        return v ? std::size_t(std::max(1L, std::atol(v))) : exchange_overlap_tiles;
+    }());
+    // The tiles are contiguous rows of pairs, not spread over all orbitals as the BSH residual's
+    // (device_spread_tiles): a tile's functions are stored together, node by node, so a tile of
+    // pairs of every orbital spans the whole volume and its transforms and products work on many
+    // more nodes. Dealing the pairs to the tiles (water20 at k=8, 4 A100s) balanced the devices
+    // slightly better but took 23% more kernel time and twice the transfers between devices, and
+    // evicted: the exchange went from 131 to 210 s over the protocol.
 
+    DeviceFunctions K;
+    for (std::size_t t0 = 0; t0 < ntiles; t0 += per_graph) {
         DeviceGraph g(world, "exchange");
         auto f = g.feed(psi, true);
-        // [ttg: transform x2 + multiply + compress/truncate]
-        auto pair = g.multiply(g.transform(f, Ua, 0.0, "x-A"), g.transform(f, Ub, 0.0, "x-B"), thresh, "x-pair");
-        // [ttg: nonstandard + convolution + compress/truncate], all pairs in one convolution
-        auto v = g.convolution(cache.exchange_op, pair, thresh, &cache);
-        // [ttg: transform x2 + multiply + compress + transform (sum over the sources)]
-        auto kp = g.transform(g.multiply(g.transform(f, Uc, 0.0, "x-C"), g.transform(v, Uw, 0.0, "x-W"), 0.0, "x-dir"),
-                              Us, 0.0, "x-sum");
+        std::optional<DeviceGraph::Functions> acc;   // the contributions of this graph's tiles so far
+        std::optional<DeviceGraph::Result> prev_v;   // the norms of the latest tile's V
+        for (std::size_t t = t0; t < std::min(ntiles, t0 + per_graph); ++t) {
+            const std::size_t p0 = t * tile;
+            const long T = long(std::min(tile, pairs.size() - p0));
+            // the directed products of this tile: (target, source, pair)
+            struct Directed { long target, source, pair; };
+            std::vector<Directed> dirs;
+            for (long p = 0; p < T; ++p) {
+                const auto [i, j] = pairs[p0 + p];
+                dirs.push_back({i, j, p});
+                if (i != j) dirs.push_back({j, i, p});
+            }
+            const long D = long(dirs.size());
+            Tensor<double> Ua(N, T), Ub(N, T), Uc(N, D), Uw(T, D), Us(D, N);
+            for (long p = 0; p < T; ++p) {
+                Ua(pairs[p0 + p].first, p) = 1.0;
+                Ub(pairs[p0 + p].second, p) = 1.0;
+            }
+            for (long d = 0; d < D; ++d) {
+                Uc(dirs[d].source, d) = 1.0;
+                Uw(dirs[d].pair, d) = 1.0;
+                Us(d, dirs[d].target) = 1.0;
+            }
+            // a selection from the orbitals: right away, or once the V whose norms are `after` is
+            // complete (the orbitals' nodes wait in the transform until then)
+            const auto select = [&](const Tensor<double>& U, std::optional<DeviceGraph::Result> after,
+                                    const char* name) {
+                if (!after) return g.transform(f, U, 0.0, name);
+                auto m = g.decide(*after, [U](const Tensor<double>&) { return U; });
+                return g.transform(f, m, std::size_t(U.dim(1)), 0.0);
+            };
+            // [ttg: transform x2 + multiply + compress/truncate], after the previous tile's V
+            auto pair = g.multiply(select(Ua, prev_v, "x-A"), select(Ub, prev_v, "x-B"), thresh, "x-pair");
+            // [ttg: nonstandard + convolution + compress/truncate], all pairs in one convolution
+            auto v = g.convolution(cache.exchange_op, pair, thresh, &cache);
+            prev_v = g.norms(v);
+            // [ttg: transform x2 + multiply + compress + transform (sum over the sources)]; the
+            // sources (2T functions) are selected once V is complete, not held through the convolution
+            auto kp = g.transform(g.multiply(select(Uc, prev_v, "x-C"), g.transform(v, Uw, 0.0, "x-W"), 0.0, "x-dir"),
+                                  Us, 0.0, "x-sum");
+            acc = acc ? g.gaxpy(1.0, *acc, 1.0, kp, 0.0) : kp;
+        }
         if (K.size() == 0) {
-            g.store(kp, K);
+            g.store(*acc, K);
         } else {
-            g.store(g.gaxpy(1.0, g.feed(K, false), 1.0, kp, 0.0), K);
+            g.store(g.gaxpy(1.0, g.feed(K, false), 1.0, *acc, 0.0), K);
         }
         g.execute();
     }

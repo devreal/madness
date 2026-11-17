@@ -2167,11 +2167,16 @@ void SCF::loadbal(World& world, functionT& arho, functionT& brho,
     lb.add_tree(vnuc, lbcost<double, 3>(param.vnucextra() * 1.0, param.vnucextra() * 8.0),
                 false);
     lb.add_tree(arho, lbcost<double, 3>(1.0, 8.0), false);
+    double exchange_cost = 0.0;   // of the device orbitals' pairs (device_add_exchange_lb_cost)
 #ifdef HAVE_MRA_TTG
     if (device_mo) {
         world.gop.fence();   // MRA-TTG is idle between graphs
         if (validate_mra_ttg) validate_device_lb_cost(world, amo, *device_mo);
         device_add_lb_cost(lb, *device_mo);
+        // the exchange's work grows with the pairs of orbitals present at a node, not with the
+        // orbitals: with HF exchange, weigh the nodes by their pairs as well
+        if (xc.hf_exchange_coefficient() != 0.0)
+            exchange_cost = device_add_exchange_lb_cost(lb, *device_mo, device_lb_pair_weight());
     } else
 #endif // HAVE_MRA_TTG
     for (unsigned int i = 0; i < amo.size(); ++i) {
@@ -2184,15 +2189,25 @@ void SCF::loadbal(World& world, functionT& arho, functionT& brho,
         }
     }
     world.gop.fence();
+    world.gop.sum(exchange_cost);
 
     if (sfc) {
-        std::shared_ptr<SFCPmap<3>> pmap = lb.load_balance_sfc(ndevice, param.loadbalparts());
+        // at least 8 subtrees per part: with the exchange's pair costs (concentrated at coarse
+        // nodes) the default of 2 left cuts at max/mean 1.18 (water20 on 4 A100s, 7 pieces); 8
+        // cut at 1.01-1.06 and took 184 s instead of 199 (the exchange 94 s instead of 108)
+        constexpr int device_min_loadbalparts = 8;
+        const int parts = std::max(param.loadbalparts(), device_min_loadbalparts);
+        std::shared_ptr<SFCPmap<3>> pmap = lb.load_balance_sfc(ndevice, parts);
         if (world.rank() == 0 and param.print_level() > 2) {
             const std::vector<double>& cost = pmap->costs();
-            const double mean = std::accumulate(cost.begin(), cost.end(), 0.0)/cost.size();
+            const double total = std::accumulate(cost.begin(), cost.end(), 0.0);
+            const double mean = total/cost.size();
             const double max = *std::max_element(cost.begin(), cost.end());
             print("load balance:", world.size(), "processes,", ndevice, "devices each,", pmap->num_pieces(),
                   "pieces of the curve, max/mean cost", max/mean);
+            if (exchange_cost > 0.0)
+                print("load balance: total cost", total, "of which exchange pairs", exchange_cost,
+                      "(weight", device_lb_pair_weight(), ")");
         }
         FunctionDefaults<3>::redistribute(world, pmap);
     } else {
@@ -2969,17 +2984,26 @@ void SCF::solve_simple(World& world) {
     // local_potential: the device applies the potential (the local part and the exchange)
     const bool local_potential = molecule.parameters.pure_ae() && !xc.is_meta()
                                  && (hf_coeff == 0.0 || !host_exchange);
-    // pairs of orbitals per exchange graph (0: all in one); by default estimated to fit device memory
+    // pairs of orbitals per exchange graph, orbitals per BSH residual graph (0: all in one); by
+    // default estimated to fit device memory
     const std::size_t exchange_tile = std::getenv("MRA_TTG_EXCHANGE_TILE")
                                       ? std::stoul(std::getenv("MRA_TTG_EXCHANGE_TILE")) : device_exchange_auto_tile;
+    const std::size_t bsh_tile = std::getenv("MRA_TTG_BSH_TILE")
+                                 ? std::stoul(std::getenv("MRA_TTG_BSH_TILE")) : device_bsh_auto_tile;
     // orbitals converged for a looser threshold (of the protocol, or of a restart; not an initial
-    // guess) are not yet
-    // refined for this one, and their products far less: the exchange tiles of this protocol are
-    // sized for orbitals device_exchange_unrefined_growth times the size of those it starts from
-    // (set at the first exchange; < 0: not yet)
-    const bool exchange_unrefined = refined_for_thresh < 1.e9
-                                    && refined_for_thresh > FunctionDefaults<3>::get_thresh();
-    double exchange_min_nodes = -1.0;
+    // guess) are not yet refined for this one, and their products far less: the exchange and BSH
+    // tiles of this protocol are sized for orbitals device_exchange_unrefined_growth times the size
+    // of those it starts from (set at the first exchange or BSH residual; < 0: not yet)
+    const bool device_unrefined = refined_for_thresh < 1.e9
+                                  && refined_for_thresh > FunctionDefaults<3>::get_thresh();
+    double device_min_nodes = -1.0;
+    const auto tile_min_nodes = [&](DeviceFunctions& psi) {
+        if (device_min_nodes < 0.0)
+            device_min_nodes = device_unrefined
+                               ? device_exchange_unrefined_growth * device_nodes_per_orbital(world, psi)
+                               : 0.0;
+        return device_min_nodes;
+    };
     const bool device_only = resident && local_potential && param.deriv() == "abgv";
     if (resident) {
         if (mrattg_batches > 0) set_device_orbital_batches(mrattg_batches);
@@ -3345,12 +3369,8 @@ void SCF::solve_simple(World& world) {
                 START_TIMER(world);
                 {
                     DeviceRange range("HF exchange (device)");
-                    if (exchange_min_nodes < 0.0)
-                        exchange_min_nodes = exchange_unrefined
-                                             ? device_exchange_unrefined_growth * device_nodes_per_orbital(world, amo_d)
-                                             : 0.0;
                     Kpsi_d = device_exchange(world, amo_d, param.lo(), device_operator_cache(), exchange_tile,
-                                             exchange_min_nodes);
+                                             tile_min_nodes(amo_d));
                 }
                 END_TIMER(world, "HF exchange (device)");
                 if (validate_mra_ttg) {
@@ -3637,7 +3657,7 @@ void SCF::solve_simple(World& world) {
 
 #ifdef HAVE_MRA_TTG
         if (resident) {
-            // [ttg: transform + gaxpy + BSH apply + gaxpy + norm, one graph]
+            // [ttg: transform + gaxpy + BSH apply + gaxpy + norm, in tiles of orbitals]
             START_TIMER(world);
             const long nmo = amo_d.size();
             tensorT eps(nmo), fockp = copy(fock);
@@ -3656,7 +3676,7 @@ void SCF::solve_simple(World& world) {
             {
                 DeviceRange range("BSH residual (device)");
                 rneg_d = device_bsh_residual(world, amo_d, Vpsi_d, fockp, eps, param, rnorm,
-                                             &device_operator_cache());
+                                             &device_operator_cache(), bsh_tile, tile_min_nodes(amo_d));
             }
             if (validate_mra_ttg) {
                 // rneg = G(-2 (Vpsi - psi fockp)) - psi, as in device_bsh_residual
