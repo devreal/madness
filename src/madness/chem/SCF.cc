@@ -2948,6 +2948,9 @@ void SCF::solve_simple(World& world) {
     PROFILE_MEMBER_FUNC(SCF);
 #ifdef HAVE_MRA_TTG
     if (!mrattg_dot_dir.empty()) set_device_dot_dir(mrattg_dot_dir);
+    // one NVTX range per protocol step, e.g. for nsys --capture-range=nvtx --nvtx-capture="solve k=8@MRA-TTG SCF"
+    const std::string solve_range_name = "solve k=" + std::to_string(FunctionDefaults<3>::get_k());
+    DeviceRange solve_range(solve_range_name.c_str());
 #endif // HAVE_MRA_TTG
     MADNESS_CHECK_THROW(param.spin_restricted() && param.nalpha() == param.nbeta(),
                         "solve_simple supports closed-shell (spin-restricted, nalpha==nbeta) only");
