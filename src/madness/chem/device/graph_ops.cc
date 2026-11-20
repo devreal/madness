@@ -123,6 +123,22 @@ DeviceGraph::Functions DeviceGraph::multiply(Functions a, Functions b, double to
     auto fns = make_mrattg_functionset(layout);
     RecEdge prod_e;
     NodeEdge comp_e;
+    static const bool separate_truncate = std::getenv("MRA_TTG_SEPARATE_TRUNCATE") != nullptr;
+    if (mra::get_multiply_compressed_levels() == 2 && !(tol > 0.0 && separate_truncate)) {
+        // two levels per multiply task (MRA_TTG_MULTIPLY_LEVELS=2): the product nodes at odd
+        // levels stay packed per task and the compression reads them from there
+        ttg::Edge<mra::Key<3>, mra::CombinedReconstructedNode<T, 3>> packed_e(name + "-packed");
+        g.add(mra::make_multiply_compressed_combined<T, 3>(pimpl->domain(), make_mrattg_functionset(a_layout), fns,
+                                                           g.functiondata, g.K, a_e, pimpl->get(b).compressed,
+                                                           prod_e, packed_e, name, device_procmap(layout),
+                                                           device_devicemap(layout)));
+        g.add(mra::make_compress_combined<T, 3>(fns, g.K, false, g.functiondata, prod_e, packed_e, comp_e,
+                                                name + "-compress", device_procmap(layout), device_devicemap(layout),
+                                                /*enable_truncate=*/tol > 0.0, tol,
+                                                FunctionDefaults<3>::get_truncate_mode(),
+                                                FunctionDefaults<3>::get_cell_min_width()));
+        return pimpl->add_functions(comp_e, layout);
+    }
     // multiplied in compressed form: the factors are not reconstructed for this
     g.add(mra::make_multiply_compressed<T, 3>(pimpl->domain(), make_mrattg_functionset(a_layout), fns, g.functiondata,
                                               g.K, a_e, pimpl->get(b).compressed, prod_e,
