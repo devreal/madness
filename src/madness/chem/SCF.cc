@@ -2994,9 +2994,10 @@ void SCF::solve_simple(World& world) {
     const std::size_t bsh_tile = std::getenv("MRA_TTG_BSH_TILE")
                                  ? std::stoul(std::getenv("MRA_TTG_BSH_TILE")) : device_bsh_auto_tile;
     // orbitals converged for a looser threshold (of the protocol, or of a restart; not an initial
-    // guess) are not yet refined for this one, and their products far less: the exchange and BSH
-    // tiles of this protocol are sized for orbitals device_exchange_unrefined_growth times the size
-    // of those it starts from (set at the first exchange or BSH residual; < 0: not yet)
+    // guess) are not yet refined for this one, and their products far less: the exchange tiles of
+    // this protocol are sized for orbitals device_exchange_unrefined_growth times the size of those
+    // it starts from (set at the first exchange; < 0: not yet). The BSH tiles need no such guess:
+    // they are sized from Vpsi, which is already refined (see device_bsh_tile)
     const bool device_unrefined = refined_for_thresh < 1.e9
                                   && refined_for_thresh > FunctionDefaults<3>::get_thresh();
     double device_min_nodes = -1.0;
@@ -3679,7 +3680,7 @@ void SCF::solve_simple(World& world) {
             {
                 DeviceRange range("BSH residual (device)");
                 rneg_d = device_bsh_residual(world, amo_d, Vpsi_d, fockp, eps, param, rnorm,
-                                             &device_operator_cache(), bsh_tile, tile_min_nodes(amo_d));
+                                             &device_operator_cache(), bsh_tile);
             }
             if (validate_mra_ttg) {
                 // rneg = G(-2 (Vpsi - psi fockp)) - psi, as in device_bsh_residual

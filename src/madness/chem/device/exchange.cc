@@ -185,17 +185,18 @@ std::size_t device_exchange_tile(World& world, DeviceFunctions& psi, double min_
     return tile;
 }
 
-/// the device memory an orbital holds in a BSH residual graph, in trees of the average orbital's
-/// size: its Fock transform, the shifted V psi, its non-standard form, the convolution's result
-/// (much finer than the orbital: the operator spreads every node over its neighbors) and the
-/// residual. Calibrated on water20 HF at k=8, thresh 1e-6 (four A100s, half of 159 GB), in the
-/// second iteration after k=6: 50 orbitals per graph evict (32.8 s, against 39 s for all 100 in one
-/// graph), 25 do not (7.4 s). Sized together with the expected growth of the orbitals at the start
-/// of a protocol (device_exchange_unrefined_growth, 697 instead of ~100 nodes per orbital for
-/// water20), which picks 4 tiles of 25; 250 trees picked 8 tiles, ~2-4 s slower per iteration.
-/// Without that growth, e.g., restarting from orbitals already converged for this threshold, the
-/// actual node counts may pick tiles that evict.
-static constexpr double bsh_orbital_trees = 120.0;
+/// the device memory an orbital holds in a BSH residual graph, in trees of the average size of
+/// Vpsi: the shifted Vpsi, its non-standard form, the convolution's result (much finer than its
+/// input: the operator spreads every node over its neighbors), the Fock transform of psi and the
+/// residual. Sized from Vpsi as it arrives, not from psi: psi is not refined for a new threshold
+/// before this BSH step, but Vpsi already is (water10 HF: 9 times the nodes of psi at k=6, 14 times
+/// at the start of k=8, where psi still has its k=6 trees), so no expected growth is added.
+/// Derived from the earlier psi-based estimate of 120 trees of psi (calibrated on water20 HF, k=8,
+/// thresh 1e-6, four A100s: 25 orbitals per graph do not evict, 50 do), about 14 trees of Vpsi on
+/// water10 at k=6, with some margin. On water10 at k=8 (1300 nodes per Vpsi, 38 GB) this keeps all
+/// 50 orbitals in one graph, which does not evict (3.5 s, against 9-10 s in 5 tiles).
+/// Not yet checked on water20.
+static constexpr double bsh_vpsi_trees = 20.0;
 
 bool device_spread_tiles() {
     static const bool spread = [] {
@@ -205,24 +206,17 @@ bool device_spread_tiles() {
     return spread;
 }
 
-std::size_t device_bsh_tile(World& world, DeviceFunctions& psi, double min_nodes_per_orbital) {
-    const double N = double(psi.size());
-    double local_nodes = local_orbital_nodes(psi);
+std::size_t device_bsh_tile(World& world, DeviceFunctions& Vpsi) {
+    const double N = double(Vpsi.size());
+    const double local_nodes = local_orbital_nodes(Vpsi);
     const double local_pool = double(local_device_pool_bytes());
     double nodes = local_nodes;
     world.gop.sum(nodes);
     if (nodes == 0 || N == 0) return 0;
-    // orbitals not yet refined for this threshold: sized for the orbitals they will become
-    const bool floored = min_nodes_per_orbital * N > nodes;
-    if (floored) {
-        const double scale = min_nodes_per_orbital * N / nodes;
-        local_nodes *= scale;
-        nodes *= scale;
-    }
     const double k = FunctionDefaults<3>::get_k();
     const double node_bytes = 8.0 * 8 * k * k * k;   // (2k)^3 doubles
     // the trees of an orbital are distributed over the processes like the orbitals
-    const double local_bytes_per_orbital = bsh_orbital_trees * (local_nodes / N) * node_bytes;
+    const double local_bytes_per_orbital = bsh_vpsi_trees * (local_nodes / N) * node_bytes;
     const double share = exchange_pool_share(world);
     const double fit = items_that_fit(world, local_bytes_per_orbital, share * local_pool);
     if (fit < 0) return 0;   // no device pool known: one graph
@@ -232,8 +226,8 @@ std::size_t device_bsh_tile(World& world, DeviceFunctions& psi, double min_nodes
     const std::size_t tile = fit >= N ? 0 : std::size_t(std::ceil(N / ntiles));
     if (world.rank() == 0)
         print("device BSH residual:", std::size_t(N), "orbitals in", std::size_t(ntiles), "tile(s) (",
-              std::size_t(nodes / N), floored ? "nodes per orbital (expected; fewer now), about" : "nodes per orbital, about",
-              std::lround(bsh_orbital_trees * (nodes / N) * node_bytes / 1e6), "MB per orbital; ",
+              std::size_t(nodes / N), "nodes per Vpsi, about",
+              std::lround(bsh_vpsi_trees * (nodes / N) * node_bytes / 1e6), "MB per orbital; ",
               std::lround(100 * share), "% of the smallest device pool,", std::lround(min_pool / 1e9), "GB )");
     return tile;
 }

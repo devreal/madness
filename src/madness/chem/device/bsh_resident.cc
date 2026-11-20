@@ -53,7 +53,7 @@ namespace madness {
 DeviceFunctions device_bsh_residual(World& world, DeviceFunctions& psi, DeviceFunctions& Vpsi,
                                     const Tensor<double>& fockp, const tensorT& eps,
                                     const CalculationParameters& param, std::vector<double>& rnorm,
-                                    DeviceOperatorCache* cache, std::size_t tile, double min_nodes_per_orbital) {
+                                    DeviceOperatorCache* cache, std::size_t tile) {
     const long N = long(psi.size());
     // in the orbitals' batches: each batch is computed by its process group; the Fock matrix must
     // be block-diagonal in the batches (canonical orbitals: diagonal)
@@ -71,7 +71,7 @@ DeviceFunctions device_bsh_residual(World& world, DeviceFunctions& psi, DeviceFu
     const double thresh = FunctionDefaults<3>::get_thresh();
     std::vector<poperatorT> ops = SCF::make_bsh_operators(world, eps, param);
 
-    if (tile == device_bsh_auto_tile) tile = device_bsh_tile(world, psi, min_nodes_per_orbital);
+    if (tile == device_bsh_auto_tile) tile = device_bsh_tile(world, Vpsi);
     // tiles: every batch in as many parts, so none is smaller than the smallest batch
     long min_batch = N;
     for (mra::Batch b = 0; b < nb; ++b) min_batch = std::min(min_batch, size(b));

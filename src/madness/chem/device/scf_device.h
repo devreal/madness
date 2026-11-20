@@ -284,20 +284,20 @@ namespace madness {
     inline constexpr std::size_t device_bsh_auto_tile = std::size_t(-1);
 
     /// the number of orbitals per BSH residual graph whose data fits in device memory (0: all of
-    /// them), estimated as device_exchange_tile does. Collective.
-    std::size_t device_bsh_tile(World& world, DeviceFunctions& psi, double min_nodes_per_orbital = 0.0);
+    /// them), estimated from the size of Vpsi (already refined for the threshold, unlike psi at
+    /// the start of a protocol step). Collective.
+    std::size_t device_bsh_tile(World& world, DeviceFunctions& Vpsi);
 
     /// rneg = G(-2 (Vpsi - psi fockp)) - psi and its norms; psi is kept, Vpsi is consumed. With a
     /// cache, the BSH operators reuse the 1D matrices of earlier ones (see DeviceOperatorCache).
     /// The orbitals are processed in tiles of about `tile` orbitals, one graph each (0: all in one;
-    /// device_bsh_auto_tile: see device_bsh_tile, with min_nodes_per_orbital); with the orbitals in
+    /// device_bsh_auto_tile: see device_bsh_tile); with the orbitals in
     /// several batches, a tile is a part of every batch.
     DeviceFunctions device_bsh_residual(World& world, DeviceFunctions& psi, DeviceFunctions& Vpsi,
                                         const Tensor<double>& fockp, const tensorT& eps,
                                         const CalculationParameters& param, std::vector<double>& rnorm,
                                         DeviceOperatorCache* cache = nullptr,
-                                        std::size_t tile = device_bsh_auto_tile,
-                                        double min_nodes_per_orbital = 0.0);
+                                        std::size_t tile = device_bsh_auto_tile);
 
     /// Vpsi_i = v psi_i for one (host) function v, truncated with tol unless tol == 0; psi is kept
     void device_apply_local_potential(World& world, const functionT& v, DeviceFunctions& psi,
