@@ -3276,6 +3276,12 @@ void SCF::solve_simple(World& world) {
             // while the Coulomb potential is formed from it on the device. The kinetic matrix does
             // not depend on the potential: its derivatives fill the device while the convolution
             // of the single density waits on the levels of its tree.
+            // experiment: MRA_TTG_KE_SEPARATE=1 builds the kinetic matrix in its own graph after
+            // the Coulomb potential, to measure the critical path density -> Coulomb alone
+            static const bool ke_separate = [] {
+                const char* e = std::getenv("MRA_TTG_KE_SEPARATE");
+                return e && std::atoi(e) != 0;
+            }();
             START_TIMER(world);
             {
                 DeviceRange range("Density, Coulomb potential, KE (device)");
@@ -3285,13 +3291,25 @@ void SCF::solve_simple(World& world) {
                 auto arho_f = g.density(psi, aocc);
                 g.store(arho_f, arho, amo.front());
                 auto [enuc_r, ecoul_r] = device_coulomb(g, arho_f, vn_d);
-                auto kin_r = g.kinetic_matrix(psi);
+                DeviceGraph::Result kin_r;
+                if (!ke_separate) kin_r = g.kinetic_matrix(psi);
                 g.execute();
                 enuclear = g.get(enuc_r)(0, 0);
                 ecoulomb = 0.5 * g.get(ecoul_r)(0, 0);
-                kin = g.get(kin_r);
+                if (!ke_separate) kin = g.get(kin_r);
             }
-            END_TIMER(world, "Density, Coulomb, KE (device)");
+            END_TIMER(world, ke_separate ? "Density, Coulomb (device)" : "Density, Coulomb, KE (device)");
+            if (ke_separate) {
+                START_TIMER(world);
+                {
+                    DeviceRange range("KE (device)");
+                    DeviceGraph g(world, "kinetic");
+                    auto kin_r = g.kinetic_matrix(g.feed(amo_d, true));
+                    g.execute();
+                    kin = g.get(kin_r);
+                }
+                END_TIMER(world, "KE (device)");
+            }
             if (validate_mra_ttg) {
                 functionT ref = make_density(world, aocc, amo);
                 const double d = (ref - arho).norm2(), n = ref.norm2();
