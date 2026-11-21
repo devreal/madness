@@ -32,6 +32,8 @@
 /// \file device/graph_reduce.cc
 /// \brief DeviceGraph reductions to host results: matrix_inner, norms, kinetic matrix.
 
+#include <cstdlib>
+
 #include "graph_impl.h"
 
 namespace madness {
@@ -152,6 +154,27 @@ DeviceGraph::Result DeviceGraph::kinetic_matrix(Functions psi) {
     std::array<RecEdge, 3> d_e;
     g.add(mra::make_gradient_compressed<T, 3>(pimpl->domain(), fns, g.functiondata, g.K, pimpl->get(psi).compressed,
                                               d_e, "gradient", device_procmap(layout), device_devicemap(layout)));
+    // With a single batch, each derivative's Gram matrix is formed while compressing it
+    // (mra::make_compress_gram): the compressed derivatives are never stored.
+    // MRA_TTG_KE_FUSED=0 compresses them and forms the matrix with make_matrix_inner.
+    static const bool fused = [] {
+        const char* e = std::getenv("MRA_TTG_KE_FUSED");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    if (fused && layout->num_batches() == 1) {
+        r.place = [](const mra::Key<3>&, const double* d, Tensor<double>& into, double f) {
+            for (long i = 0; i < into.size(); ++i) into.ptr()[i] += f * d[i];
+        };
+        for (mra::Dimension axis = 0; axis < 3; ++axis) {
+            const std::string name = "d" + std::to_string(axis);
+            MatrixEdge m_e;
+            g.add(mra::make_compress_gram<T, 3>(fns, g.K, g.functiondata, d_e[axis], m_e, "compress_gram_" + name,
+                                                device_procmap(layout), device_devicemap(layout), compress_group));
+            r.arrivals += 1;
+            pimpl->add_matrix_sink(m_e, r, 0.5, "kinetic_" + name + "-sink");
+        }
+        return Result{int(pimpl->results.size()) - 1};
+    }
     for (mra::Dimension axis = 0; axis < 3; ++axis) {
         const std::string name = "d" + std::to_string(axis);
         NodeEdge dc_e;
