@@ -55,6 +55,12 @@ TTPtr make_compress_from_ns(const DeviceFunctionSet& fns, mra::size_type K,
 TTPtr make_nonstandard(const DeviceFunctionSet& fns, mra::size_type K,
                        const mra::FunctionData<double, 3>& functiondata, NodeEdge in, NodeEdge out,
                        const std::string& name) {
+    // two levels per task (MRA_TTG_NONSTANDARD_LEVELS=2) where a key and its children are
+    // on the same process and device
+    if (mra::get_nonstandard_levels() == 2) {
+        return mra::make_nonstandard_2level<double, 3>(fns, K, functiondata, std::move(in), std::move(out), name,
+                                                        device_procmap(fns), device_devicemap(fns));
+    }
     return mra::make_nonstandard(fns, K, functiondata, std::move(in), std::move(out), name, device_procmap(fns),
                                  device_devicemap(fns));
 }
